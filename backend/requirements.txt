@@ -1,0 +1,10 @@
+# ASX Prediction Engine Requirements
+streamlit==1.55.0
+plotly==6.6.0
+yfinance==0.2.35
+pandas==2.3.3
+numpy==1.26.3
+statsmodels==0.14.6
+scikit-learn==1.8.0
+python-dotenv==1.0.0
+requests==2.32.5

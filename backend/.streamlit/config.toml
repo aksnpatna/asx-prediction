@@ -1,0 +1,8 @@
+[runner]
+magicEnabled = true
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

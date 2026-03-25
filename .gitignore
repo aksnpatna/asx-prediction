@@ -40,3 +40,12 @@ Thumbs.db
 
 # Environment
 .env
+
+# Cloudflare Tunnel Credentials (NEVER COMMIT)
+tunnel-creds.json
+cert.pem
+*.pem
+bc2b54c5-*.json
+
+# Large binary packages
+*.deb

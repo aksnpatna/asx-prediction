@@ -1,0 +1,5 @@
+name,email,phone,company,title,duration_minutes
+Alice Johnson,alice@acme.com,555-0001,ACME Corp,Product Demo,45
+Bob Smith,bob@techco.com,555-0002,Tech Co,Budget Planning,90
+Carol White,carol@startup.io,555-0003,StartUp Inc,Implementation Kickoff,120
+Dave Brown,dave@enterprise.com,555-0004,Enterprise Ltd,Quarterly Review,60

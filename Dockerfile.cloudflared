@@ -1,0 +1,12 @@
+FROM cloudflare/cloudflared:latest
+
+# Create directory for config
+WORKDIR /etc/cloudflared
+
+# Copy credentials and certificate  
+COPY tunnel-creds.json ./
+COPY cert.pem ./
+COPY cloudflared-config.yml ./config.yml
+
+# Run tunnel with config
+ENTRYPOINT ["cloudflared", "tunnel", "--config", "config.yml", "run"]

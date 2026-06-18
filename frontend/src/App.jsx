@@ -1,10 +1,28 @@
-﻿import React, { useEffect, useMemo, useState } from 'react'
+﻿import React, { Component, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
+
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null } }
+  static getDerivedStateFromError(error) { return { hasError: true, error } }
+  componentDidCatch(error, info) { console.error('React ErrorBoundary:', error, info) }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, textAlign: 'center' }}>
+          <h2 style={{ color: 'var(--ig-red)' }}>Something went wrong</h2>
+          <p style={{ color: 'var(--ig-muted)', margin: '12px 0' }}>{this.state.error?.message || 'Unknown error'}</p>
+          <button className="add-btn" onClick={() => this.setState({ hasError: false, error: null })}>Retry</button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
 
@@ -508,8 +526,632 @@ function PortfolioTab({ token, preferredMarket }) {
               </div>
             )}
             {!llmReview && <p className="section-note">Click "Get AI Review" for risk assessment, diversification score, rebalancing suggestions, and 3-scenario stress test (bull / bear / crash).</p>}
-          </section>
-        </>
+            </section>
+
+            {/* Backtest panel */}
+            <section className="panel" style={{ marginTop: 16 }}>
+              <div className="section-header">
+                <h2>📊 Weekly Pick Performance vs Benchmark</h2>
+                <button className="btn-secondary" onClick={fetchBacktest} disabled={backtestLoading}>
+                  {backtestLoading ? 'Loading...' : '📈 Load Backtest'}
+                </button>
+              </div>
+              {!backtestData && !backtestLoading && (
+                <p className="section-note">Click "Load Backtest" to see how past weekly picks performed vs the ASX200 benchmark.</p>
+              )}
+              {backtestData?.summary && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 12 }}>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Direction Accuracy</span>
+                        <span className="stat-value">{backtestData.summary.direction_accuracy_pct?.toFixed(1)}%</span>
+                      </div>
+                    </div>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Avg Predicted</span>
+                        <span className="stat-value" style={{ color: 'var(--ig-blue)' }}>{backtestData.summary.avg_predicted_pct >= 0 ? '+' : ''}{backtestData.summary.avg_predicted_pct?.toFixed(2)}%</span>
+                      </div>
+                    </div>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Avg Actual</span>
+                        <span className="stat-value" style={{ color: backtestData.summary.avg_actual_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{backtestData.summary.avg_actual_pct >= 0 ? '+' : ''}{backtestData.summary.avg_actual_pct?.toFixed(2)}%</span>
+                      </div>
+                    </div>
+                    {backtestData.summary.benchmark_6mo_pct != null && (
+                      <div className={`stat-card ${backtestData.summary.outperform ? 'green' : 'red'}`}>
+                        <div className="stat-content">
+                          <span className="stat-title">XJO 6mo Benchmark</span>
+                          <span className="stat-value">{backtestData.summary.benchmark_6mo_pct >= 0 ? '+' : ''}{backtestData.summary.benchmark_6mo_pct?.toFixed(2)}%</span>
+                          <span style={{ fontSize: 10, color: backtestData.summary.outperform ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                            {backtestData.summary.outperform ? 'Picks OUTPERFORM' : 'Picks UNDERPERFORM'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {backtestData.weeks?.length > 0 && (
+                    <div className="table-wrap">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Week</th>
+                            <th>Picks</th>
+                            <th>Avg Predicted</th>
+                            <th>Avg Actual</th>
+                            <th>Direction Acc</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {backtestData.weeks.map(w => (
+                            <tr key={w.week}>
+                              <td><strong>{w.week}</strong></td>
+                              <td>{w.picks_count}</td>
+                              <td style={{ color: w.avg_predicted_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{w.avg_predicted_pct >= 0 ? '+' : ''}{w.avg_predicted_pct}%</td>
+                              <td style={{ color: w.avg_actual_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{w.avg_actual_pct >= 0 ? '+' : ''}{w.avg_actual_pct}%</td>
+                              <td style={{ color: w.direction_accuracy >= 50 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>{w.direction_accuracy}%</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <p style={{ fontSize: 11, color: 'var(--ig-muted)', marginTop: 8 }}>
+                    Evaluated {backtestData.summary.total_picks_evaluated} picks. Direction accuracy measures whether the predicted direction (up/down) matched actual outcome 7 days later.
+                  </p>
+                </div>
+              )}
+              {backtestData && !backtestData.summary && (
+                <p className="section-note">No evaluated picks yet. Weekly picks need to age 7 days before backtest data is available.</p>
+              )}
+            </section>
+          </>
+      )}
+    </div>
+  )
+}
+
+// ─── Wealth Builder Tab ───────────────────────────────────────────────────────
+const zoneColors = { clear: 'var(--ig-gain)', caution: '#f59e0b', avoid: 'var(--ig-red)' }
+const zoneEmoji = { clear: '🟢', caution: '🟡', avoid: '🔴' }
+
+function WealthBuilderTab({ token, preferredMarket, setActiveTab }) {
+  const authH = () => ({ headers: { Authorization: `Bearer ${token}` } })
+
+  const [form, setForm] = useState({
+    market: preferredMarket || 'AU',
+    min_analyst_upside: 5,
+    min_score: 0.45,
+    min_prob_5pct: 40,
+    max_symbols: 20,
+    send_telegram: false,
+    scan_mode: 'top',
+  })
+  const [result, setResult] = useState(null)
+  const [cachedResult, setCachedResult] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [cacheLoading, setCacheLoading] = useState(false)
+  const [err, setErr] = useState(null)
+  const [expandedRow, setExpandedRow] = useState(null)
+  const [scanStartTime, setScanStartTime] = useState(null)
+  const [elapsedDisplay, setElapsedDisplay] = useState(0)
+
+  // Timer for live elapsed counter during scan
+  useEffect(() => {
+    if (!loading) return
+    const start = Date.now()
+    setScanStartTime(start)
+    setElapsedDisplay(0)
+    const t = setInterval(() => {
+      setElapsedDisplay(Math.round((Date.now() - start) / 1000))
+    }, 1000)
+    return () => clearInterval(t)
+  }, [loading])
+
+  const run = async () => {
+    setLoading(true)
+    setErr(null)
+    setResult(null)
+    try {
+      const r = await axios.post(`${API_BASE}/signals/wealth-builder`, form, { ...authH(), timeout: 300000 })
+      setResult(r.data)
+    } catch (e) {
+      setErr(e.response?.data?.detail || e.message || 'Scan failed')
+    }
+    setLoading(false)
+  }
+
+  const loadCached = async () => {
+    setCacheLoading(true)
+    setErr(null)
+    setCachedResult(null)
+    try {
+      const r = await axios.get(`${API_BASE}/signals/wealth-builder/cached-broad`, {
+        ...authH(),
+        params: { market: form.market, min_score: form.min_score, min_prob_5pct: form.min_prob_5pct, min_analyst_upside: form.min_analyst_upside }
+      })
+      setCachedResult(r.data)
+    } catch (e) {
+      setErr('No cached scan yet. Broad scan runs at 5AM daily.')
+    }
+    setCacheLoading(false)
+  }
+
+  const displayResult = result || cachedResult
+
+  const estTime = form.scan_mode === 'broad' ? '30-90s' : '15-40s'
+  return (
+    <div>
+      {err && <div className="error-toast"><p>{err}</p><button onClick={() => setErr(null)}>×</button></div>}
+
+      {/* Loading overlay */}
+      {loading && (
+        <div className="wealth-loading-overlay">
+          <div className="spinner" />
+          <h3 style={{ margin: '16px 0 8px', color: 'var(--ig-dark)' }}>Running Wealth Builder Scan</h3>
+          <p style={{ color: 'var(--ig-muted)', marginBottom: 4 }}>
+            Screening {form.scan_mode === 'broad' ? form.max_symbols : 40} stocks across multiple factors
+          </p>
+          <p style={{ color: 'var(--ig-medium)', fontSize: 12, marginBottom: 8 }}>
+            Fetching price data, valuations, analyst targets, and entry timing...
+          </p>
+          <p style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 14, fontWeight: 700, color: 'var(--ig-red)' }}>
+            {elapsedDisplay > 0 ? `⏱ ${elapsedDisplay}s elapsed` : 'Starting...'}
+          </p>
+          <p style={{ color: 'var(--ig-muted)', fontSize: 11, marginTop: 8 }}>
+            Estimated wait: ~{estTime} | Tip: Use <strong>⚡ Quick Load</strong> for instant 5AM cached results
+          </p>
+        </div>
+      )}
+
+      <section className="panel" style={{ marginBottom: 16 }}>
+        <div className="section-header">
+          <h2>🏦 Wealth Builder — Multi-Factor Signal Screener</h2>
+          <button className="btn-secondary" onClick={() => setActiveTab('tracker')} style={{ fontSize: 11 }}>
+            ← Back to Strategy
+          </button>
+        </div>
+        <p className="section-note" style={{ marginBottom: 12 }}>
+          Combines technical score, analyst consensus targets, earnings catalyst timing, and short interest to surface high-conviction entry opportunities. <strong>Tip:</strong> Use the AI Analyzer on the Strategy tab to get forecasted shares, then screen them here with multi-factor validation.
+        </p>
+
+        <div className="wealth-controls" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 12 }}>
+          {/* Market */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Market</label>
+            <select className="provider-select" value={form.market}
+              onChange={e => setForm(p => ({ ...p, market: e.target.value }))}>
+              <option value="AU">🇦🇺 ASX</option>
+              <option value="US">🇺🇸 NASDAQ</option>
+              <option value="IN">🇮🇳 NSE</option>
+            </select>
+          </div>
+
+          {/* Min analyst upside */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min Upside %</label>
+            <input className="search-input" type="number" min="-20" max="100" style={{ width: 90 }}
+              value={form.min_analyst_upside}
+              onChange={e => setForm(p => ({ ...p, min_analyst_upside: parseFloat(e.target.value) || 0 }))} />
+          </div>
+
+          {/* Min score */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min Score</label>
+            <input className="search-input" type="number" min="0" max="1" step="0.05" style={{ width: 80 }}
+              value={form.min_score}
+              onChange={e => setForm(p => ({ ...p, min_score: parseFloat(e.target.value) || 0 }))} />
+          </div>
+
+          {/* Min P(≥5%) */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min P(≥5%)</label>
+            <input className="search-input" type="number" min="0" max="100" style={{ width: 80 }}
+              value={form.min_prob_5pct}
+              onChange={e => setForm(p => ({ ...p, min_prob_5pct: parseFloat(e.target.value) || 0 }))} />
+          </div>
+
+          {/* Max scan */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Max Scan</label>
+            <input className="search-input" type="number" min="5" max="100" style={{ width: 70 }}
+              value={form.max_symbols}
+              onChange={e => setForm(p => ({ ...p, max_symbols: parseInt(e.target.value) || 20 }))} />
+          </div>
+
+          {/* Scan mode toggle */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Universe</label>
+            <select className="provider-select" value={form.scan_mode}
+              onChange={e => setForm(p => ({ ...p, scan_mode: e.target.value }))}
+              style={{ width: 90, fontSize: 11 }}>
+              <option value="top">Top 40</option>
+              <option value="broad">Broad 200+</option>
+            </select>
+          </div>
+
+          {/* Telegram */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', paddingBottom: 4, whiteSpace: 'nowrap' }}>
+            <input type="checkbox" checked={form.send_telegram}
+              onChange={e => setForm(p => ({ ...p, send_telegram: e.target.checked }))} />
+            📱 Telegram
+          </label>
+
+          <button className="add-btn" onClick={run} disabled={loading} style={{ paddingInline: 24, whiteSpace: 'nowrap' }}>
+            {loading ? '⏳ Scanning…' : '🔍 Run Screen'}
+          </button>
+          <button className="btn-secondary" onClick={loadCached} disabled={cacheLoading} style={{ whiteSpace: 'nowrap', fontSize: 11 }}>
+            {cacheLoading ? '⏳…' : '⚡ Quick Load'}
+          </button>
+        </div>
+
+        {/* Legend */}
+        <div className="legend-row" style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--ig-medium)', flexWrap: 'wrap' }}>
+          <span>🟢 Clear entry</span>
+          <span>🟡 Caution</span>
+          <span>🔴 Avoid</span>
+        </div>
+      </section>
+
+      {/* Summary bar */}
+      {displayResult && (
+        <section className="stats-grid" style={{ marginBottom: 16 }}>
+          <div className="stat-card blue">
+            <div className="stat-content">
+              <span className="stat-title">Screened</span>
+              <span className="stat-value">{displayResult.screened}</span>
+            </div>
+          </div>
+          <div className="stat-card blue">
+            <div className="stat-content">
+              <span className="stat-title">Candidates Found</span>
+              <span className="stat-value" style={{ color: displayResult.candidates_found > 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                {displayResult.candidates_found}
+              </span>
+            </div>
+          </div>
+          <div className="stat-card blue">
+            <div className="stat-content">
+              <span className="stat-title">Clear Entry</span>
+              <span className="stat-value" style={{ color: 'var(--ig-gain)' }}>
+                {displayResult.candidates?.filter(c => c.entry_timing?.entry_zone === 'clear').length || 0}
+              </span>
+            </div>
+          </div>
+          <div className="stat-card blue">
+            <div className="stat-content">
+              <span className="stat-title">Telegram</span>
+              <span className="stat-value" style={{ fontSize: 13 }}>
+                {displayResult.telegram?.sent ? '✅ Sent' : '—'}
+              </span>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Results table */}
+      {displayResult && displayResult.candidates?.length > 0 && (
+        <section className="panel">
+          <div className="section-header">
+            <h2>Candidates — ranked by Wealth Score {cachedResult && <span style={{ background: 'var(--ig-gain)', color: 'white', fontSize: 10, padding: '2px 8px', borderRadius: 3, marginLeft: 8 }}>CACHED {cachedResult.generated_at ? `@ ${new Date(cachedResult.generated_at).toLocaleString([], { hour: '2-digit', minute: '2-digit' })}` : ''}</span>}</h2>
+          </div>
+          
+          {/* Mobile card view */}
+          <div className="mobile-card-list">
+            {displayResult.candidates.map((c, idx) => {
+              const et = c.entry_timing || {}
+              const zone = et.entry_zone || 'caution'
+              const upside = c.analyst_upside_pct
+              const predChg = c.predicted_change_pct || 0
+              const isExpanded = expandedRow === idx
+              return (
+                <div key={c.symbol} className="mobile-card" onClick={() => setExpandedRow(isExpanded ? null : idx)}>
+                  <div className="mobile-card-header">
+                    <div>
+                      <div className="mobile-card-symbol">#{idx + 1} {c.symbol}</div>
+                      <div className="mobile-card-name">{c.name?.slice(0, 30)}</div>
+                    </div>
+                    <div style={{ textAlign: 'right' }}>
+                      <div className="mobile-card-price">${c.current_price?.toFixed(2)}</div>
+                      <div style={{ color: c.change_percent >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 12, fontWeight: 600 }}>
+                        {c.change_percent >= 0 ? '+' : ''}{c.change_percent?.toFixed(2)}%
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mobile-card-grid">
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Score</span>
+                      <span className="mobile-card-value" style={{ color: (c.score || 0) >= 0.65 ? 'var(--ig-gain)' : 'var(--ig-dark)' }}>{(c.score || 0).toFixed(2)}</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">P(≥5%)</span>
+                      <span className="mobile-card-value">{(c.prob_ge_5pct || 0).toFixed(1)}%</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Forecast</span>
+                      <span className="mobile-card-value" style={{ color: predChg >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{predChg >= 0 ? '+' : ''}{predChg?.toFixed(1)}%</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Upside</span>
+                      <span className="mobile-card-value" style={{ color: upside >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{upside != null ? `${upside >= 0 ? '+' : ''}${upside.toFixed(1)}%` : '—'}</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Entry</span>
+                      <span className="mobile-card-value" style={{ color: zoneColors[zone] }}>{zoneEmoji[zone]} {zone.toUpperCase()}</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Rec</span>
+                      <span className="mobile-card-value" style={{ textTransform: 'uppercase', color: 'var(--ig-blue)' }}>{(c.analyst_recommendation || '—').toUpperCase()}</span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Liq</span>
+                      <span className="mobile-card-value" style={{ color: c.liquidity_ok !== false ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 10 }}>
+                        {c.liquidity_ok !== false ? '✓ OK' : (c.liquidity_flags || []).join(' ')}
+                      </span>
+                    </div>
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">EPS</span>
+                      <span className="mobile-card-value" style={{ color: (c.earnings_quality_flags || []).length === 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 10 }}>
+                        {(c.earnings_quality_flags || []).length === 0 ? '✓ OK' : (c.earnings_quality_flags || []).join(' ')}
+                      </span>
+                    </div>
+                    {c.rel_strength_3m != null && (
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">vs Sector</span>
+                      <span className="mobile-card-value" style={{ color: c.rel_strength_3m >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                        {c.rel_strength_3m >= 0 ? '+' : ''}{c.rel_strength_3m.toFixed(1)}%
+                      </span>
+                    </div>
+                    )}
+                    {c.avg_volume != null && (
+                    <div className="mobile-card-row">
+                      <span className="mobile-card-label">Avg Vol</span>
+                      <span className="mobile-card-value">{c.avg_volume > 1000000 ? `${(c.avg_volume / 1000000).toFixed(1)}M` : c.avg_volume > 1000 ? `${(c.avg_volume / 1000).toFixed(0)}K` : c.avg_volume}</span>
+                    </div>
+                    )}
+                  </div>
+                  {isExpanded && (
+                    <div className="mobile-card-expand">
+                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Entry Timing:</strong> {zoneEmoji[zone]} {zone.toUpperCase()} — {et.reason}</div>
+                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Earnings:</strong> {c.next_earnings_date || 'N/A'} {c.days_to_earnings != null && <span style={{ color: c.days_to_earnings <= 7 ? 'var(--ig-red)' : c.days_to_earnings <= 30 ? '#f59e0b' : 'var(--ig-medium)' }}>({c.days_to_earnings}d)</span>}</div>
+                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Target:</strong> ${c.analyst_target_mean?.toFixed(2) || '—'} | <strong>Short:</strong> {c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : '—'}</div>
+                      <div style={{ fontSize: 11 }}><strong>P/E:</strong> {c.pe ? `${c.pe.toFixed(1)}x` : '—'} | <strong>Fwd P/E:</strong> {c.forward_pe ? `${c.forward_pe.toFixed(1)}x` : '—'} | <strong>EPS Growth:</strong> {c.eps_growth_fwd_pct != null ? `${c.eps_growth_fwd_pct > 0 ? '+' : ''}${c.eps_growth_fwd_pct.toFixed(1)}%` : '—'}</div>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+          
+          {/* Desktop table view */}
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Symbol</th>
+                  <th>Price</th>
+                  <th>Chg%</th>
+                  <th>Score</th>
+                  <th>P(≥5%)</th>
+                  <th>Forecast</th>
+                  <th>Target</th>
+                  <th>Upside</th>
+                  <th>Liq</th>
+                  <th>EPS</th>
+                  <th>vsSect</th>
+                  <th>Entry</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {displayResult.candidates.map((c, idx) => {
+                  const et = c.entry_timing || {}
+                  const zone = et.entry_zone || 'caution'
+                  const upside = c.analyst_upside_pct
+                  const predChg = c.predicted_change_pct || 0
+                  const isExpanded = expandedRow === idx
+                  return (
+                    <>
+                      <tr key={c.symbol} style={{ cursor: 'pointer' }} onClick={() => setExpandedRow(isExpanded ? null : idx)}>
+                        <td style={{ fontWeight: 600, opacity: 0.6 }}>{idx + 1}</td>
+                        <td><strong>{c.symbol}</strong><br /><span style={{ fontSize: 10, opacity: 0.6 }}>{c.name?.slice(0, 22)}</span></td>
+                        <td>${c.current_price?.toFixed(2)}</td>
+                        <td style={{ color: c.change_percent >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                          {c.change_percent >= 0 ? '+' : ''}{c.change_percent?.toFixed(2)}%
+                        </td>
+                        <td>
+                          <div className="weight-bar-wrap">
+                            <div className="weight-bar-fill" style={{ width: `${(c.score || 0) * 100}%`, background: (c.score || 0) >= 0.65 ? 'var(--ig-gain)' : 'var(--ig-blue)' }} />
+                            <span className="weight-pct">{(c.score || 0).toFixed(2)}</span>
+                          </div>
+                        </td>
+                        <td>{(c.prob_ge_5pct || 0).toFixed(1)}%</td>
+                        <td style={{ color: predChg >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
+                          {predChg >= 0 ? '+' : ''}{predChg?.toFixed(1)}%
+                        </td>
+                        <td>${c.analyst_target_mean?.toFixed(2) || '—'}</td>
+                        <td style={{ color: upside >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
+                          {upside != null ? `${upside >= 0 ? '+' : ''}${upside.toFixed(1)}%` : '—'}
+                        </td>
+                        <td style={{ fontSize: 10, color: c.liquidity_ok !== false ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
+                          {c.liquidity_ok !== false ? '✓' : (c.liquidity_flags || []).join(' ')}
+                        </td>
+                        <td style={{ fontSize: 10, color: (c.earnings_quality_flags || []).length === 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
+                          {(c.earnings_quality_flags || []).length === 0 ? '✓' : (c.earnings_quality_flags || []).join(' ')}
+                        </td>
+                        <td style={{ fontSize: 10, color: (c.rel_strength_3m || 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
+                          {c.rel_strength_3m != null ? `${c.rel_strength_3m >= 0 ? '+' : ''}${c.rel_strength_3m.toFixed(1)}%` : '—'}
+                        </td>
+                        <td style={{ color: zoneColors[zone], fontWeight: 700 }}>
+                          {zoneEmoji[zone]} {zone.toUpperCase()}
+                        </td>
+                        <td>
+                          <button className="btn-secondary" style={{ fontSize: 11, padding: '2px 8px' }}
+                            onClick={e => { e.stopPropagation(); setExpandedRow(isExpanded ? null : idx) }}>
+                            {isExpanded ? '▲' : '▼'}
+                          </button>
+                        </td>
+                      </tr>
+
+                      {isExpanded && (
+                        <tr key={`${c.symbol}-detail`}>
+                          <td colSpan={14} style={{ background: 'var(--ig-light-grey)', padding: 16 }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }} className="expanded-detail-grid">
+                              {/* Entry timing */}
+                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
+                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📅 Entry Timing</p>
+                                <p style={{ fontSize: 12, color: zoneColors[zone], fontWeight: 700 }}>{zoneEmoji[zone]} {zone.toUpperCase()}</p>
+                                <p style={{ fontSize: 11, color: 'var(--ig-medium)', marginTop: 4 }}>{et.reason}</p>
+                                <p style={{ fontSize: 11, marginTop: 6 }}>Earnings risk: <strong>{et.earnings_risk?.toUpperCase()}</strong></p>
+                                <p style={{ fontSize: 11 }}>Technicals confirmed: <strong>{et.technical_confirmed ? '✅ Yes' : '❌ No'}</strong></p>
+                              </div>
+
+                              {/* Valuation */}
+                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
+                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📊 Valuation</p>
+                                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                                  <tbody>
+                                    {[
+                                      ['P/E', c.pe ? `${c.pe.toFixed(1)}x` : '—'],
+                                      ['Fwd P/E', c.forward_pe ? `${c.forward_pe.toFixed(1)}x` : '—'],
+                                      ['EPS Growth', c.eps_growth_fwd_pct != null ? `${c.eps_growth_fwd_pct > 0 ? '+' : ''}${c.eps_growth_fwd_pct.toFixed(1)}%` : '—'],
+                                      ['52w High', c.valuation?.['52w_high'] ? `$${c.valuation['52w_high'].toFixed(2)}` : '—'],
+                                      ['From Peak', c.pct_from_52w_high != null ? `${c.pct_from_52w_high.toFixed(1)}%` : '—'],
+                                      ['Short %', c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : '—'],
+                                    ].map(([label, val]) => (
+                                      <tr key={label}>
+                                        <td style={{ color: 'var(--ig-medium)', paddingRight: 8 }}>{label}</td>
+                                        <td style={{ fontWeight: 600 }}>{val}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              {/* Risk / positioning */}
+                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
+                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>⚠️ Risk Checklist</p>
+                                <ul style={{ fontSize: 11, paddingLeft: 16, color: 'var(--ig-dark)', lineHeight: 1.8 }}>
+                                  <li style={{ color: (c.short_pct_float || 0) > 15 ? 'var(--ig-red)' : 'inherit' }}>
+                                    Short interest: {c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : 'N/A'} {(c.short_pct_float || 0) > 15 ? '⚠️ HIGH' : ''}
+                                  </li>
+                                  <li style={{ color: (c.days_to_earnings || 999) <= 14 ? '#f59e0b' : 'inherit' }}>
+                                    Earnings: {c.next_earnings_date || 'N/A'} {(c.days_to_earnings || 999) <= 14 ? '⚠️ NEAR' : ''}
+                                  </li>
+                                  <li>Sector: {c.valuation?.sector || '—'}</li>
+                                  <li># Analysts covering: {c.num_analyst_opinions || '—'}</li>
+                                  <li>Trend: {(c.trend || '—').toUpperCase()}</li>
+                                </ul>
+                                <p style={{ fontSize: 10, color: 'var(--ig-muted)', marginTop: 8 }}>
+                                  Suggested stop: ~8% below entry | Target: analyst mean ${c.analyst_target_mean?.toFixed(2) || '—'}
+                                </p>
+                              </div>
+
+                              {/* Quality & Momentum */}
+                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
+                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📈 Quality &amp; Momentum</p>
+                                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+                                  <tbody>
+                                    {[
+                                      ['Liquidity', c.liquidity_ok !== false ? '✓ OK' : '⚠ LOW'],
+                                      ['Avg Vol', c.avg_volume != null ? (c.avg_volume > 1e6 ? `${(c.avg_volume / 1e6).toFixed(1)}M` : `${(c.avg_volume / 1000).toFixed(0)}K`) : '—'],
+                                      ['EPS', c.trailing_eps != null ? (c.trailing_eps > 0 ? `$${c.trailing_eps.toFixed(2)}` : `⚠ -$${Math.abs(c.trailing_eps).toFixed(2)}`) : '—'],
+                                      ['Rev Growth', c.revenue_growth != null ? `${(c.revenue_growth * 100).toFixed(1)}%` : '—'],
+                                      ['vs Sector 3m', c.rel_strength_3m != null ? `${c.rel_strength_3m >= 0 ? '+' : ''}${c.rel_strength_3m.toFixed(1)}%` : '—'],
+                                      ['Sector 1m', c.sector_perf_1mo != null ? `${c.sector_perf_1mo >= 0 ? '+' : ''}${c.sector_perf_1mo.toFixed(1)}%` : '—'],
+                                      ['EPS/Quality Flags', (c.earnings_quality_flags || []).length > 0 ? (c.earnings_quality_flags || []).join(', ') : '✓ All clear'],
+                                    ].map(([label, val]) => (
+                                      <tr key={label}>
+                                        <td style={{ color: 'var(--ig-medium)', paddingRight: 8 }}>{label}</td>
+                                        <td style={{ fontWeight: 600, fontSize: 10 }}>{val}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {displayResult && displayResult.candidates?.length === 0 && (
+        <section className="panel">
+          <p className="section-note">No candidates met the filter criteria. Try lowering the score threshold or analyst upside requirement.</p>
+        </section>
+      )}
+    </div>
+  )
+}
+
+// ─── Telegram Bot Command Guide ───────────────────────────────────────────────
+function TelegramBotGuide() {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <div style={{
+      background: 'linear-gradient(135deg,#f0f7ff 0%,#e8f3ff 100%)',
+      border: '1px solid #c3daff',
+      borderRadius: 10,
+      marginBottom: 14,
+      overflow: 'hidden',
+    }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%', background: 'none', border: 'none', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '12px 16px', fontWeight: 600, fontSize: 14, color: '#1a3a6b',
+        }}
+      >
+        <span>📱 Telegram Bot Commands — text your bot to update your portfolio</span>
+        <span style={{ fontSize: 12, color: '#5a80b0' }}>{open ? '▲ Hide' : '▼ Show'}</span>
+      </button>
+      {open && (
+        <div style={{ padding: '0 16px 16px', display: 'grid', gap: 10 }}>
+          <p style={{ margin: 0, fontSize: 13, color: '#3a5580' }}>
+            Text your Telegram bot to record trades, check your portfolio, or manage watchlist items.
+            Every trade command automatically starts position monitoring with alerts.
+          </p>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: '#d6e9ff' }}>
+                <th style={{ padding: '6px 10px', textAlign: 'left' }}>What to send</th>
+                <th style={{ padding: '6px 10px', textAlign: 'left' }}>What happens</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ['BUY BHP 100 45.50', 'Records buy · adds to watchlist · starts monitoring (8% stop, model target)'],
+                ['BUY BHP 100 @ 45.50', 'Same — @ is optional'],
+                ['ADD FMG 200 18.50', 'Records additional buy for existing position'],
+                ['SELL CBA 50 123.00', 'Records sell · closes position monitor'],
+                ['REDUCE WOW 100 30.00', 'Records partial sell'],
+                ['PORTFOLIO  or  P', 'Returns your current holdings summary'],
+                ['STATUS  or  S', 'Shows all open monitored positions with P&L'],
+                ['TRACK BHP', 'Adds BHP to your watchlist without recording a trade'],
+                ['HELP', 'Shows the full command reference'],
+              ].map(([cmd, desc], i) => (
+                <tr key={i} style={{ background: i % 2 === 0 ? '#fff' : '#f7faff' }}>
+                  <td style={{ padding: '5px 10px', fontFamily: 'monospace', color: '#0062cc', whiteSpace: 'nowrap' }}>{cmd}</td>
+                  <td style={{ padding: '5px 10px', color: '#445' }}>{desc}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p style={{ margin: 0, fontSize: 12, color: '#8a9ab0' }}>
+            ⚙️ To activate: link your Telegram chat ID in the <strong>Telegram Setup</strong> section below, then ask your admin to run <em>POST /api/telegram/register-webhook</em> once (or send <strong>any message</strong> to the bot after the backend URL is live).
+          </p>
+        </div>
       )}
     </div>
   )
@@ -522,6 +1164,12 @@ function App() {
   const [authMode, setAuthMode] = useState('login')
   const [authLoading, setAuthLoading] = useState(false)
   const [authForm, setAuthForm] = useState({ full_name: '', email: '', password: '' })
+  
+  // Forgot password states
+  const [forgotPasswordEmail, setForgotPasswordEmail] = useState('')
+  const [resetToken, setResetToken] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [resetInstructions, setResetInstructions] = useState('')
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -534,6 +1182,26 @@ function App() {
   const [aiSuggestions, setAiSuggestions] = useState([])
   const [rankedItems, setRankedItems] = useState([])
   const [selectedSymbols, setSelectedSymbols] = useState({})
+  const [telegramRecipients, setTelegramRecipients] = useState([])
+  const [telegramAdvice, setTelegramAdvice] = useState(null)
+  const [telegramDigest, setTelegramDigest] = useState(null)
+  const [telegramAdviceLoading, setTelegramAdviceLoading] = useState(false)
+  const [telegramDigestLoading, setTelegramDigestLoading] = useState(false)
+  const [telegramHistory, setTelegramHistory] = useState([])
+  const [telegramHistoryLoading, setTelegramHistoryLoading] = useState(false)
+  const [newTelegramChatId, setNewTelegramChatId] = useState('')
+  const [newTelegramLabel, setNewTelegramLabel] = useState('')
+  const [telegramRecipientSaving, setTelegramRecipientSaving] = useState(false)
+  const [adviceActions, setAdviceActions] = useState([])
+  const [adviceHoldings, setAdviceHoldings] = useState([])
+  const [adviceActionsLoading, setAdviceActionsLoading] = useState(false)
+  const [adviceActionSaving, setAdviceActionSaving] = useState(false)
+  const [adviceActionDrafts, setAdviceActionDrafts] = useState({})
+  const [positionHistory, setPositionHistory] = useState([])
+  const [positionHistoryLoading, setPositionHistoryLoading] = useState(false)
+  const [tradeDrafts, setTradeDrafts] = useState({})
+  const [paperTrades, setPaperTrades] = useState([])
+  const [paperTradeLoading, setPaperTradeLoading] = useState(false)
   const [trackingOverview, setTrackingOverview] = useState([])
   const [bucketCounts, setBucketCounts] = useState({ meeting_expectation: 0, non_meeting_expectation: 0 })
   const [metrics, setMetrics] = useState({ validation_hit_rate_pct: 0, average_forecast_error_pct: 0 })
@@ -546,6 +1214,7 @@ function App() {
   const [sentimentLoading, setSentimentLoading] = useState(false)
 
   const [analyzeSymbol, setAnalyzeSymbol] = useState('')
+  const [analyzeMarket, setAnalyzeMarket] = useState('AU')
   const [analyzeData, setAnalyzeData] = useState(null)
   const [analyzeLoading, setAnalyzeLoading] = useState(false)
   const [userNotes, setUserNotes] = useState('')
@@ -556,8 +1225,84 @@ function App() {
   const [rankLoading, setRankLoading] = useState(false)
   const [trackLoading, setTrackLoading] = useState(false)
 
+  // Phase 6 – Weekly Predictions
+  const [weeklyData, setWeeklyData] = useState(null)
+  const [weeklyLoading, setWeeklyLoading] = useState(false)
+  const [weeklyCap, setWeeklyCap] = useState('all')
+  const [weeklySectors, setWeeklySectors] = useState(null)
+  const [weeklySectorsLoading, setWeeklySectorsLoading] = useState(false)
+  const [backtestData, setBacktestData] = useState(null)
+  const [backtestLoading, setBacktestLoading] = useState(false)
+
+  // Phase 6 – Crypto Dashboard
+  const [cryptoMarket, setCryptoMarket] = useState(null)
+  const [cryptoLoading, setCryptoLoading] = useState(false)
+  const [cryptoDetail, setCryptoDetail] = useState(null)
+  const [cryptoDetailLoading, setCryptoDetailLoading] = useState(false)
+  const [cryptoSearch, setCryptoSearch] = useState('')
+  const [cryptoSearchResults, setCryptoSearchResults] = useState([])
+  const [cryptoWatchlist, setCryptoWatchlist] = useState([])
+  const [cryptoAnalysis, setCryptoAnalysis] = useState(null)
+  const [cryptoAnalysisLoading, setCryptoAnalysisLoading] = useState(false)
+
+  // Phase 6 – ETF Explorer
+  const [etfList, setEtfList] = useState(null)
+  const [etfLoading, setEtfLoading] = useState(false)
+  const [etfDetail, setEtfDetail] = useState(null)
+  const [etfDetailLoading, setEtfDetailLoading] = useState(false)
+  const [etfSearch, setEtfSearch] = useState('')
+  const [etfCompare, setEtfCompare] = useState(null)
+  const [etfCompareLoading, setEtfCompareLoading] = useState(false)
+  const [etfCompareTickers, setEtfCompareTickers] = useState('')
+  const [etfSpotlight, setEtfSpotlight] = useState(null)
+  const [etfSpotlightLoading, setEtfSpotlightLoading] = useState(false)
+
+  // Phase 6 – AI banner
+  const [aiBanner, setAiBanner] = useState(null)
+
   const authHeaders = () => ({ headers: { Authorization: `Bearer ${token}` } })
   const selectedCount = useMemo(() => Object.values(selectedSymbols).filter(Boolean).length, [selectedSymbols])
+  const activeStrategyDashboard = useMemo(
+    () => telegramAdvice?.strategy_dashboard || telegramDigest?.strategy_dashboard || null,
+    [telegramAdvice, telegramDigest],
+  )
+  const executionSnapshot = useMemo(() => {
+    const recent = (adviceActions || []).slice(0, 30)
+    let buyCount = 0
+    let reduceCount = 0
+    let netDeployed = 0
+    let commissions = 0
+
+    recent.forEach((item) => {
+      const action = String(item.action_type || '').toUpperCase()
+      const net = Number(item.net_amount || 0)
+      const fee = Number(item.commission || 0)
+      commissions += fee
+      if (action === 'BUY' || action === 'ADD' || action === 'HOLD') {
+        buyCount += 1
+        netDeployed += net
+      } else if (action === 'SELL' || action === 'REDUCE') {
+        reduceCount += 1
+        netDeployed -= net
+      }
+    })
+
+    const holdingsCost = (adviceHoldings || []).reduce((sum, item) => {
+      const invested = Number(item.invested_amount || 0)
+      if (invested > 0) return sum + invested
+      return sum + (Number(item.quantity || 0) * Number(item.avg_cost || 0))
+    }, 0)
+
+    return {
+      decisions: recent.length,
+      buyCount,
+      reduceCount,
+      netDeployed,
+      commissions,
+      holdingsCost,
+      holdingsTracked: (adviceHoldings || []).length,
+    }
+  }, [adviceActions, adviceHoldings])
 
   useEffect(() => {
     if (!token) { setLoading(false); return }
@@ -567,15 +1312,18 @@ function App() {
   const bootstrap = async () => {
     try {
       setLoading(true)
+      let marketValue = 'AU'
       try {
         const me = await axios.get(`${API_BASE}/auth/me`, authHeaders())
         setUser(me.data)
-        setPreferredMarket(me.data.preferred_market || 'AU')
+        marketValue = me.data.preferred_market || 'AU'
+        setPreferredMarket(marketValue)
+        setAnalyzeMarket(marketValue)
       } catch (authErr) {
         throw new Error(`Authentication failed (${authErr.response?.status}): ${authErr.response?.data?.detail || authErr.message}`)
       }
       try {
-        await Promise.all([fetchTopUniverse(), fetchTrackingOverview(), fetchMarketPulse(), fetchExplainability()])
+        await Promise.all([fetchTopUniverse(marketValue), fetchTrackingOverview(), fetchMarketPulse(), fetchExplainability(), fetchTelegramRecipients(), fetchTelegramHistory(), fetchAdviceActions(), fetchPaperTrades(), fetchPositionHistory()])
       } catch (dataErr) {
         setError(`Data load incomplete: ${dataErr.message}`)
       }
@@ -589,8 +1337,9 @@ function App() {
     }
   }
 
-  const fetchTopUniverse = async () => {
-    const r = await axios.get(`${API_BASE}/universe/top`, authHeaders())
+  const fetchTopUniverse = async (market) => {
+    const m = market || preferredMarket || 'AU'
+    const r = await axios.get(`${API_BASE}/universe/top`, { ...authHeaders(), params: { market: m } })
     const items = r.data?.items || []
     setTopUniverse(items)
     if (items.length > 0) await rankSymbols(items.map(i => i.symbol))
@@ -602,12 +1351,201 @@ function App() {
     setMetrics(r.data?.metrics || { validation_hit_rate_pct: 0, average_forecast_error_pct: 0 })
   }
   const fetchMarketPulse = async () => {
-    const r = await axios.get(`${API_BASE}/v1/market/pulse`, authHeaders())
-    setMarketPulse(r.data)
+    try {
+      const r = await axios.get(`${API_BASE}/v1/market/pulse`, authHeaders())
+      setMarketPulse(r.data)
+    } catch { /* non-critical – market tab will show retry */ }
   }
   const fetchExplainability = async () => {
     const r = await axios.get(`${API_BASE}/v1/backtest/summary`, authHeaders())
     setExplainability(r.data)
+  }
+
+  const fetchTelegramRecipients = async () => {
+    try {
+      const r = await axios.get(`${API_BASE}/telegram/recipients`, authHeaders())
+      setTelegramRecipients(r.data?.recipients || [])
+    } catch {
+      setTelegramRecipients([])
+    }
+  }
+
+  const fetchTelegramHistory = async () => {
+    setTelegramHistoryLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/telegram/history`, authHeaders())
+      setTelegramHistory(r.data?.items || [])
+    } catch {
+      setTelegramHistory([])
+    } finally {
+      setTelegramHistoryLoading(false)
+    }
+  }
+
+  const addTelegramRecipient = async () => {
+    if (!newTelegramChatId.trim()) {
+      setError('Enter a Telegram chat ID first.')
+      return
+    }
+    setTelegramRecipientSaving(true)
+    try {
+      await axios.post(`${API_BASE}/telegram/recipients`, {
+        chat_id: newTelegramChatId.trim(),
+        label: newTelegramLabel.trim() || null,
+      }, authHeaders())
+      setNewTelegramChatId('')
+      setNewTelegramLabel('')
+      await Promise.all([fetchTelegramRecipients(), fetchTelegramHistory()])
+      setError(null)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to add Telegram chat mapping.')
+    } finally {
+      setTelegramRecipientSaving(false)
+    }
+  }
+
+  const removeTelegramRecipient = async (recipientId) => {
+    try {
+      await axios.delete(`${API_BASE}/telegram/recipients/${recipientId}`, authHeaders())
+      await Promise.all([fetchTelegramRecipients(), fetchTelegramHistory()])
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to remove Telegram chat mapping.')
+    }
+  }
+
+  const fetchPositionHistory = async () => {
+    setPositionHistoryLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/positions/history`, authHeaders())
+      setPositionHistory(r.data?.items || [])
+    } catch {
+      setPositionHistory([])
+    } finally {
+      setPositionHistoryLoading(false)
+    }
+  }
+
+  const fetchAdviceActions = async () => {
+    setAdviceActionsLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/advice/actions`, authHeaders())
+      setAdviceActions(r.data?.items || [])
+      setAdviceHoldings(r.data?.holdings || [])
+    } catch {
+      setAdviceActions([])
+      setAdviceHoldings([])
+    } finally {
+      setAdviceActionsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!token || activeTab !== 'tracker') return
+    const timer = setInterval(() => {
+      fetchAdviceActions()
+    }, 15000)
+    return () => clearInterval(timer)
+  }, [token, activeTab])
+
+  useEffect(() => {
+    if (!telegramAdvice?.items?.length) return
+    setAdviceActionDrafts(prev => {
+      const next = { ...prev }
+      telegramAdvice.items.forEach((item) => {
+        if (!next[item.symbol]) {
+          next[item.symbol] = {
+            quantity: '',
+            execution_price: '',
+            commission: '',
+            notes: '',
+          }
+        }
+      })
+      return next
+    })
+  }, [telegramAdvice])
+
+  const logAdviceAction = async (item, forcedActionType = null) => {
+    const symbol = item?.symbol
+    if (!symbol) return
+    const draft = adviceActionDrafts[symbol] || {}
+    const quantity = Number(draft.quantity)
+    const executionPrice = Number(draft.execution_price)
+    const commission = draft.commission === '' || draft.commission == null ? null : Number(draft.commission)
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      setError(`Enter a valid quantity for ${symbol}.`)
+      return
+    }
+    if (!Number.isFinite(executionPrice) || executionPrice <= 0) {
+      setError(`Enter a valid execution price for ${symbol}.`)
+      return
+    }
+
+    const actionType = (forcedActionType || item.action || 'BUY').toUpperCase()
+    setAdviceActionSaving(true)
+    try {
+      await axios.post(`${API_BASE}/advice/actions`, {
+        symbol,
+        market: preferredMarket,
+        action_type: actionType,
+        quantity,
+        execution_price: executionPrice,
+        commission,
+        advice_cache_key: telegramAdvice?.cache_key || null,
+        source_message_type: 'hedge_advice',
+        notes: (draft.notes || '').trim() || null,
+      }, authHeaders())
+      await Promise.all([fetchAdviceActions(), fetchTrackingOverview()])
+      setAdviceActionDrafts(prev => ({
+        ...prev,
+        [symbol]: { quantity: '', execution_price: '', commission: '', notes: '' },
+      }))
+      setError(null)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to record executed action.')
+    } finally {
+      setAdviceActionSaving(false)
+    }
+  }
+
+  const fetchPaperTrades = async () => {
+    try {
+      const r = await axios.get(`${API_BASE}/paper-trades`, authHeaders())
+      setPaperTrades(r.data?.items || [])
+      const draftMap = {}
+      ;(r.data?.items || []).forEach((trade) => {
+        draftMap[trade.id] = {
+          stop_loss_price: trade.stop_loss_price ?? '',
+          take_profit_price: trade.take_profit_price ?? '',
+          trailing_stop_pct: trade.trailing_stop_pct ?? 3,
+          position_stage: trade.position_stage || 'entered',
+        }
+      })
+      setTradeDrafts(draftMap)
+    } catch {
+      setPaperTrades([])
+      setTradeDrafts({})
+    }
+  }
+
+  const updatePaperTradePlan = async (tradeId) => {
+    const draft = tradeDrafts[tradeId]
+    if (!draft) return
+    try {
+      setPaperTradeLoading(true)
+      await axios.patch(`${API_BASE}/paper-trades/${tradeId}`, {
+        stop_loss_price: draft.stop_loss_price === '' ? null : Number(draft.stop_loss_price),
+        take_profit_price: draft.take_profit_price === '' ? null : Number(draft.take_profit_price),
+        trailing_stop_pct: draft.trailing_stop_pct === '' ? null : Number(draft.trailing_stop_pct),
+        position_stage: draft.position_stage || null,
+      }, authHeaders())
+      await Promise.all([fetchPaperTrades(), fetchPositionHistory()])
+      setError(null)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to update trade plan.')
+    } finally {
+      setPaperTradeLoading(false)
+    }
   }
 
   const refreshMarketAnalysis = async () => {
@@ -636,13 +1574,265 @@ function App() {
     setAnalyzeData(null)
     setUserNotes('')
     try {
-      const r = await axios.get(`${API_BASE}/ai/analyze/${analyzeSymbol.trim().toUpperCase()}`, authHeaders())
+      const r = await axios.get(`${API_BASE}/ai/analyze/${analyzeSymbol.trim().toUpperCase()}`, {
+        ...authHeaders(),
+        params: { market: analyzeMarket },
+        timeout: 150000,
+      })
       setAnalyzeData(r.data)
       loadNotes(analyzeSymbol.trim().toUpperCase())
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to analyze share')
+      setError(err.response?.data?.detail || (err.code === 'ECONNABORTED' ? 'Analysis timed out – try again' : 'Failed to analyze share'))
     }
     setAnalyzeLoading(false)
+  }
+
+  // ─── Phase 6 Fetch Functions ─────────────────────────────────────────────────
+  const formatCurrency = (val, market) => {
+    if (val == null) return 'N/A'
+    if (market === 'IN') return '₹' + Number(val).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    return '$' + Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  }
+
+  const fetchWeeklyDigest = async () => {
+    setWeeklyLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/weekly/latest?market=${preferredMarket}`, authHeaders())
+      const raw = r.data
+      // Flatten picks_by_cap into a list with cap_tier field
+      const picks = []
+      let llm_summary = ''
+      if (raw.picks_by_cap) {
+        for (const [tier, data] of Object.entries(raw.picks_by_cap)) {
+          if (data.picks) {
+            for (const p of data.picks) picks.push({ ...p, cap_tier: tier })
+          }
+          if (data.ai_summary && !llm_summary) llm_summary = data.ai_summary
+        }
+      }
+      setWeeklyData({
+        picks,
+        llm_summary,
+        week_label: raw.week,
+        generated_at: raw.generated_at || new Date().toISOString(),
+        market: raw.market,
+        status: raw.status,
+        message: raw.message,
+        picks_by_sector: raw.picks_by_sector || {},
+      })
+    } catch { setWeeklyData(null) }
+    setWeeklyLoading(false)
+  }
+
+  const fetchWeeklySectors = async () => {
+    setWeeklySectorsLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/weekly/sectors?market=${preferredMarket}`, authHeaders())
+      setWeeklySectors(r.data)
+    } catch { setWeeklySectors(null) }
+    setWeeklySectorsLoading(false)
+  }
+
+  const fetchBacktest = async () => {
+    setBacktestLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/weekly/backtest?market=${preferredMarket}&weeks=8`, authHeaders())
+      setBacktestData(r.data)
+    } catch { setBacktestData(null) }
+    setBacktestLoading(false)
+  }
+
+  const generateWeekly = async () => {
+    setWeeklyLoading(true)
+    try {
+      await axios.post(`${API_BASE}/weekly/generate`, { market: preferredMarket }, authHeaders())
+      await fetchWeeklyDigest()
+    } catch { setError('Failed to generate weekly digest') }
+    setWeeklyLoading(false)
+  }
+
+  const fetchCryptoMarket = async () => {
+    setCryptoLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/crypto/market`, authHeaders())
+      setCryptoMarket(r.data)
+    } catch { setCryptoMarket(null) }
+    setCryptoLoading(false)
+  }
+
+  const fetchCryptoDetail = async (coinId) => {
+    setCryptoDetailLoading(true)
+    setCryptoAnalysis(null)
+    try {
+      const r = await axios.get(`${API_BASE}/crypto/${coinId}`, authHeaders())
+      setCryptoDetail(r.data)
+    } catch { setCryptoDetail(null) }
+    setCryptoDetailLoading(false)
+  }
+
+  const searchCrypto = async () => {
+    if (!cryptoSearch.trim()) return
+    try {
+      const r = await axios.get(`${API_BASE}/crypto/search?q=${encodeURIComponent(cryptoSearch)}`, authHeaders())
+      setCryptoSearchResults(r.data?.results || [])
+    } catch { setCryptoSearchResults([]) }
+  }
+
+  const fetchCryptoWatchlist = async () => {
+    try {
+      const r = await axios.get(`${API_BASE}/crypto/watchlist`, authHeaders())
+      setCryptoWatchlist(r.data?.coins || [])
+    } catch { setCryptoWatchlist([]) }
+  }
+
+  const addCryptoWatchlist = async (coinId) => {
+    try {
+      await axios.post(`${API_BASE}/crypto/watchlist`, { coin_id: coinId }, authHeaders())
+      await fetchCryptoWatchlist()
+    } catch { /* already exists */ }
+  }
+
+  const removeCryptoWatchlist = async (coinId) => {
+    try {
+      await axios.delete(`${API_BASE}/crypto/watchlist/${coinId}`, authHeaders())
+      await fetchCryptoWatchlist()
+    } catch {}
+  }
+
+  const analyzeCrypto = async (coinId) => {
+    setCryptoAnalysisLoading(true)
+    try {
+      const r = await axios.post(`${API_BASE}/crypto/${coinId}/analyze`, {}, authHeaders())
+      setCryptoAnalysis(r.data)
+    } catch { setError('Failed to analyze crypto') }
+    setCryptoAnalysisLoading(false)
+  }
+
+  const fetchEtfList = async () => {
+    setEtfLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/etf/list?market=${preferredMarket}`, authHeaders())
+      // Normalize: backend returns {categories: {...}} or {etfs: {...}}
+      const cats = r.data?.categories || r.data?.etfs || r.data || {}
+      setEtfList({ etfs: cats })
+    } catch { setEtfList(null) }
+    setEtfLoading(false)
+  }
+
+  const fetchEtfDetail = async (ticker) => {
+    setEtfDetailLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/etf/${encodeURIComponent(ticker)}`, authHeaders())
+      setEtfDetail(r.data)
+    } catch { setEtfDetail(null) }
+    setEtfDetailLoading(false)
+  }
+
+  const compareEtfs = async () => {
+    if (!etfCompareTickers.trim()) return
+    setEtfCompareLoading(true)
+    try {
+      const tickers = etfCompareTickers.split(',').map(t => t.trim()).filter(Boolean)
+      const r = await axios.post(`${API_BASE}/etf/compare`, { tickers }, authHeaders())
+      setEtfCompare(r.data)
+    } catch { setError('Failed to compare ETFs') }
+    setEtfCompareLoading(false)
+  }
+
+  const fetchEtfSpotlight = async () => {
+    setEtfSpotlightLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/etf/spotlight?market=${preferredMarket}`, authHeaders())
+      setEtfSpotlight(r.data)
+    } catch { setEtfSpotlight(null) }
+    setEtfSpotlightLoading(false)
+  }
+
+  const fetchAiBanner = async () => {
+    try {
+      const r = await axios.get(`${API_BASE}/ai/weekly-summary?market=${preferredMarket}`, authHeaders())
+      setAiBanner(r.data)
+    } catch { setAiBanner(null) }
+  }
+
+  const getAdviceSymbols = () => {
+    const selected = Object.entries(selectedSymbols).filter(([, checked]) => checked).map(([symbol]) => symbol)
+    if (selected.length > 0) return selected
+    const tracked = (trackingOverview || []).map(item => item.symbol).filter(Boolean)
+    if (tracked.length > 0) return tracked.slice(0, 5)
+    return rankedItems.slice(0, 5).map(item => item.symbol)
+  }
+
+  const requestTelegramAdvice = async (sendTelegram = false) => {
+    const symbols = getAdviceSymbols()
+    if (!symbols.length) {
+      setError('Rank some shares or select rows first.')
+      return
+    }
+    setTelegramAdviceLoading(true)
+    try {
+      const r = await axios.post(`${API_BASE}/ai/hedge-advice`, {
+        symbols,
+        market: preferredMarket,
+        limit: 5,
+        send_telegram: sendTelegram,
+      }, { ...authHeaders(), timeout: 30000 })
+      setTelegramAdvice(r.data)
+      await Promise.all([fetchTelegramRecipients(), fetchTelegramHistory()])
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to generate Telegram advice.')
+    } finally {
+      setTelegramAdviceLoading(false)
+    }
+  }
+
+  const requestDailyDigest = async (sendTelegram = false) => {
+    setTelegramDigestLoading(true)
+    try {
+      const r = await axios.post(`${API_BASE}/ai/daily-digest`, {
+        market: preferredMarket,
+        limit: 5,
+        send_telegram: sendTelegram,
+      }, { ...authHeaders(), timeout: 30000 })
+      setTelegramDigest(r.data)
+      await Promise.all([fetchTelegramRecipients(), fetchTelegramHistory()])
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to generate daily digest.')
+    } finally {
+      setTelegramDigestLoading(false)
+    }
+  }
+
+  const openPaperTrade = async (item) => {
+    try {
+      setPaperTradeLoading(true)
+      const side = item.action === 'REDUCE' ? 'SHORT' : 'LONG'
+      await axios.post(`${API_BASE}/paper-trades`, {
+        symbol: item.symbol,
+        market: preferredMarket,
+        side,
+        quantity: 100,
+        notes: `Opened from ${item.action} signal`,
+      }, authHeaders())
+      await Promise.all([fetchPaperTrades(), fetchPositionHistory()])
+      setError(null)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to open paper trade.')
+    } finally {
+      setPaperTradeLoading(false)
+    }
+  }
+
+  const closePaperTrade = async (tradeId) => {
+    try {
+      setPaperTradeLoading(true)
+      await axios.post(`${API_BASE}/paper-trades/${tradeId}/close`, {}, authHeaders())
+      await Promise.all([fetchPaperTrades(), fetchPositionHistory()])
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to close paper trade.')
+    } finally {
+      setPaperTradeLoading(false)
+    }
   }
 
   const loadNotes = async (symbol) => {
@@ -727,15 +1917,55 @@ function App() {
 
   const updateMarket = async (market) => {
     setPreferredMarket(market)
+    setAnalyzeMarket(market)
     try {
       await axios.put(`${API_BASE}/auth/me/market`, { market }, authHeaders())
     } catch { /* non-critical */ }
+    fetchTopUniverse(market)
   }
 
   const logout = () => {
     localStorage.removeItem('asx_token')
     setToken(''); setUser(null)
     setTopUniverse([]); setAiSuggestions([]); setRankedItems([]); setTrackingOverview([])
+  }
+
+  const handleForgotPassword = async (e) => {
+    e.preventDefault()
+    setAuthLoading(true)
+    setError(null)
+    try {
+      const r = await axios.post(`${API_BASE}/auth/forgot-password`, { email: forgotPasswordEmail })
+      setResetToken(r.data.reset_token)
+      setResetInstructions(r.data.instructions)
+      setAuthMode('reset')
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to send reset token')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handleResetPassword = async (e) => {
+    e.preventDefault()
+    setAuthLoading(true)
+    setError(null)
+    try {
+      await axios.post(`${API_BASE}/auth/reset-password`, { 
+        token: resetToken, 
+        new_password: newPassword 
+      })
+      setResetToken('')
+      setNewPassword('')
+      setForgotPasswordEmail('')
+      setAuthMode('login')
+      setError(null)
+      setTimeout(() => alert('✅ Password reset successfully! Please log in with your new password.'), 500)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to reset password')
+    } finally {
+      setAuthLoading(false)
+    }
   }
 
   // IG-compatible inline style helpers
@@ -771,8 +2001,88 @@ function App() {
               {authLoading ? 'Please wait...' : authMode === 'register' ? 'Create account' : 'Sign in'}
             </button>
           </form>
-          <button type="button" className="auth-switch" onClick={() => setAuthMode(authMode === 'register' ? 'login' : 'register')}>
-            {authMode === 'register' ? 'Already have an account? Sign in' : 'Need an account? Register'}
+          {authMode !== 'reset' && (
+            <>
+              <button type="button" className="auth-switch" onClick={() => setAuthMode(authMode === 'register' ? 'login' : 'register')}>
+                {authMode === 'register' ? 'Already have an account? Sign in' : 'Need an account? Register'}
+              </button>
+              {authMode === 'login' && (
+                <button type="button" className="auth-switch" onClick={() => setAuthMode('forgot')} style={{ marginTop: 8, fontSize: '12px', opacity: 0.8 }}>
+                  Forgot your password?
+                </button>
+              )}
+            </>
+          )}
+          {error && <p className="auth-error">{error}</p>}
+        </div>
+      </div>
+    )
+  }
+
+  if (authMode === 'forgot') {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <div className="auth-brand">
+            <p className="auth-eyebrow">Reset Your Password</p>
+            <h1>Enter your email</h1>
+            <p>We'll send you a reset token to create a new password.</p>
+          </div>
+          <form className="auth-form" onSubmit={handleForgotPassword}>
+            <input 
+              type="email" 
+              placeholder="Enter your email" 
+              value={forgotPasswordEmail}
+              onChange={(e) => setForgotPasswordEmail(e.target.value)} 
+              className="search-input" 
+              required 
+            />
+            <button type="submit" className="add-btn" disabled={authLoading}>
+              {authLoading ? 'Sending...' : 'Send reset token'}
+            </button>
+          </form>
+          <button type="button" className="auth-switch" onClick={() => { setAuthMode('login'); setForgotPasswordEmail(''); setError(null); }}>
+            Back to sign in
+          </button>
+          {error && <p className="auth-error">{error}</p>}
+        </div>
+      </div>
+    )
+  }
+
+  if (authMode === 'reset') {
+    return (
+      <div className="auth-shell">
+        <div className="auth-panel">
+          <div className="auth-brand">
+            <p className="auth-eyebrow">Reset Your Password</p>
+            <h1>Create a new password</h1>
+            <p>{resetInstructions}</p>
+          </div>
+          <form className="auth-form" onSubmit={handleResetPassword}>
+            <input 
+              type="password" 
+              placeholder="New password (min 8 characters)" 
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)} 
+              className="search-input" 
+              required 
+              minLength="8"
+            />
+            <input 
+              type="text" 
+              placeholder="Reset token" 
+              value={resetToken}
+              onChange={(e) => setResetToken(e.target.value)} 
+              className="search-input" 
+              required 
+            />
+            <button type="submit" className="add-btn" disabled={authLoading}>
+              {authLoading ? 'Resetting...' : 'Reset password'}
+            </button>
+          </form>
+          <button type="button" className="auth-switch" onClick={() => { setAuthMode('forgot'); setNewPassword(''); setResetToken(''); setError(null); }}>
+            Back
           </button>
           {error && <p className="auth-error">{error}</p>}
         </div>
@@ -788,38 +2098,151 @@ function App() {
             <span className="logo-icon">📈</span>
             <h1>{EXCHANGE_LABELS[preferredMarket]} Intelligence Dashboard</h1>
           </div>
+          <div className="nav-scroll-wrap">
           <nav className="nav">
-            <button className={`nav-btn ${activeTab === 'tracker' ? 'active' : ''}`} onClick={() => setActiveTab('tracker')}>Tracker</button>
-            <button className={`nav-btn ${activeTab === 'market' ? 'active' : ''}`} onClick={() => setActiveTab('market')}>Market</button>
-            <button className={`nav-btn ${activeTab === 'explain' ? 'active' : ''}`} onClick={() => setActiveTab('explain')}>Analytics</button>
-            <button className={`nav-btn ${activeTab === 'analyze' ? 'active' : ''}`} onClick={() => setActiveTab('analyze')}>Analyze</button>
-            <button className={`nav-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')}>Portfolio</button>
-            <div style={{ display: 'flex', gap: 4 }}>
+            <button className={`nav-btn ${activeTab === 'tracker' ? 'active' : ''}`} onClick={() => setActiveTab('tracker')} title="Strategy"><span className="nav-icon">📋</span><span className="nav-label-text">Strategy</span></button>
+            <button className={`nav-btn ${activeTab === 'wealth' ? 'active' : ''}`} onClick={() => setActiveTab('wealth')} title="Wealth Builder"><span className="nav-icon">🏦</span><span className="nav-label-text">Wealth</span></button>
+            <button className={`nav-btn ${activeTab === 'market' ? 'active' : ''}`} onClick={() => setActiveTab('market')} title="Market"><span className="nav-icon">📊</span><span className="nav-label-text">Market</span></button>
+            <button className={`nav-btn ${activeTab === 'analyze' ? 'active' : ''}`} onClick={() => setActiveTab('analyze')} title="Analyze"><span className="nav-icon">🔍</span><span className="nav-label-text">Analyze</span></button>
+            <button className={`nav-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')} title="Portfolio"><span className="nav-icon">💼</span><span className="nav-label-text">Portfolio</span></button>
+            <button className={`nav-btn ${activeTab === 'weekly' ? 'active' : ''}`} onClick={() => { setActiveTab('weekly'); if (!weeklyData) fetchWeeklyDigest(); if (!weeklySectors) fetchWeeklySectors() }} title="Weekly"><span className="nav-icon">📅</span><span className="nav-label-text">Weekly</span></button>
+            <button className={`nav-btn ${activeTab === 'candidates' ? 'active' : ''}`} onClick={() => setActiveTab('candidates')} title="Candidates"><span className="nav-icon">⭐</span><span className="nav-label-text">Candidates</span></button>
+            <button className={`nav-btn ${activeTab === 'crypto' ? 'active' : ''}`} onClick={() => { setActiveTab('crypto'); if (!cryptoMarket) fetchCryptoMarket(); fetchCryptoWatchlist() }} title="Crypto"><span className="nav-icon">🪙</span><span className="nav-label-text">Crypto</span></button>
+            <button className={`nav-btn ${activeTab === 'etf' ? 'active' : ''}`} onClick={() => { setActiveTab('etf'); if (!etfList) fetchEtfList(); if (!etfSpotlight) fetchEtfSpotlight() }} title="ETFs"><span className="nav-icon">📈</span><span className="nav-label-text">ETFs</span></button>
+            <button className={`nav-btn ${activeTab === 'explain' ? 'active' : ''}`} onClick={() => setActiveTab('explain')} title="Analytics"><span className="nav-icon">📉</span><span className="nav-label-text">Analytics</span></button>
+            <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} className="market-selector-nav">
               {['AU', 'US', 'IN'].map(m => (
                 <button key={m}
                   className={`nav-btn ${preferredMarket === m ? 'active' : ''}`}
                   onClick={() => updateMarket(m)}
                   title={EXCHANGE_LABELS[m]}>
-                  {MARKET_FLAGS[m]} {EXCHANGE_LABELS[m]}
+                  <span className="nav-icon">{MARKET_FLAGS[m]}</span><span className="nav-label-text">{m}</span>
                 </button>
               ))}
             </div>
             <span className="nav-user">{user?.email}</span>
-            <button className="nav-btn" onClick={logout}>Logout</button>
+            <button className="nav-btn" style={{ flexShrink: 0 }} onClick={logout} title="Logout"><span className="nav-icon">🚪</span><span className="nav-label-text">Logout</span></button>
           </nav>
+          </div>
         </div>
       </header>
 
       <main className="main">
-        {activeTab === 'tracker' && (
+        {/* AI Weekly Banner */}
+        {aiBanner?.summary && activeTab === 'tracker' && (
+          <div style={{ background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)', border: '1px solid #0f3460', borderRadius: 8, padding: '16px 20px', marginBottom: 16, color: '#e0e0e0' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 20 }}>🤖</span>
+              <strong style={{ color: '#00d2ff' }}>AI Weekly Insight</strong>
+              <span style={{ fontSize: 12, color: '#888', marginLeft: 'auto' }}>{aiBanner.market} • {aiBanner.generated_at?.slice(0, 10)}</span>
+            </div>
+            <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6 }}>{aiBanner.summary}</p>
+          </div>
+        )}
+        {(activeTab === 'tracker' || activeTab === 'candidates') && (
           <>
-            <section className="stats-grid">
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Validation Hit Rate</span><span className="stat-value">{metrics.validation_hit_rate_pct.toFixed(2)}%</span></div></div>
-              <div className="stat-card red"><div className="stat-content"><span className="stat-title">Average Forecast Error</span><span className="stat-value">{metrics.average_forecast_error_pct.toFixed(2)}%</span></div></div>
-              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Meeting Expectation</span><span className="stat-value">{bucketCounts.meeting_expectation}</span></div></div>
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Non-Meeting Expectation</span><span className="stat-value">{bucketCounts.non_meeting_expectation}</span></div></div>
+            {activeTab === 'tracker' && (
+            <>
+            <section className="stats-grid" style={{ marginBottom: 14 }}>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Stocks Tracked</span><span className="stat-value">{executionSnapshot.holdingsTracked}</span></div></div>
+              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Decisions (30d)</span><span className="stat-value">{executionSnapshot.decisions}</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Weekly Digest</span><span className="stat-value" style={{ fontSize: 13 }}>100+ ASX stocks</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Wealth Scan</span><span className="stat-value" style={{ fontSize: 13 }}>Top 40 / Broad 200+</span></div></div>
             </section>
 
+            <div style={{ background: 'linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)', border: '1px solid #bbf7d0', borderRadius: 8, padding: '14px 18px', marginBottom: 14, fontSize: 13, color: '#166534', lineHeight: 1.7 }}>
+              <strong>📊 Diversification Health:</strong> The weekly digest scans <strong>100+ ASX stocks across 8 sectors</strong> — not just the top 40. 
+              The Wealth Builder now offers a <strong>"Broad 200+" universe mode</strong> that screens 200+ ASX-listed companies including mid-caps, 
+              small-caps, ETFs, and gold miners. Use the weekly picks as a discovery layer, then validate candidates through both 
+              the <strong>Analyze</strong> tab (AI deep analysis) and the <strong>Wealth Builder</strong> (multi-factor scoring). 
+              This ensures your watchlist isn't just the usual suspects (BHP, CBA, etc.) but includes genuine 
+              high-conviction opportunities from the full exchange.
+            </div>
+
+            <TelegramBotGuide />
+
+            <section className="panel" style={{ background: 'linear-gradient(135deg, #f6fbff 0%, #eef5ff 100%)', borderColor: '#d4e3ff' }}>
+              <div className="section-header" style={{ alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                <h2>AI Investment Strategy Blueprint</h2>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn-secondary" onClick={() => setActiveTab('candidates')}>
+                    Open Candidates Workspace
+                  </button>
+                  <button className="add-btn" onClick={() => setActiveTab('wealth')}>
+                    🏦 Wealth Builder
+                  </button>
+                </div>
+              </div>
+              <p className="section-note" style={{ marginBottom: 12 }}>
+                This is the strategy cockpit: regime context, stage filters, allocation policy, risk budget, and execution loop.
+                Discovery and rank tables live in the Candidates workspace.
+              </p>
+              {activeStrategyDashboard ? (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 10 }}>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Confidence</strong>
+                      <div style={{ fontSize: 18, marginTop: 4 }}>{activeStrategyDashboard.confidence || 'n/a'}</div>
+                    </div>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Average Score</strong>
+                      <div style={{ fontSize: 18, marginTop: 4 }}>{Number(activeStrategyDashboard.avg_score || 0).toFixed(2)}</div>
+                    </div>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Qualified / Analysed</strong>
+                      <div style={{ fontSize: 18, marginTop: 4 }}>
+                        {Number(activeStrategyDashboard.filters?.qualified_count || 0)} /
+                        {' '}{Number(activeStrategyDashboard.filters?.analyzed_count || 0)}
+                      </div>
+                    </div>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Action Mix</strong>
+                      <div style={{ marginTop: 4, fontSize: 13 }}>
+                        BUY {Number(activeStrategyDashboard.action_mix?.buy || 0)}
+                        {' '}· ADD {Number(activeStrategyDashboard.action_mix?.add || 0)}
+                        {' '}· HOLD {Number(activeStrategyDashboard.action_mix?.hold || 0)}
+                        {' '}· REDUCE {Number(activeStrategyDashboard.action_mix?.reduce || 0)}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 10 }}>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Portfolio Mix Target</strong>
+                      <div style={{ marginTop: 6, fontSize: 13 }}>
+                        Growth {Number(activeStrategyDashboard.portfolio_mix?.growth_pct || 0)}%
+                        {' '}· Core {Number(activeStrategyDashboard.portfolio_mix?.core_hold_pct || 0)}%
+                        {' '}· Defensive/Cash {Number(activeStrategyDashboard.portfolio_mix?.defensive_cash_pct || 0)}%
+                      </div>
+                    </div>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Practical Risk Controls</strong>
+                      <div style={{ marginTop: 6, fontSize: 13 }}>
+                        {(activeStrategyDashboard.risk_controls || []).join(' · ') || 'No risk controls returned yet'}
+                      </div>
+                    </div>
+                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                      <strong>Execution Risk Budget</strong>
+                      <div style={{ marginTop: 6, fontSize: 13 }}>
+                        Net deployed ${executionSnapshot.netDeployed.toFixed(2)} ·
+                        {' '}Commissions ${executionSnapshot.commissions.toFixed(2)} ·
+                        {' '}Cost base ${executionSnapshot.holdingsCost.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div style={{ background: '#fff', border: '1px dashed #bcd0ff', borderRadius: 6, padding: 12 }}>
+                  <p style={{ margin: 0, fontSize: 13 }}>
+                    Generate an advice or digest preview to populate the live strategy blueprint cards.
+                  </p>
+                </div>
+              )}
+            </section>
+            </>
+            )}
+
+            {activeTab === 'candidates' && (
+            <>
             <section className="tab-grid">
               <div className="panel">
                 <div className="section-header"><h2>Top ASX Set (Default)</h2></div>
@@ -877,50 +2300,502 @@ function App() {
                   {trackLoading ? 'Adding...' : `Keep Selected (${selectedCount})`}
                 </button>
               </div>
-              <p className="section-note">Sorted by composite score using probability of return &ge;5%, trend, quality, regime fit, and liquidity.</p>
+              <p className="section-note">Sorted by composite score using probability of return &ge;5%, trend, quality, regime fit, and liquidity. Signals are locked daily &mdash; the same prediction holds for the full trading day.</p>
               {rankLoading ? <p>Ranking symbols...</p> : (
                 <div className="table-wrap"><table className="data-table"><thead><tr><th>Keep</th><th>Symbol</th><th>P(&ge;5%)</th><th>Expected 3M</th><th>Trend</th><th>Score</th></tr></thead><tbody>
-                  {rankedItems.map(item => (
-                    <tr key={item.symbol}>
-                      <td><input type="checkbox" checked={!!selectedSymbols[item.symbol]} onChange={e => setSelectedSymbols(prev => ({ ...prev, [item.symbol]: e.target.checked }))} /></td>
-                      <td><strong>{item.symbol}</strong></td>
-                      <td>{item.prob_ge_5pct.toFixed(2)}%</td>
-                      <td className={item.expected_return_3m_pct >= 0 ? 'positive' : 'negative'}>{item.expected_return_3m_pct.toFixed(2)}%</td>
-                      <td>{item.trend}</td>
-                      <td>{item.score.toFixed(2)}</td>
-                    </tr>
-                  ))}
+                  {rankedItems.map(item => {
+                    const warningLabels = {
+                      volume_divergence: 'Price jumped without volume support — spike may not hold.',
+                      drawdown_severe: `Elevated downside risk detected (~${item.warning_message?.match(/\d+/)?.[0] ?? '?'}%). Consider position sizing carefully.`,
+                      drawdown_moderate: 'Moderate downside volatility observed. Monitor closely.',
+                      extreme_projection: 'Model output was unusually large and has been capped. Treat with caution.',
+                      overbought: 'RSI above 70 — the stock may be overbought and due for a pullback.',
+                    }
+                    const friendlyWarning = warningLabels[item.warning_type] || item.warning_message || 'Elevated risk detected. Review before trading.'
+                    return (
+                      <tr key={item.symbol}>
+                        <td><input type="checkbox" checked={!!selectedSymbols[item.symbol]} onChange={e => setSelectedSymbols(prev => ({ ...prev, [item.symbol]: e.target.checked }))} /></td>
+                        <td>
+                          <strong>{item.symbol}</strong>
+                          {item.high_volatility_warning && (
+                            <span title={friendlyWarning} style={{marginLeft: '6px', fontSize: '14px', cursor: 'help'}}>⚠️</span>
+                          )}
+                        </td>
+                        <td>{item.prob_ge_5pct.toFixed(2)}%</td>
+                        <td className={item.expected_return_3m_pct >= 0 ? 'positive' : 'negative'}>{item.expected_return_3m_pct.toFixed(2)}%</td>
+                        <td>
+                          <span style={pillStyle(item.trend)}>{item.trend}</span>
+                          {item.streak_label && (
+                            <div style={{fontSize: '11px', color: 'var(--ig-muted, #666)', marginTop: '3px', fontWeight: 'normal'}}>{item.streak_label}</div>
+                          )}
+                        </td>
+                        <td>{item.score.toFixed(2)}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody></table></div>
               )}
             </section>
 
+            </>
+
+            )}
+            {activeTab === 'tracker' && (
             <section className="panel">
-              <div className="section-header"><h2>14-Day Tracking Bucket Table</h2></div>
-              <p className="section-note">Auto-evaluated into meeting vs non-meeting expectation at D+14 with 1.5% tolerance.</p>
-              {loading ? <p>Loading...</p> : (
-                <div className="table-wrap"><table className="data-table"><thead><tr><th>Symbol</th><th>Start</th><th>Day</th><th>Entry</th><th>Target 14D</th><th>Current</th><th>Progress</th><th>Expected</th><th>Actual</th><th>Status</th><th>Bucket</th></tr></thead><tbody>
-                  {trackingOverview.map(row => (
-                    <tr key={row.id}><td><strong>{row.symbol}</strong></td><td>{new Date(row.start_date).toLocaleDateString()}</td><td>D+{row.current_day}</td><td>${row.entry_price.toFixed(2)}</td><td>${row.target_price_14d.toFixed(2)}</td><td>${row.current_price.toFixed(2)}</td><td>{row.progress_to_target.toFixed(1)}%</td><td>{row.expected_direction}</td><td>{row.actual_direction}</td><td>{row.status}</td><td>{row.bucket || '-'}</td></tr>
-                  ))}
-                </tbody></table></div>
-              )}
+              <div className="section-header"><h2>Strategy Execution Audit</h2></div>
+              <p className="section-note">Execution behavior and model discipline for the current strategy cycle.</p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 12 }}>
+                <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 10 }}>
+                  <strong>Meeting Expectation</strong>
+                  <div style={{ marginTop: 4 }}>{bucketCounts.meeting_expectation}</div>
+                </div>
+                <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 10 }}>
+                  <strong>Non-Meeting Expectation</strong>
+                  <div style={{ marginTop: 4 }}>{bucketCounts.non_meeting_expectation}</div>
+                </div>
+                <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 10 }}>
+                  <strong>BUY/ADD vs REDUCE</strong>
+                  <div style={{ marginTop: 4 }}>{executionSnapshot.buyCount} / {executionSnapshot.reduceCount}</div>
+                </div>
+                <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 10 }}>
+                  <strong>Diagnostics Rows</strong>
+                  <div style={{ marginTop: 4 }}>{trackingOverview.length}</div>
+                </div>
+              </div>
+              <details>
+                <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 10 }}>Advanced: 14-Day signal diagnostics</summary>
+                {loading ? <p>Loading...</p> : (
+                  <div className="table-wrap"><table className="data-table"><thead><tr><th>Symbol</th><th>Start</th><th>Day</th><th>Entry</th><th>Target 14D</th><th>Current</th><th>Progress</th><th>Expected</th><th>Actual</th><th>Status</th><th>Bucket</th></tr></thead><tbody>
+                    {trackingOverview.map(row => (
+                      <tr key={row.id}><td><strong>{row.symbol}</strong></td><td>{new Date(row.start_date).toLocaleDateString()}</td><td>D+{row.current_day}</td><td>${row.entry_price.toFixed(2)}</td><td>${row.target_price_14d.toFixed(2)}</td><td>${row.current_price.toFixed(2)}</td><td>{row.progress_to_target.toFixed(1)}%</td><td>{row.expected_direction}</td><td>{row.actual_direction}</td><td>{row.status}</td><td>{row.bucket || '-'}</td></tr>
+                    ))}
+                  </tbody></table></div>
+                )}
+              </details>
             </section>
+            )}
           </>
         )}
+        {activeTab === 'tracker' && (
+              <section className="panel">
+                <div className="section-header">
+                  <h2>AI Strategy Control Center</h2>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button className="btn-secondary" onClick={() => requestDailyDigest(false)} disabled={telegramDigestLoading}>
+                      {telegramDigestLoading ? 'Analysing...' : 'Preview Daily Digest'}
+                    </button>
+                    <button className="add-btn" onClick={() => requestDailyDigest(true)} disabled={telegramDigestLoading}>
+                      {telegramDigestLoading ? 'Sending...' : 'Send Daily Digest'}
+                    </button>
+                    <button className="btn-secondary" onClick={() => requestTelegramAdvice(false)} disabled={telegramAdviceLoading}>
+                      {telegramAdviceLoading ? 'Analysing...' : 'Preview Telegram Advice'}
+                    </button>
+                    <button className="add-btn" onClick={() => requestTelegramAdvice(true)} disabled={telegramAdviceLoading}>
+                      {telegramAdviceLoading ? 'Sending...' : 'Send to Telegram'}
+                    </button>
+                  </div>
+                </div>
+                <p className="section-note">
+                  Strategy messaging and this dashboard run off the same model payload.
+                  Use this control center for decision cadence, risk guardrails, and post-trade feedback capture.
+                </p>
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+                  <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '8px 12px' }}>
+                    <strong>{telegramRecipients.length}</strong> active Telegram chat{telegramRecipients.length === 1 ? '' : 's'} for this user
+                  </div>
+                  <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '8px 12px' }}>
+                    <strong>{telegramHistory.filter(item => item.status === 'sent').length}</strong> successful deliveries tracked
+                  </div>
+                  {telegramRecipients.slice(0, 3).map(recipient => (
+                    <div key={`${recipient.id || recipient.user_id}-${recipient.chat_id}`} style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '8px 12px', fontSize: 12 }}>
+                      <strong>{recipient.label || 'Telegram chat'}</strong>
+                      <div style={{ color: 'var(--ig-muted)' }}>{recipient.chat_id}</div>
+                      {recipient.id && (
+                        <button className="btn-secondary" style={{ marginTop: 6, padding: '4px 8px', fontSize: 10 }} onClick={() => removeTelegramRecipient(recipient.id)}>
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+                  <input
+                    type="text"
+                    placeholder="Telegram chat ID"
+                    value={newTelegramChatId}
+                    onChange={(e) => setNewTelegramChatId(e.target.value)}
+                    style={{ minWidth: 170 }}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Label (optional)"
+                    value={newTelegramLabel}
+                    onChange={(e) => setNewTelegramLabel(e.target.value)}
+                    style={{ minWidth: 170 }}
+                  />
+                  <button className="add-btn" onClick={addTelegramRecipient} disabled={telegramRecipientSaving}>
+                    {telegramRecipientSaving ? 'Saving...' : 'Add Chat Mapping'}
+                  </button>
+                </div>
+                {telegramAdvice?.delivery?.error && (
+                  <div style={{ background: '#fff2f0', border: '1px solid #f2b8b5', color: '#8a1c14', borderRadius: 4, padding: 12, marginBottom: 12 }}>
+                    {telegramAdvice.delivery.error}
+                  </div>
+                )}
+                {telegramAdvice?.summary && (
+                  <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 14, marginBottom: 12 }}>
+                    <div dangerouslySetInnerHTML={{ __html: telegramAdvice.summary }} />
+                  </div>
+                )}
+                {telegramAdvice?.strategy_dashboard && (
+                  <div style={{ background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 12, marginBottom: 12 }}>
+                    <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>Strategy Dashboard (Live)</h3>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, fontSize: 12 }}>
+                      <div><strong>Confidence</strong><div>{telegramAdvice.strategy_dashboard.confidence || 'n/a'}</div></div>
+                      <div><strong>Avg Score</strong><div>{Number(telegramAdvice.strategy_dashboard.avg_score || 0).toFixed(2)}</div></div>
+                      <div><strong>Qualified</strong><div>{telegramAdvice.strategy_dashboard.filters?.qualified_count || 0} / {telegramAdvice.strategy_dashboard.filters?.analyzed_count || 0}</div></div>
+                      <div><strong>Mix</strong><div>BUY {telegramAdvice.strategy_dashboard.action_mix?.buy || 0} · ADD {telegramAdvice.strategy_dashboard.action_mix?.add || 0} · HOLD {telegramAdvice.strategy_dashboard.action_mix?.hold || 0} · REDUCE {telegramAdvice.strategy_dashboard.action_mix?.reduce || 0}</div></div>
+                    </div>
+                    <p style={{ margin: '10px 0 0 0', fontSize: 12, color: 'var(--ig-muted)' }}>
+                      Risk controls: {(telegramAdvice.strategy_dashboard.risk_controls || []).join(', ')}
+                    </p>
+                  </div>
+                )}
+                {telegramAdvice?.items?.length > 0 && (
+                  <details style={{ marginBottom: 12 }}>
+                    <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 10 }}>Advanced: Symbol-level AI signals</summary>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
+                    {telegramAdvice.items.map(item => (
+                      <div key={item.symbol} style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 14 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 8 }}>
+                          <div>
+                            <strong style={{ fontSize: 16 }}>{item.symbol}</strong>
+                            <div style={{ color: 'var(--ig-muted)', fontSize: 12 }}>{item.name || 'Ranked opportunity'}</div>
+                          </div>
+                          <span style={{ padding: '4px 8px', borderRadius: 999, background: item.action === 'BUY' ? '#e8f5ec' : item.action === 'REDUCE' ? '#fff2f0' : '#f5f5f5', color: item.action === 'BUY' ? '#1e6b36' : item.action === 'REDUCE' ? '#8a1c14' : '#555', fontSize: 11, fontWeight: 700 }}>
+                            {item.action}
+                          </span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, marginBottom: 10, fontSize: 12 }}>
+                          <div><strong>Score</strong><div>{Number(item.score || 0).toFixed(2)}</div></div>
+                          <div><strong>P(≥5%)</strong><div>{Number(item.prob_ge_5pct || 0).toFixed(1)}%</div></div>
+                          <div><strong>Trend</strong><div>{item.trend || 'n/a'}</div></div>
+                          <div><strong>Streak</strong><div>{item.streak_label || 'New signal'}</div></div>
+                        </div>
+                        <div style={{ fontSize: 12, marginBottom: 8 }}><strong>Why now:</strong> {item.reason}</div>
+                        <div style={{ fontSize: 12, marginBottom: 8 }}><strong>Next step:</strong> {item.next_step}</div>
+                        <div style={{ fontSize: 12, marginBottom: 8 }}><strong>Entry idea:</strong> {item.entry_idea}</div>
+                        <div style={{ fontSize: 12, marginBottom: 8 }}><strong>Sell trigger:</strong> {item.sell_trigger}</div>
+                        <div style={{ fontSize: 12, marginBottom: 12 }}><strong>Invalidation:</strong> {item.invalidation}</div>
+                        {item.held_quantity > 0 && (
+                          <div style={{ fontSize: 12, marginBottom: 10, background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 4, padding: 8 }}>
+                            <strong>Current holding:</strong> {Number(item.held_quantity).toFixed(2)} shares @ ${Number(item.held_avg_cost || 0).toFixed(2)}
+                            {item.held_unrealized_pct != null && (
+                              <span style={{ marginLeft: 6, color: item.held_unrealized_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                                ({item.held_unrealized_pct >= 0 ? '+' : ''}{Number(item.held_unrealized_pct).toFixed(2)}%)
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, marginBottom: 8 }}>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="Qty bought"
+                            value={adviceActionDrafts[item.symbol]?.quantity ?? ''}
+                            onChange={(e) => setAdviceActionDrafts(prev => ({ ...prev, [item.symbol]: { ...(prev[item.symbol] || {}), quantity: e.target.value } }))}
+                          />
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="Price"
+                            value={adviceActionDrafts[item.symbol]?.execution_price ?? ''}
+                            onChange={(e) => setAdviceActionDrafts(prev => ({ ...prev, [item.symbol]: { ...(prev[item.symbol] || {}), execution_price: e.target.value } }))}
+                          />
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder="Commission (optional)"
+                            value={adviceActionDrafts[item.symbol]?.commission ?? ''}
+                            onChange={(e) => setAdviceActionDrafts(prev => ({ ...prev, [item.symbol]: { ...(prev[item.symbol] || {}), commission: e.target.value } }))}
+                          />
+                          <input
+                            type="text"
+                            placeholder="Broker/note"
+                            value={adviceActionDrafts[item.symbol]?.notes ?? ''}
+                            onChange={(e) => setAdviceActionDrafts(prev => ({ ...prev, [item.symbol]: { ...(prev[item.symbol] || {}), notes: e.target.value } }))}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                          <button className="btn-secondary" onClick={() => openPaperTrade(item)} disabled={paperTradeLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                            Track Position
+                          </button>
+                          <button className="add-btn" onClick={() => logAdviceAction(item, item.action === 'REDUCE' ? 'SELL' : 'BUY')} disabled={adviceActionSaving} style={{ padding: '5px 10px', fontSize: 11 }}>
+                            {adviceActionSaving ? 'Saving...' : 'Log Executed Action'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    </div>
+                  </details>
+                )}
+                {telegramAdvice && (
+                  <p className="section-note" style={{ marginTop: 10 }}>
+                    Telegram delivery: {telegramAdvice.telegram_sent ? `sent to ${telegramAdvice.delivery?.success_count || 0} chat${telegramAdvice.delivery?.success_count === 1 ? '' : 's'}` : 'preview only'} · routing: {telegramAdvice.telegram_enabled ? 'user-scoped chat mapping active' : 'no active Telegram chat for this user'} · cache: {telegramAdvice.cache_hit ? 'warm' : 'fresh'}
+                  </p>
+                )}
+                {telegramDigest?.delivery?.error && (
+                  <div style={{ background: '#fff8e6', border: '1px solid #f0d48a', color: '#7a5a00', borderRadius: 4, padding: 12, marginTop: 12 }}>
+                    {telegramDigest.delivery.error}
+                  </div>
+                )}
+                {telegramDigest?.summary && (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{ background: 'var(--ig-white)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 14, marginBottom: 12 }}>
+                      <div dangerouslySetInnerHTML={{ __html: telegramDigest.summary }} />
+                    </div>
+                    {telegramDigest?.breakdown && (
+                      <details>
+                        <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 10 }}>Advanced: Daily digest symbol breakdown</summary>
+                        <div className="table-wrap">
+                        <table className="data-table">
+                          <thead><tr><th>Bucket</th><th>Symbol</th><th>Trend</th><th>Score</th><th>Reason</th></tr></thead>
+                          <tbody>
+                            {['buy', 'hold', 'reduce'].flatMap(bucket => (telegramDigest.breakdown[bucket] || []).map(item => (
+                              <tr key={`${bucket}-${item.symbol}`}>
+                                <td>{bucket.toUpperCase()}</td>
+                                <td><strong>{item.symbol}</strong></td>
+                                <td>{item.trend}</td>
+                                <td>{Number(item.score || 0).toFixed(2)}</td>
+                                <td>{item.next_step || item.reason}</td>
+                              </tr>
+                            ))) }
+                          </tbody>
+                        </table>
+                        </div>
+                      </details>
+                    )}
+                    <p className="section-note" style={{ marginTop: 10 }}>
+                      Daily digest: {telegramDigest.telegram_sent ? `sent to ${telegramDigest.delivery?.success_count || 0} chat${telegramDigest.delivery?.success_count === 1 ? '' : 's'}` : 'preview only'} · routing: {telegramDigest.telegram_enabled ? 'user-scoped chat mapping active' : 'no active Telegram chat for this user'} · cache: {telegramDigest.cache_hit ? 'warm' : 'fresh'}
+                    </p>
+                  </div>
+                )}
 
-        {activeTab === 'market' && marketPulse && (
+                <div style={{ marginTop: 18 }}>
+                  <div className="section-header" style={{ marginBottom: 10 }}>
+                    <h3 style={{ margin: 0 }}>Delivery History</h3>
+                    <button className="btn-secondary" onClick={fetchTelegramHistory} disabled={telegramHistoryLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                      {telegramHistoryLoading ? 'Refreshing...' : 'Refresh'}
+                    </button>
+                  </div>
+                  {telegramHistory.length > 0 ? (
+                    <div className="table-wrap">
+                      <table className="data-table">
+                        <thead><tr><th>When</th><th>Type</th><th>Chat</th><th>Status</th><th>Mode</th><th>Error</th></tr></thead>
+                        <tbody>
+                          {telegramHistory.slice(0, 10).map(item => (
+                            <tr key={item.id}>
+                              <td>{item.created_at ? new Date(item.created_at).toLocaleString() : '-'}</td>
+                              <td>{item.message_type}</td>
+                              <td>{item.chat_id || '-'}</td>
+                              <td>{item.status}</td>
+                              <td>{item.delivery_mode || '-'}</td>
+                              <td>{item.error_message || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="section-note">No Telegram deliveries logged for this user yet.</p>
+                  )}
+                </div>
+
+                <div style={{ marginTop: 18 }}>
+                  <div className="section-header" style={{ marginBottom: 10 }}>
+                    <h3 style={{ margin: 0 }}>Executed Advice Actions</h3>
+                    <button className="btn-secondary" onClick={fetchAdviceActions} disabled={adviceActionsLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                      {adviceActionsLoading ? 'Refreshing...' : 'Refresh'}
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+                    <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '8px 12px', fontSize: 12 }}>
+                      Holdings tracked: <strong>{adviceHoldings.length}</strong>
+                    </div>
+                    <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '8px 12px', fontSize: 12 }}>
+                      Executed actions logged: <strong>{adviceActions.length}</strong>
+                    </div>
+                    {adviceHoldings.slice(0, 4).map((holding) => (
+                      <div key={holding.symbol} style={{ background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
+                        <strong>{holding.symbol}</strong> {Number(holding.quantity || 0).toFixed(2)} @ ${Number(holding.avg_cost || 0).toFixed(2)}
+                      </div>
+                    ))}
+                  </div>
+                  {adviceActions.length > 0 ? (
+                    <div className="table-wrap" style={{ marginBottom: 18 }}>
+                      <table className="data-table">
+                        <thead><tr><th>When</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Commission</th><th>Gross</th><th>Net</th><th>Note</th></tr></thead>
+                        <tbody>
+                          {adviceActions.slice(0, 12).map((item) => (
+                            <tr key={item.id}>
+                              <td>{item.created_at ? new Date(item.created_at).toLocaleString() : '-'}</td>
+                              <td><strong>{item.symbol}</strong></td>
+                              <td>{item.action_type}</td>
+                              <td>{Number(item.quantity || 0).toFixed(2)}</td>
+                              <td>${Number(item.execution_price || 0).toFixed(2)}</td>
+                              <td>${Number(item.commission || 0).toFixed(2)}</td>
+                              <td>${Number(item.gross_amount || 0).toFixed(2)}</td>
+                              <td>${Number(item.net_amount || 0).toFixed(2)}</td>
+                              <td>{item.notes || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="section-note" style={{ marginBottom: 18 }}>No executed advice actions logged yet.</p>
+                  )}
+
+                  <div className="section-header" style={{ marginBottom: 10 }}>
+                    <h3 style={{ margin: 0 }}>Paper Trades</h3>
+                    <button className="btn-secondary" onClick={fetchPaperTrades} disabled={paperTradeLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                      Refresh
+                    </button>
+                  </div>
+                  {paperTrades.length > 0 ? (
+                    <div className="table-wrap">
+                      <table className="data-table">
+                        <thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Current</th><th>Net P&amp;L</th><th>Stage</th><th>Stop</th><th>Target</th><th>Trail %</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                          {paperTrades.map(trade => (
+                            <tr key={trade.id}>
+                              <td><strong>{trade.symbol}</strong></td>
+                              <td>{trade.side}</td>
+                              <td>{trade.entry_price?.toFixed(2)}</td>
+                              <td>{trade.current_price?.toFixed(2)}</td>
+                              <td style={{ color: trade.unrealized_pnl_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }} title={`Net Value: $${trade.unrealized_pnl_value?.toFixed(2)} (Assumes $${trade.brokerage_fees} CommSec fees)`}>
+                                {trade.unrealized_pnl_pct >= 0 ? '+' : ''}{trade.unrealized_pnl_pct?.toFixed(2)}%
+                              </td>
+                              <td>
+                                <select
+                                  value={tradeDrafts[trade.id]?.position_stage ?? trade.position_stage ?? 'entered'}
+                                  onChange={(e) => setTradeDrafts(prev => ({ ...prev, [trade.id]: { ...(prev[trade.id] || {}), position_stage: e.target.value } }))}
+                                  disabled={trade.status !== 'open'}
+                                >
+                                  <option value="entered">entered</option>
+                                  <option value="hold">hold</option>
+                                  <option value="trim_signal">trim_signal</option>
+                                  <option value="exit_signal">exit_signal</option>
+                                  <option value="closed">closed</option>
+                                </select>
+                              </td>
+                              <td>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={tradeDrafts[trade.id]?.stop_loss_price ?? ''}
+                                  onChange={(e) => setTradeDrafts(prev => ({ ...prev, [trade.id]: { ...(prev[trade.id] || {}), stop_loss_price: e.target.value } }))}
+                                  style={{ width: 92 }}
+                                  disabled={trade.status !== 'open'}
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={tradeDrafts[trade.id]?.take_profit_price ?? ''}
+                                  onChange={(e) => setTradeDrafts(prev => ({ ...prev, [trade.id]: { ...(prev[trade.id] || {}), take_profit_price: e.target.value } }))}
+                                  style={{ width: 92 }}
+                                  disabled={trade.status !== 'open'}
+                                />
+                              </td>
+                              <td>
+                                <input
+                                  type="number"
+                                  step="0.1"
+                                  value={tradeDrafts[trade.id]?.trailing_stop_pct ?? ''}
+                                  onChange={(e) => setTradeDrafts(prev => ({ ...prev, [trade.id]: { ...(prev[trade.id] || {}), trailing_stop_pct: e.target.value } }))}
+                                  style={{ width: 70 }}
+                                  disabled={trade.status !== 'open'}
+                                />
+                              </td>
+                              <td>{trade.status}</td>
+                              <td>
+                                {trade.status === 'open' && (
+                                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                    <button className="btn-secondary" onClick={() => updatePaperTradePlan(trade.id)} disabled={paperTradeLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                                      Save Plan
+                                    </button>
+                                    <button className="btn-secondary" onClick={() => closePaperTrade(trade.id)} disabled={paperTradeLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                                      Close
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="section-note">No paper trades yet. Open one from the hedge assistant above.</p>
+                  )}
+                </div>
+
+                <div style={{ marginTop: 18 }}>
+                  <div className="section-header" style={{ marginBottom: 10 }}>
+                    <h3 style={{ margin: 0 }}>Position Trigger History</h3>
+                    <button className="btn-secondary" onClick={fetchPositionHistory} disabled={positionHistoryLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
+                      {positionHistoryLoading ? 'Refreshing...' : 'Refresh'}
+                    </button>
+                  </div>
+                  {positionHistory.length > 0 ? (
+                    <div className="table-wrap">
+                      <table className="data-table">
+                        <thead><tr><th>When</th><th>Trade</th><th>Event</th><th>Message</th></tr></thead>
+                        <tbody>
+                          {positionHistory.slice(0, 12).map((event) => (
+                            <tr key={event.id}>
+                              <td>{event.created_at ? new Date(event.created_at).toLocaleString() : '-'}</td>
+                              <td>{event.payload?.symbol || event.trade_id}</td>
+                              <td>{event.event_type}</td>
+                              <td>{event.event_message}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="section-note">No trigger events yet.</p>
+                  )}
+                </div>
+              </section>
+        )}
+
+        {activeTab === 'market' && (
+          !marketPulse ? (
+            <section className="panel">
+              <div className="section-header"><h2>Market Pulse</h2></div>
+              <p className="section-note">⏳ Loading market data…
+                <button className="btn-secondary" style={{ marginLeft: 12 }} onClick={fetchMarketPulse}>Retry</button>
+              </p>
+            </section>
+          ) : (
           <>
             <section className="stats-grid">
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">ASX200 Daily</span><span className="stat-value">{marketPulse.metrics.asx200_ret.toFixed(2)}%</span></div></div>
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">S&amp;P 500 Daily</span><span className="stat-value">{marketPulse.metrics.sp500_ret.toFixed(2)}%</span></div></div>
-              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Gold Daily</span><span className="stat-value">{marketPulse.metrics.gold_ret.toFixed(2)}%</span></div></div>
-              <div className="stat-card red"><div className="stat-content"><span className="stat-title">DXY Daily</span><span className="stat-value">{marketPulse.metrics.dxy_ret.toFixed(2)}%</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">ASX200 Daily</span><span className="stat-value">{(marketPulse.metrics.asx200_ret ?? 0).toFixed(2)}%</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">S&amp;P 500 Daily</span><span className="stat-value">{(marketPulse.metrics.sp500_ret ?? 0).toFixed(2)}%</span></div></div>
+              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Gold Daily</span><span className="stat-value">{(marketPulse.metrics.gold_ret ?? 0).toFixed(2)}%</span></div></div>
+              <div className="stat-card red"><div className="stat-content"><span className="stat-title">DXY Daily</span><span className="stat-value">{(marketPulse.metrics.dxy_ret ?? 0).toFixed(2)}%</span></div></div>
             </section>
             <section className="panel">
               <div className="section-header"><h2>Regime Engine</h2></div>
-              <p className="section-note">Regime: <strong>{marketPulse.regime.name}</strong> ({marketPulse.regime.confidence.toFixed(1)}% confidence)</p>
+              <p className="section-note">Regime: <strong>{marketPulse.regime.name}</strong> ({(marketPulse.regime.confidence ?? 0).toFixed(1)}% confidence)</p>
               <p className="regime-summary">{marketPulse.summary}</p>
-              <div className="ai-suggestions">{marketPulse.regime.tags.map(tag => <span key={tag} className="suggest-pill">{tag}</span>)}</div>
+              <div className="ai-suggestions">{(marketPulse.regime.tags || []).map(tag => <span key={tag} className="suggest-pill">{tag}</span>)}</div>
             </section>
             <section className="panel">
               <div className="section-header">
@@ -934,6 +2809,7 @@ function App() {
                 : <p className="section-note">Click refresh to get AI-powered market analysis</p>}
             </section>
           </>
+          )
         )}
 
         {activeTab === 'explain' && (
@@ -1009,8 +2885,18 @@ function App() {
           <>
             <section className="panel">
               <div className="section-header"><h2>Individual Share Analysis</h2></div>
-              <div style={{ display: 'flex', gap: 10, marginBottom: 20 }}>
-                <input style={{ ...inputStyle, fontSize: 16 }} type="text" placeholder="Enter symbol (e.g., BHP, CBA, CSL, AAPL, RELIANCE)"
+              <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
+                <select
+                  value={analyzeMarket}
+                  onChange={e => setAnalyzeMarket(e.target.value)}
+                  style={{ ...inputStyle, width: 150, fontSize: 15 }}
+                >
+                  <option value="AU">🇦🇺 ASX (AU)</option>
+                  <option value="US">🇺🇸 NASDAQ (US)</option>
+                  <option value="IN">🇮🇳 BSE/NSE (IN)</option>
+                </select>
+                <input style={{ ...inputStyle, fontSize: 16, flex: 1 }} type="text"
+                  placeholder={analyzeMarket === 'AU' ? 'e.g. BHP, SUN, PMGOLD, NDQ' : analyzeMarket === 'US' ? 'e.g. AAPL, MSFT, NVDA' : 'e.g. RELIANCE, TCS, INFY'}
                   value={analyzeSymbol} onChange={e => setAnalyzeSymbol(e.target.value.toUpperCase())}
                   onKeyPress={e => e.key === 'Enter' && analyzeShare()} />
                 <button onClick={analyzeShare} disabled={analyzeLoading || !String(analyzeSymbol).trim()}
@@ -1144,8 +3030,372 @@ function App() {
           </>
         )}
 
+        {activeTab === 'weekly' && (
+          <>
+            <section className="panel">
+              <div className="section-header">
+                <h2>📅 Weekly Stock Predictions — {EXCHANGE_LABELS[preferredMarket]}</h2>
+                <button style={btnGreen} onClick={generateWeekly} disabled={weeklyLoading}>
+                  {weeklyLoading ? 'Generating...' : '🔄 Generate Fresh'}
+                </button>
+              </div>
+              {weeklyLoading && <p>Loading weekly digest...</p>}
+              {!weeklyLoading && !weeklyData?.picks?.length && (
+                <p className="section-note">No weekly digest available yet. Click "Generate Fresh" to create one for {EXCHANGE_LABELS[preferredMarket]}.</p>
+              )}
+              {weeklyData?.picks?.length > 0 && (
+                <>
+                  {weeklyData.llm_summary && (
+                    <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 14, marginBottom: 16 }}>
+                      <strong style={{ color: 'var(--ig-red)' }}>AI Summary:</strong>
+                      <p style={{ margin: '8px 0 0 0', lineHeight: 1.7 }}>{weeklyData.llm_summary}</p>
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                    {['all', 'large_cap', 'mid_cap', 'small_cap'].map(cap => (
+                      <button key={cap} className={`nav-btn ${weeklyCap === cap ? 'active' : ''}`}
+                        onClick={() => setWeeklyCap(cap)} style={{ padding: '6px 14px', fontSize: 13 }}>
+                        {cap === 'all' ? 'All' : cap.replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase())}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="table-wrap">
+                    <table className="data-table">
+                      <thead><tr><th>Rank</th><th>Symbol</th><th>Name</th><th>Cap</th><th>Score</th><th>P(≥5%)</th><th>Expected 3M</th><th>Trend</th></tr></thead>
+                      <tbody>
+                        {weeklyData.picks
+                          .filter(p => weeklyCap === 'all' || p.cap_tier === weeklyCap)
+                          .map((p, i) => (
+                            <tr key={p.symbol}>
+                              <td>{i + 1}</td>
+                              <td>
+                                <strong>{p.symbol}</strong>
+                                {p.high_volatility_warning && (
+                                  <span title={p.warning_message || "Highly Volatile/Overbought Anomaly"} style={{marginLeft: '6px', fontSize: '14px', cursor: 'help'}}>⚠️</span>
+                                )}
+                              </td>
+                              <td>{p.name || '-'}</td>
+                              <td><span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 11, background: p.cap_tier === 'large_cap' ? '#0066cc22' : p.cap_tier === 'mid_cap' ? '#cc660022' : '#00cc6622', color: p.cap_tier === 'large_cap' ? '#0066cc' : p.cap_tier === 'mid_cap' ? '#cc6600' : '#00cc66' }}>
+                                {p.cap_tier?.replace('_', ' ')}</span></td>
+                              <td><strong>{p.score?.toFixed(2)}</strong></td>
+                              <td>{p.prob_ge_5pct?.toFixed(1)}%</td>
+                              <td style={{ color: (p.expected_return_3m_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                                {p.expected_return_3m_pct?.toFixed(2)}%</td>
+                              <td style={{ color: p.trend === 'bullish' ? 'var(--ig-gain)' : p.trend === 'bearish' ? 'var(--ig-red)' : '#d4ac0d' }}>
+                                {p.trend?.toUpperCase()}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="section-note" style={{ marginTop: 10 }}>
+                    Generated: {weeklyData.generated_at?.slice(0, 16)?.replace('T', ' ')} • Week: {weeklyData.week_label}
+                  </p>
+                </>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="section-header">
+                <h2>📊 Sector Breakdown</h2>
+              </div>
+              {weeklyData?.picks_by_sector && Object.keys(weeklyData.picks_by_sector).length > 0 ? (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 12 }}>
+                  {Object.entries(weeklyData.picks_by_sector).map(([sector, data]) => (
+                    <div key={sector} style={cardStyle}>
+                      <strong style={{ fontSize: 13, color: 'var(--ig-red)', textTransform: 'uppercase', letterSpacing: 1 }}>{sector.replace('_',' ')}</strong>
+                      {data.picks?.length > 0 && (
+                        <div style={{ marginTop: 8 }}>
+                          {data.picks.slice(0, 3).map((p, i) => (
+                            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '3px 0', borderBottom: '1px solid var(--ig-border)' }}>
+                              <strong style={{ fontSize: 13 }}>{p.symbol}</strong>
+                              <span style={{ fontSize: 12, color: (p.expected_return_3m_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                                {p.expected_return_3m_pct?.toFixed(1)}%
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {data.ai_summary && (
+                        <p style={{ fontSize: 11, color: 'var(--ig-medium)', marginTop: 6, marginBottom: 0, lineHeight: 1.5 }}>
+                          {data.ai_summary.slice(0, 80)}{data.ai_summary.length > 80 ? '...' : ''}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
+                  {weeklySectors?.sectors && Object.entries(weeklySectors.sectors).map(([sector, tickers]) => (
+                    <div key={sector} style={{ ...cardStyle, textAlign: 'center' }}>
+                      <strong style={{ fontSize: 13, color: 'var(--ig-red)', textTransform: 'uppercase', letterSpacing: 1 }}>{sector}</strong>
+                      <div style={{ fontSize: 11, color: 'var(--ig-medium)', marginTop: 8 }}>
+                        {Array.isArray(tickers) ? tickers.slice(0, 4).join(', ') : Object.keys(tickers).slice(0, 4).join(', ')}
+                      </div>
+                    </div>
+                  ))}
+                  {!weeklySectors?.sectors && <p className="section-note">Generate weekly picks to see sector breakdown.</p>}
+                </div>
+              )}
+            </section>
+          </>
+        )}
+
+        {activeTab === 'crypto' && (
+          <>
+            <section className="stats-grid">
+              {cryptoMarket?.global_stats && (
+                <>
+                  <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Total Market Cap</span><span className="stat-value">${(cryptoMarket.global_stats.total_market_cap / 1e12).toFixed(2)}T</span></div></div>
+                  <div className="stat-card green"><div className="stat-content"><span className="stat-title">24h Volume</span><span className="stat-value">${(cryptoMarket.global_stats.total_volume / 1e9).toFixed(1)}B</span></div></div>
+                  <div className="stat-card red"><div className="stat-content"><span className="stat-title">BTC Dominance</span><span className="stat-value">{cryptoMarket.global_stats.btc_dominance?.toFixed(1)}%</span></div></div>
+                  <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Fear & Greed</span><span className="stat-value">{cryptoMarket.fear_greed?.value ?? 'N/A'} — {cryptoMarket.fear_greed?.label ?? ''}</span></div></div>
+                </>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="section-header">
+                <h2>🔍 Search Crypto</h2>
+                <button style={btnGreen} onClick={fetchCryptoMarket} disabled={cryptoLoading}>
+                  {cryptoLoading ? 'Loading...' : '🔄 Refresh Market'}
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                <input style={inputStyle} type="text" placeholder="Search coins (e.g., solana, cardano)"
+                  value={cryptoSearch} onChange={e => setCryptoSearch(e.target.value)}
+                  onKeyPress={e => e.key === 'Enter' && searchCrypto()} />
+                <button onClick={searchCrypto} style={btnGreen}>Search</button>
+              </div>
+              {cryptoSearchResults.length > 0 && (
+                <div className="chips-grid" style={{ marginBottom: 16 }}>
+                  {cryptoSearchResults.slice(0, 12).map(c => (
+                    <div key={c.id} className="chip-card" style={{ cursor: 'pointer' }} onClick={() => fetchCryptoDetail(c.id)}>
+                      <div>
+                        <strong>{c.symbol?.toUpperCase()}</strong>
+                        <p style={{ fontSize: 12 }}>{c.name}</p>
+                      </div>
+                      <button className="add-btn small" onClick={(e) => { e.stopPropagation(); addCryptoWatchlist(c.id) }}>★</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="section-header"><h2>📈 Top Coins</h2></div>
+              {cryptoLoading && <p>Loading market data...</p>}
+              {cryptoMarket?.coins?.length > 0 && (
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead><tr><th>#</th><th>Coin</th><th>Price</th><th>24h</th><th>7d</th><th>Market Cap</th><th>Actions</th></tr></thead>
+                    <tbody>
+                      {cryptoMarket.coins.map((c, i) => (
+                        <tr key={c.id || i}>
+                          <td>{i + 1}</td>
+                          <td style={{ cursor: 'pointer', color: 'var(--ig-red)' }} onClick={() => fetchCryptoDetail(c.id)}>
+                            <strong>{c.symbol?.toUpperCase()}</strong> <span style={{ color: 'var(--ig-medium)', fontSize: 12 }}>{c.name}</span>
+                          </td>
+                          <td>${c.current_price?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}</td>
+                          <td style={{ color: (c.price_change_24h_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                            {c.price_change_24h_pct?.toFixed(2)}%</td>
+                          <td style={{ color: (c.price_change_7d_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                            {c.price_change_7d_pct?.toFixed(2)}%</td>
+                          <td>${(c.market_cap / 1e9)?.toFixed(2)}B</td>
+                          <td>
+                            <button className="add-btn small" onClick={() => addCryptoWatchlist(c.id)} title="Add to watchlist">★</button>
+                            <button className="add-btn small" style={{ marginLeft: 4 }} onClick={() => { fetchCryptoDetail(c.id) }}>View</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+
+            {cryptoWatchlist.length > 0 && (
+              <section className="panel">
+                <div className="section-header"><h2>⭐ Watchlist</h2></div>
+                <div className="chips-grid">
+                  {cryptoWatchlist.map(c => (
+                    <div key={c.coin_id} className="chip-card">
+                      <div style={{ cursor: 'pointer' }} onClick={() => fetchCryptoDetail(c.coin_id)}>
+                        <strong>{c.coin_id}</strong>
+                      </div>
+                      <button className="add-btn small" style={{ background: 'var(--ig-red)', color: 'white' }}
+                        onClick={() => removeCryptoWatchlist(c.coin_id)}>✕</button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {cryptoDetail && (
+              <section className="panel">
+                <div className="section-header">
+                  <h2>🪙 {cryptoDetail.name} ({cryptoDetail.symbol?.toUpperCase()})</h2>
+                  <button style={btnGreen} onClick={() => analyzeCrypto(cryptoDetail.id)} disabled={cryptoAnalysisLoading}>
+                    {cryptoAnalysisLoading ? 'Analyzing...' : '🤖 AI Analysis'}
+                  </button>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Price</span><br/><strong style={{ fontSize: 22 }}>${cryptoDetail.market_data?.current_price?.toLocaleString()}</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>24h Change</span><br/><strong style={{ fontSize: 22, color: (cryptoDetail.market_data?.price_change_24h ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{cryptoDetail.market_data?.price_change_24h?.toFixed(2)}%</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Market Cap</span><br/><strong>${(cryptoDetail.market_data?.market_cap / 1e9)?.toFixed(2)}B</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>ATH</span><br/><strong>${cryptoDetail.market_data?.ath?.toLocaleString()}</strong><br/><small style={{ color: 'var(--ig-red)' }}>{cryptoDetail.market_data?.ath_change?.toFixed(1)}% from ATH</small></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>24h Volume</span><br/><strong>${(cryptoDetail.market_data?.total_volume / 1e9)?.toFixed(2)}B</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Rank</span><br/><strong>#{cryptoDetail.market_cap_rank}</strong></div>
+                </div>
+                {cryptoDetail.description && (
+                  <div style={{ ...subPanelStyle, marginTop: 16 }}>
+                    <p style={{ lineHeight: 1.7, fontSize: 14, maxHeight: 120, overflow: 'hidden' }}>{cryptoDetail.description}</p>
+                  </div>
+                )}
+                {cryptoAnalysis?.analysis && (
+                  <div style={{ ...subPanelStyle, marginTop: 16, borderLeft: '3px solid var(--ig-gain)' }}>
+                    <strong style={{ color: 'var(--ig-gain)' }}>🤖 AI Analysis</strong>
+                    <p style={{ lineHeight: 1.8, marginTop: 8 }}>{cryptoAnalysis.analysis}</p>
+                  </div>
+                )}
+              </section>
+            )}
+          </>
+        )}
+
+        {activeTab === 'etf' && (
+          <>
+            <section className="panel">
+              <div className="section-header">
+                <h2>🏦 ETF Explorer — {EXCHANGE_LABELS[preferredMarket]}</h2>
+                <button style={btnGreen} onClick={fetchEtfList} disabled={etfLoading}>
+                  {etfLoading ? 'Loading...' : '🔄 Refresh'}
+                </button>
+              </div>
+
+              {/* ETF Search */}
+              <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                <input style={inputStyle} type="text" placeholder={`Search ETFs (e.g., ${preferredMarket === 'AU' ? 'IOZ, STW' : preferredMarket === 'IN' ? 'NIFTYBEES, GOLDBEES' : 'SPY, QQQ'})`}
+                  value={etfSearch} onChange={e => setEtfSearch(e.target.value)} />
+              </div>
+
+              {etfLoading && <p>Loading ETF data...</p>}
+
+              {etfList?.etfs && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 }}>
+                  {Object.entries(etfList.etfs)
+                    .filter(([cat]) => !etfSearch || cat.toLowerCase().includes(etfSearch.toLowerCase()))
+                    .map(([category, funds]) => (
+                      <div key={category} style={cardStyle}>
+                        <strong style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: 1, color: 'var(--ig-red)' }}>{category.replace(/_/g, ' ')}</strong>
+                        <div style={{ marginTop: 10 }}>
+                          {funds.map(f => (
+                            <div key={f.ticker} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid var(--ig-border)' }}>
+                              <div>
+                                <strong style={{ cursor: 'pointer', color: 'var(--ig-dark)' }} onClick={() => fetchEtfDetail(f.ticker)}>{f.ticker}</strong>
+                                <span style={{ fontSize: 12, color: 'var(--ig-medium)', display: 'block' }}>{f.name}</span>
+                              </div>
+                              <button className="add-btn small" onClick={() => fetchEtfDetail(f.ticker)}>View</button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </section>
+
+            {etfDetail && (
+              <section className="panel">
+                <div className="section-header">
+                  <h2>📊 {etfDetail.ticker} — {etfDetail.name}</h2>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Price</span><br/><strong style={{ fontSize: 20 }}>{formatCurrency(etfDetail.current_price, preferredMarket)}</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>1Y Return</span><br/><strong style={{ fontSize: 20, color: (etfDetail.one_year_return_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{etfDetail.one_year_return_pct?.toFixed(2)}%</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>YTD Return</span><br/><strong style={{ color: (etfDetail.ytd_return_pct ?? 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{etfDetail.ytd_return_pct?.toFixed(2)}%</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>52W High</span><br/><strong>{formatCurrency(etfDetail['52_week_high'], preferredMarket)}</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Expense Ratio</span><br/><strong>{etfDetail.expense_ratio != null ? (etfDetail.expense_ratio * 100).toFixed(2) + '%' : 'N/A'}</strong></div>
+                  <div style={cardStyle}><span style={{ color: 'var(--ig-medium)' }}>Dividend Yield</span><br/><strong>{etfDetail.dividend_yield != null ? (etfDetail.dividend_yield * 100).toFixed(2) + '%' : 'N/A'}</strong></div>
+                </div>
+                <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {etfDetail.category && <span style={{ padding: '3px 12px', borderRadius: 10, background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', fontSize: 12 }}>{etfDetail.category}</span>}
+                  {etfDetail.exchange && <span style={{ padding: '3px 12px', borderRadius: 10, background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', fontSize: 12 }}>{etfDetail.exchange}</span>}
+                </div>
+              </section>
+            )}
+
+            <section className="panel">
+              <div className="section-header"><h2>⚖️ Compare ETFs</h2></div>
+              <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+                <input style={inputStyle} type="text" placeholder={`Tickers separated by commas (e.g., ${preferredMarket === 'IN' ? 'NIFTYBEES.NS, GOLDBEES.NS' : preferredMarket === 'AU' ? 'IOZ.AX, STW.AX' : 'SPY, QQQ'})`}
+                  value={etfCompareTickers} onChange={e => setEtfCompareTickers(e.target.value)} />
+                <button style={btnGreen} onClick={compareEtfs} disabled={etfCompareLoading}>
+                  {etfCompareLoading ? 'Comparing...' : 'Compare'}
+                </button>
+              </div>
+              {etfCompare?.comparison?.length > 0 && (
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead><tr><th>Ticker</th><th>Name</th><th>Price</th><th>Expense Ratio</th><th>Dividend Yield</th><th>Total Assets</th></tr></thead>
+                    <tbody>
+                      {etfCompare.comparison.map(e => (
+                        <tr key={e.ticker}>
+                          <td><strong>{e.ticker}</strong></td>
+                          <td style={{ fontSize: 12 }}>{e.name}</td>
+                          <td>{formatCurrency(e.current_price, preferredMarket)}</td>
+                          <td>{e.expense_ratio != null ? (e.expense_ratio * 100).toFixed(2) + '%' : 'N/A'}</td>
+                          <td>{e.dividend_yield != null ? (e.dividend_yield * 100).toFixed(2) + '%' : 'N/A'}</td>
+                          <td>{e.total_assets != null ? '$' + (e.total_assets / 1e9).toFixed(2) + 'B' : 'N/A'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+
+            {etfSpotlight?.theme && (
+              <section className="panel">
+                <div className="section-header"><h2>💡 ETF Spotlight — {etfSpotlight.theme}</h2></div>
+                <div style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', borderRadius: 6, padding: 16, lineHeight: 1.7 }}>
+                  <p style={{ marginTop: 0 }}>{etfSpotlight.commentary}</p>
+                  <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 12 }}>
+                    {etfSpotlight.au_etf && (
+                      <div style={cardStyle}>
+                        <span style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block' }}>🇦🇺 AU</span>
+                        <strong style={{ cursor: 'pointer', color: 'var(--ig-red)' }} onClick={() => fetchEtfDetail(etfSpotlight.au_etf)}>{etfSpotlight.au_etf}</strong>
+                      </div>
+                    )}
+                    {etfSpotlight.us_etf && (
+                      <div style={cardStyle}>
+                        <span style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block' }}>🇺🇸 US</span>
+                        <strong style={{ cursor: 'pointer', color: 'var(--ig-red)' }} onClick={() => fetchEtfDetail(etfSpotlight.us_etf)}>{etfSpotlight.us_etf}</strong>
+                      </div>
+                    )}
+                    {etfSpotlight.in_etf && (
+                      <div style={cardStyle}>
+                        <span style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block' }}>🇮🇳 IN</span>
+                        <strong style={{ cursor: 'pointer', color: 'var(--ig-red)' }} onClick={() => fetchEtfDetail(etfSpotlight.in_etf)}>{etfSpotlight.in_etf}</strong>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              )}
+
+          </>
+        )}
+
         {activeTab === 'portfolio' && (
           <PortfolioTab token={token} preferredMarket={preferredMarket} />
+        )}
+
+        {activeTab === 'wealth' && (
+          <ErrorBoundary>
+            <WealthBuilderTab token={token} preferredMarket={preferredMarket} setActiveTab={setActiveTab} />
+          </ErrorBoundary>
         )}
 
         {error && (

@@ -100,8 +100,24 @@ body {
 .logo h1 { font-size: 18px; font-weight: 700; color: var(--ig-white); letter-spacing: 0.2px; }
 
 /* Nav */
-.nav { display: flex; align-items: center; gap: 4px; }
-.nav-user { color: rgba(255,255,255,0.75); font-size: 12px; padding: 0 12px; }
+.nav-scroll-wrap {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+}
+.nav-scroll-wrap::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 40px;
+  background: linear-gradient(to right, transparent, var(--ig-red));
+  pointer-events: none;
+}
+.nav { display: flex; align-items: center; gap: 4px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.nav::-webkit-scrollbar { display: none; }
+.nav-user { color: rgba(255,255,255,0.75); font-size: 12px; padding: 0 12px; flex-shrink: 0; }
 
 .nav-btn {
   background: transparent;
@@ -115,10 +131,13 @@ body {
   border-radius: 2px;
   transition: all 0.15s ease;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .nav-btn:hover { color: var(--ig-white); background: rgba(255,255,255,0.15); border-color: rgba(255,255,255,0.4); }
 .nav-btn.active { color: var(--ig-white); background: rgba(255,255,255,0.2); border-color: var(--ig-white); }
+.nav-icon { font-size: 13px; }
+.nav-label-text { margin-left: 4px; }
 
 /* Main */
 .main { max-width: 1400px; margin: 0 auto; padding: 28px 24px; }
@@ -382,12 +401,14 @@ body {
 /* Responsive: Tablet */
 @media (max-width: 768px) {
   .header { height: auto; padding: 8px 0; }
-  .header-content { flex-direction: column; align-items: flex-start; gap: 6px; padding: 8px 12px; }
-  .logo h1 { font-size: 15px; }
-  .logo-icon { font-size: 19px; }
-  .nav { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; gap: 3px; }
-  .nav::-webkit-scrollbar { display: none; }
-  .nav-btn { white-space: nowrap; padding: 5px 9px; font-size: 11px; }
+  .header-content { flex-direction: column; align-items: stretch; gap: 6px; padding: 8px 12px; }
+  .logo { margin-bottom: 4px; }
+  .logo h1 { font-size: 14px; }
+  .logo-icon { font-size: 18px; }
+  .nav-scroll-wrap { width: 100%; flex: none; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .nav-scroll-wrap::after { width: 30px; }
+  .nav { width: max-content; min-width: 100%; padding-bottom: 2px; gap: 2px; }
+  .nav-btn { padding: 5px 8px; font-size: 10px; }
   .nav-user { display: none; }
   .main { padding: 16px 12px; }
   .tab-grid { grid-template-columns: 1fr; }
@@ -404,11 +425,12 @@ body {
   .provider-row { flex-wrap: wrap; }
   .portfolio-add-form { grid-template-columns: 1fr 1fr; }
   .advisor-row { flex-direction: column; }
+  .mobile-hide { display: none !important; }
 }
 
 /* Responsive: Small phones */
 @media (max-width: 480px) {
-  .logo h1 { font-size: 13px; }
+  .logo h1 { font-size: 12px; }
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stat-card { padding: 10px 12px; }
   .stat-title { font-size: 10px; }
@@ -429,4 +451,100 @@ body {
   .add-btn { padding: 8px 14px; font-size: 12px; }
   .portfolio-add-form { grid-template-columns: 1fr; }
   .scenario-grid { grid-template-columns: 1fr; }
+}
+
+/* Mobile tab navigation - scrollable with icon-only on very small screens */
+@media (max-width: 600px) {
+  .nav-btn { padding: 6px 10px; font-size: 11px; }
+  .nav-btn .nav-label-text { display: inline; }
+  .nav-btn .nav-icon { font-size: 12px; }
+}
+
+@media (max-width: 400px) {
+  .nav-btn { padding: 6px 8px; font-size: 10px; gap: 2px; }
+  .nav-btn .nav-label-text { display: none; }
+  .nav-btn .nav-icon { font-size: 14px; }
+}
+
+/* Mobile-friendly cards for tables */
+.mobile-card-list { display: none; }
+
+@media (max-width: 600px) {
+  .table-wrap { display: none; }
+  .mobile-card-list { display: block; }
+  .mobile-card { 
+    background: var(--ig-white); 
+    border: 2px solid var(--ig-border-strong); 
+    border-radius: 4px; 
+    padding: 12px; 
+    margin-bottom: 10px; 
+  }
+  .mobile-card-header { 
+    display: flex; 
+    justify-content: space-between; 
+    align-items: flex-start; 
+    margin-bottom: 8px; 
+    padding-bottom: 8px; 
+    border-bottom: 1px solid var(--ig-border); 
+  }
+  .mobile-card-symbol { font-size: 16px; font-weight: 700; color: var(--ig-dark); }
+  .mobile-card-name { font-size: 11px; color: var(--ig-muted); }
+  .mobile-card-price { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .mobile-card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; }
+  .mobile-card-row { display: flex; justify-content: space-between; }
+  .mobile-card-label { color: var(--ig-muted); font-size: 11px; }
+  .mobile-card-value { font-weight: 600; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .mobile-card-expand { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--ig-border); }
+}
+
+/* Grid fixes for expanded rows */
+@media (max-width: 768px) {
+  .expanded-detail-grid { grid-template-columns: 1fr !important; }
+}
+
+/* Horizontal scroll indicator */
+.scroll-hint {
+  display: none;
+  background: linear-gradient(90deg, transparent, rgba(204,0,0,0.1));
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--ig-muted);
+  text-align: center;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+/* Wealth Builder loading overlay */
+.wealth-loading-overlay {
+  text-align: center;
+  padding: 48px 20px;
+  background: var(--ig-white);
+  border: 2px solid var(--ig-border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-card);
+  margin-bottom: 16px;
+  animation: fadeIn 0.3s ease;
+}
+.wealth-loading-overlay .spinner {
+  margin: 0 auto;
+  width: 40px;
+  height: 40px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 600px) {
+  .scroll-hint { display: block; }
+}
+
+/* Mobile-friendly control grids */
+@media (max-width: 600px) {
+  .wealth-controls { flex-direction: column !important; align-items: stretch !important; gap: 8px !important; }
+  .wealth-controls > div { width: 100% !important; }
+  .wealth-controls input, .wealth-controls select { width: 100% !important; }
+  .wealth-controls .add-btn { width: 100%; justify-content: center; }
+  .legend-row { flex-direction: column !important; gap: 4px !important; }
 }

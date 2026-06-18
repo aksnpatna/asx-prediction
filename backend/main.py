@@ -3,6 +3,7 @@
 FastAPI + SQLAlchemy data layer + dual LLM providers (Local/OpenAI).
 """
 
+import asyncio
 import base64
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -12,14 +13,27 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import random
 from typing import List, Optional
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+import macro_model
+
+from concurrent.futures import ThreadPoolExecutor
+import time
+from zoneinfo import ZoneInfo
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import numpy as np
 from openai import OpenAI
+try:
+    from groq import Groq as GroqClient
+    GROQ_SDK_AVAILABLE = True
+except ImportError:
+    GROQ_SDK_AVAILABLE = False
 import pandas as pd
 from pydantic import BaseModel
 import jwt
@@ -93,16 +107,61 @@ app.add_middleware(
 
 # LLM configuration
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://host.docker.internal:1234/v1")
-LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen2.5-7b-instruct")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "deepseek-r1:7b")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 LLM_PROVIDER_ORDER = [
     provider.strip().lower()
-    for provider in os.getenv("LLM_PROVIDER_ORDER", "local,openai").split(",")
+    for provider in os.getenv("LLM_PROVIDER_ORDER", "groq,local,openai").split(",")
     if provider.strip()
 ]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+groq_client = GroqClient(api_key=GROQ_API_KEY) if (GROQ_SDK_AVAILABLE and GROQ_API_KEY) else None
+N8N_URL = os.getenv("N8N_URL", "http://broker-n8n:5678").rstrip("/")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BROKER_ID = os.getenv("TELEGRAM_BROKER_ID", "").strip()
+TELEGRAM_ACTION_INGEST_SECRET = os.getenv("TELEGRAM_ACTION_INGEST_SECRET", "").strip()
+
+
+def strip_think_tags(content: str) -> str:
+    """Strip DeepSeek-R1 <think>...</think> reasoning blocks and markdown fences."""
+    if not content:
+        return content
+    # Remove complete <think>...</think> blocks
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    # Remove incomplete <think> blocks (model hit token limit mid-reasoning)
+    content = re.sub(r"<think>.*$", "", content, flags=re.DOTALL)
+    # Strip markdown code fences
+    content = re.sub(r"```(?:json)?\s*", "", content)
+    content = re.sub(r"```\s*", "", content)
+    return content.strip()
+
+
+def extract_json_from_llm(content: str) -> Optional[dict]:
+    """Extract JSON object from LLM response after stripping think tags."""
+    content = strip_think_tags(content)
+    if not content:
+        return None
+    # Try balanced brackets first
+    m = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', content)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # Fallback: first { to last }
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(content[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return None
+
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-env")
 JWT_ALGORITHM = "HS256"
@@ -117,6 +176,9 @@ engine = create_engine(
     DATABASE_URL,
     future=True,
     pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=10,
+    pool_timeout=30,
 )
 
 
@@ -143,6 +205,20 @@ def init_db():
                     full_name TEXT,
                     password_hash TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL,
+                    used INTEGER DEFAULT 0,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
                 )
                 """
             )
@@ -218,6 +294,143 @@ def init_db():
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS daily_predictions (
+                    symbol TEXT NOT NULL,
+                    prediction_date TEXT NOT NULL,
+                    name TEXT,
+                    current_price REAL,
+                    predicted_price REAL,
+                    trend TEXT,
+                    score REAL,
+                    prob_ge_5pct REAL,
+                    expected_return_pct REAL,
+                    high_volatility_warning INTEGER DEFAULT 0,
+                    warning_message TEXT,
+                    warning_type TEXT,
+                    confidence_low REAL,
+                    confidence_high REAL,
+                    quality_reason TEXT,
+                    score_raw REAL,
+                    learning_note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (symbol, prediction_date)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trades (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    market TEXT NOT NULL DEFAULT 'AU',
+                    side TEXT NOT NULL,
+                    quantity REAL NOT NULL DEFAULT 1,
+                    entry_price REAL NOT NULL,
+                    current_price REAL,
+                    target_price REAL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    signal_score REAL,
+                    signal_trend TEXT,
+                    signal_warning TEXT,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS position_events (
+                    id TEXT PRIMARY KEY,
+                    trade_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_message TEXT,
+                    payload_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (trade_id) REFERENCES paper_trades(id),
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS user_telegram_recipients (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    label TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    UNIQUE(user_id, chat_id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_send_log (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    chat_id TEXT,
+                    message_type TEXT NOT NULL,
+                    market TEXT,
+                    digest_key TEXT,
+                    status TEXT NOT NULL,
+                    delivery_mode TEXT NOT NULL DEFAULT 'manual',
+                    source TEXT,
+                    error_message TEXT,
+                    telegram_message_id TEXT,
+                    payload_preview TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    sent_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS advice_execution_actions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    market TEXT NOT NULL DEFAULT 'AU',
+                    action_type TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    execution_price REAL NOT NULL,
+                    gross_amount REAL,
+                    commission REAL NOT NULL DEFAULT 0,
+                    net_amount REAL,
+                    advice_cache_key TEXT,
+                    source_message_type TEXT,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_telegram_recipients_user ON user_telegram_recipients(user_id, is_active)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_telegram_send_log_user_created ON telegram_send_log(user_id, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_telegram_send_log_digest ON telegram_send_log(user_id, message_type, digest_key, status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_position_events_trade_created ON position_events(trade_id, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_advice_actions_user_created ON advice_execution_actions(user_id, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_advice_actions_user_symbol ON advice_execution_actions(user_id, symbol, created_at DESC)"))
         # Migrate: add preferred_market to existing users table
         try:
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_market TEXT DEFAULT 'AU'"))
@@ -228,6 +441,23 @@ def init_db():
             conn.execute(text("ALTER TABLE portfolios ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'manual'"))
         except Exception:
             pass  # Column may already exist
+        for sql in [
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS peak_price REAL",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS stop_loss_price REAL",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS take_profit_price REAL",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS trailing_stop_pct REAL DEFAULT 3.0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS review_date TIMESTAMP",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS last_alert_at TIMESTAMP",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS position_stage TEXT DEFAULT 'entered'",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS recommendation_action TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS source_reason TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        ]:
+            try:
+                conn.execute(text(sql))
+            except Exception:
+                pass
 
 init_db()
 
@@ -309,68 +539,315 @@ class AuthResponse(BaseModel):
     user: dict
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class PasswordResetResponse(BaseModel):
+    message: str
+    reset_token: str
+    instructions: str
+
+
 security = HTTPBearer()
 
-# ASX company data cache
+# ASX company data cache — broad coverage of ASX 200 + popular ETFs/mid-caps
 ASX_COMPANIES = {
-    "BHP": "BHP Group Limited",
+    # --- Financials ---
     "CBA": "Commonwealth Bank of Australia",
     "ANZ": "ANZ Banking Group Limited",
-    "WOW": "Woolworths Group Limited",
-    "TLS": "Telstra Corporation Limited",
     "WBC": "Westpac Banking Corporation",
     "NAB": "National Australia Bank Limited",
-    "CSL": "CSL Limited",
-    "RIO": "Rio Tinto Limited",
-    "FMG": "Fortescue Metals Group Ltd",
-    "AMD": "Aristocrat Leisure Limited",
+    "MQG": "Macquarie Group Limited",
+    "SUN": "Suncorp Group Limited",
     "QBE": "QBE Insurance Group Limited",
+    "IAG": "Insurance Australia Group",
+    "AMP": "AMP Limited",
+    "CGF": "Challenger Limited",
+    "PPT": "Perpetual Limited",
+    "MFG": "Magellan Financial Group",
+    "HUB": "Hub24 Limited",
+    "NWL": "Netwealth Group Limited",
+    "PTM": "Platinum Asset Management",
+    "GQG": "GQG Partners Inc.",
+    "BOQ": "Bank of Queensland",
+    "BEN": "Bendigo and Adelaide Bank",
+    "CQR": "Charter Hall Retail REIT",
+    "CPU": "Computershare Limited",
+    "ASX": "ASX Limited",
+    "IFL": "Insignia Financial",
+    "MMS": "McMillan Shakespeare",
+    # --- Materials / Mining ---
+    "BHP": "BHP Group Limited",
+    "RIO": "Rio Tinto Limited",
+    "FMG": "Fortescue Limited",
     "S32": "South32 Limited",
     "MIN": "Mineral Resources Limited",
-    "AIA": "Auckland International Airport",
-    "AZJ": "Aurizon Holdings Limited",
-    "BXB": "Brambles Limited",
-    "CIA": "Champion Iron Limited",
-    "CWY": "Cleanaway Waste Management",
-    "DLX": "DuluxGroup Limited",
-    "HVN": "Harvey Norman Holdings",
-    "IPL": "Incitec Pivot Limited",
-    "JHX": "James Hardie Industries",
-    "LLC": "Lottery Corporation Limited",
-    "MEZ": "Meridian Energy Limited",
+    "OZL": "OZ Minerals Limited",
+    "NST": "Northern Star Resources",
+    "EVN": "Evolution Mining Limited",
     "NCM": "Newcrest Mining Limited",
-    "NEC": "Nine Entertainment Co.",
-    "OML": "Ooh!Media Limited",
-    "ORE": "Orocobre Limited",
-    "ORA": "Orora Limited",
-    "OSH": "Oil Search Limited",
-    "PMV": "Premier Investments Limited",
-    "PPT": "Perpetual Limited",
-    "QAN": "Qantas Airways Limited",
-    "REA": "REA Group Ltd",
-    "RHC": "Ramsay Health Care",
-    "SCG": "Scentre Group Limited",
-    "SEK": "Seek Limited",
-    "SHL": "Sonic Healthcare Limited",
-    "SOL": "Soul Pattinson (W.H) Ltd",
-    "SPK": "Spark New Zealand",
-    "STO": "Santos Limited",
-    "SUL": "Super Retail Group Ltd",
-    "TGP": "Travel360 Group Limited",
-    "TLC": "The Lottery Corporation",
-    "TMG": "Trigg Mining Ltd",
-    "VOC": "Vocus Group Limited",
+    "SFR": "Sandfire Resources",
+    "IGO": "IGO Limited",
+    "LYC": "Lynas Rare Earths",
+    "PLS": "Pilbara Minerals",
+    "CIA": "Champion Iron Limited",
+    "AWC": "Alumina Limited",
+    "BSL": "BlueScope Steel Limited",
+    "GRR": "Grange Resources",
+    "WHC": "Whitehaven Coal",
+    "NHC": "New Hope Corporation",
     "WDS": "Woodside Energy Group",
-    "WES": "Wesfarmers Limited",
+    "STO": "Santos Limited",
+    "BPT": "Beach Energy Limited",
+    "KAR": "Karoon Energy",
     "ORG": "Origin Energy Limited",
+    "WOR": "Worley Limited",
+    "ALD": "Ampol Limited",
+    "VEA": "Viva Energy Group",
+    "IPL": "Incitec Pivot Limited",
+    "ORA": "Orora Limited",
+    "ANN": "Ansell Limited",
+    "ALQ": "ALS Limited",
+    "NUF": "Nufarm Limited",
+    "WGX": "Westgold Resources",
+    "SLR": "Silver Lake Resources",
+    "RMS": "Ramelius Resources",
+    "GOR": "Gold Road Resources",
+    "CMM": "Capricorn Metals",
+    "PRU": "Perseus Mining",
+    "OGC": "OceanaGold Corporation",
+    "TGS": "Tiger Resources",
+    # --- Healthcare ---
+    "CSL": "CSL Limited",
+    "RHC": "Ramsay Health Care",
+    "SHL": "Sonic Healthcare Limited",
+    "COH": "Cochlear Limited",
+    "RMD": "ResMed Inc.",
+    "MPL": "Medibank Private",
+    "NHF": "nib Holdings Limited",
+    "HLS": "Healius Limited",
+    "PME": "Pro Medicus Limited",
+    "AHL": "Adrad Holdings",
+    "IDX": "Integral Diagnostics",
+    "CAJ": "Capitol Health",
+    "TLX": "Telix Pharmaceuticals",
+    "IMX": "Immutep Limited",
+    "PNV": "PolyNovo Limited",
+    # --- Consumer Discretionary ---
+    "WES": "Wesfarmers Limited",
+    "WOW": "Woolworths Group Limited",
+    "COL": "Coles Group Limited",
+    "HVN": "Harvey Norman Holdings",
+    "JBH": "JB Hi-Fi Limited",
+    "PMV": "Premier Investments Limited",
+    "SUL": "Super Retail Group Ltd",
+    "MYR": "Myer Holdings Limited",
+    "KGN": "Kogan.com Limited",
+    "BBN": "Baby Bunting Group",
+    "ADH": "Adairs Limited",
+    "BAP": "Bapcor Limited",
+    "ARB": "ARB Corporation Limited",
+    "PWR": "Peter Warren Automotive",
+    "APE": "Eagers Automotive",
+    "GUD": "GUD Holdings",
+    "GWA": "GWA Group Limited",
+    "REH": "Reece Limited",
+    "ABC": "AdBri Limited",
+    "SKC": "SkyCity Entertainment",
+    "TAH": "Tabcorp Holdings",
+    "ALL": "Aristocrat Leisure Limited",
+    "SGR": "Star Entertainment Group",
+    "CWN": "Crown Resorts",
+    "FLG": "Fairfax Financial",
+    "FLT": "Flight Centre Travel Group",
+    "WEB": "Webjet Limited",
+    "CTD": "Corporate Travel Management",
+    "QAN": "Qantas Airways Limited",
+    "REX": "Regional Express Holdings",
+    "SIG": "Sigma Healthcare",
+    "PAR": "Paradigm Biopharmaceuticals",
+    # --- Consumer Staples ---
+    "TWE": "Treasury Wine Estates",
+    "CCL": "Coca-Cola Europacific Partners",
+    "GNC": "GrainCorp Limited",
+    "ELD": "Elders Limited",
+    "ING": "Inghams Group Limited",
+    "AAC": "Australian Agricultural",
+    # --- Industrials ---
+    "BXB": "Brambles Limited",
+    "AZJ": "Aurizon Holdings Limited",
+    "DOW": "Downer EDI Limited",
+    "QUB": "Qube Holdings Limited",
+    "TCL": "Transurban Group",
+    "SYA": "Sayona Mining",
+    "ALX": "Atlas Arteria",
+    "AIA": "Auckland International Airport",
+    "SVW": "Seven Group Holdings",
+    "CAR": "CAR Group Limited",
+    "SEK": "Seek Limited",
+    "IEL": "IDP Education Limited",
+    "TNE": "Technology One Limited",
+    "REA": "REA Group Ltd",
+    "DHG": "Domain Holdings Australia",
+    "OFX": "OFX Group Limited",
+    "SWM": "Seven West Media",
+    "NEC": "Nine Entertainment Co.",
+    "NWS": "News Corporation",
+    "SXL": "Southern Cross Media",
+    "CWY": "Cleanaway Waste Management",
+    "DOW": "Downer EDI Limited",
+    "UGL": "UGL Limited",
+    "MND": "Monadelphous Group",
+    "CIM": "CIMIC Group",
+    "RWC": "Reliance Worldwide",
+    "JHX": "James Hardie Industries",
+    "DLX": "DuluxGroup Limited",
+    "ABB": "Aussie Broadband",
+    "TPG": "TPG Telecom",
+    # --- Telecom ---
+    "TLS": "Telstra Corporation Limited",
+    "TPM": "TPG Telecom Limited",
+    "VOC": "Vocus Group Limited",
+    "SPK": "Spark New Zealand",
+    # --- Technology ---
+    "WTC": "WiseTech Global",
+    "XRO": "Xero Limited",
+    "NXT": "NextDC Limited",
+    "MP1": "Megaport Limited",
+    "APX": "Appen Limited",
+    "ALU": "Altium Limited",
+    "PPS": "Praemium Limited",
+    "IRI": "Integrated Research",
+    "DUB": "Dubber Corporation",
+    "Z1P": "Zip Co Limited",
+    "SPT": "Splitit Payments",
+    "EML": "EML Payments",
+    "BTH": "Bigtincan Holdings",
+    "LNK": "Link Administration",
+    "OPT": "Opthea Limited",
+    # --- Real Estate / REITs ---
+    "GMG": "Goodman Group",
+    "SCG": "Scentre Group Limited",
+    "VCX": "Vicinity Centres",
+    "DXS": "Dexus",
+    "SGP": "Stockland",
+    "MGR": "Mirvac Group",
+    "CLW": "Charter Hall Long WALE REIT",
+    "CHC": "Charter Hall Group",
+    "CIP": "Centuria Industrial REIT",
+    "COF": "Centuria Office REIT",
+    "ARF": "Arena REIT",
+    "SCP": "Shopping Centres Australasia",
+    "LLC": "Lottery Corporation Limited",
+    "TLC": "The Lottery Corporation",
+    # --- Utilities ---
+    "AGL": "AGL Energy Limited",
+    "APA": "APA Group",
+    "SKI": "Spark Infrastructure",
+    "AST": "AusNet Services",
+    "MEZ": "Meridian Energy Limited",
+    "GNE": "Genesis Energy Limited",
+    "CEN": "Contact Energy",
+    # --- Diversified / Conglomerates ---
+    "SOL": "Soul Pattinson (W.H) Ltd",
+    "WOW": "Woolworths Group Limited",
+    # --- Defence & Aerospace ---
     "DRO": "DroneShield Limited",
     "EOS": "Electro Optic Systems Holdings",
     "ASB": "Austal Limited",
+    # --- Other / Mid-cap ---
+    "OML": "Ooh!Media Limited",
+    "ORE": "Orocobre Limited",
+    "OSH": "Oil Search Limited",
+    "TGP": "360 Capital Group",
+    "TMG": "Trigg Mining Ltd",
+    "ILU": "Iluka Resources",
+    "IMD": "Imdex Limited",
+    "NBI": "NBI Industrial REIT",
+    "OFX": "OFX Group",
+    "PAC": "Pacific Current Group",
+    "PPH": "Pushpay Holdings",
+    "PRN": "Perenti Global",
+    "SOI": "Sofi AI",
+    "SSR": "SSR Mining",
+    "STX": "Strike Energy",
+    "TLX": "Telix Pharmaceuticals",
+    "URW": "Unibail-Rodamco-Westfield",
+    # --- ASX-listed ETFs (Gold, Index, Bond, Sector) ---
+    "PMGOLD": "Perth Mint Physical Gold",
+    "GOLD": "ETFS Physical Gold",
+    "QAU": "BetaShares Gold Bullion (AUD Hedged)",
+    "ETPMAG": "ETFS Physical Silver",
+    "ETPMPD": "ETFS Physical Palladium",
+    "ETPMPT": "ETFS Physical Platinum",
+    "VAS": "Vanguard Australian Shares Index ETF",
+    "VGS": "Vanguard MSCI Index International Shares ETF",
+    "VTS": "Vanguard US Total Market Shares ETF",
+    "VEU": "Vanguard All-World ex-US Shares ETF",
+    "VGB": "Vanguard Australian Govt Bond Index ETF",
+    "VAF": "Vanguard Australian Fixed Interest Index ETF",
+    "VHY": "Vanguard Australian Shares High Yield ETF",
+    "STW": "SPDR S&P/ASX 200 Fund",
+    "IOZ": "iShares Core S&P/ASX 200 ETF",
+    "IVV": "iShares S&P 500 ETF",
+    "IJR": "iShares S&P Small-Cap ETF",
+    "NDQ": "BetaShares NASDAQ 100 ETF",
+    "HACK": "BetaShares Global Cybersecurity ETF",
+    "HNDQ": "BetaShares NASDAQ 100 (AUD Hedged) ETF",
+    "DHHF": "BetaShares Diversified High Growth ETF",
+    "VDHG": "Vanguard Diversified High Growth Index ETF",
+    "VDBA": "Vanguard Diversified Balanced Index ETF",
+    "VDGR": "Vanguard Diversified Growth Index ETF",
+    "A200": "BetaShares Australia 200 ETF",
+    "EX20": "BetaShares Ex-20 Australian Equities ETF",
+    "MVW": "VanEck Australian Equal Weight ETF",
+    "MVA": "VanEck Australian Property ETF",
+    "ETHI": "BetaShares Global Sustainability Leaders ETF",
+    "FAIR": "BetaShares Australian Sustainability Leaders ETF",
+    "ASIA": "BetaShares Asia Technology Tigers ETF",
+    "FANG": "BetaShares FAANG+ ETF",
+    "DRIV": "Global X Autonomous & Electric Vehicles ETF",
+    "RBTZ": "Global X Robotics & AI ETF",
+    "ROBO": "ETFS ROBO Global Robotics & Automation ETF",
+    "BNKS": "BetaShares Global Banks ETF",
+    "FUEL": "BetaShares Global Energy Companies ETF",
+    "FOOD": "BetaShares Global Agriculture Companies ETF",
+    "GGUS": "BetaShares Geared US Equity (Hedge Fund)",
+    "BEAR": "BetaShares Australian Equities Bear Hedge Fund",
+    "BBOZ": "BetaShares Australian Equities Strong Bear",
+    "BBUS": "BetaShares US Equities Strong Bear (Hedged)",
+    "AAA": "BetaShares Australian High Interest Cash ETF",
+    "BILL": "iShares Core Cash ETF",
+    "IAF": "iShares Core Composite Bond ETF",
+    "ISEC": "iShares Enhanced Cash ETF",
+    "AGVT": "iShares Australian Govt Bond ETF",
+    "CRED": "BetaShares Australian Investment Grade Bond ETF",
+    "QPON": "BetaShares Australian Bank Senior Floating Rate Bond ETF",
+    "FLOT": "VanEck Floating Rate ETF",
+    "IHVV": "iShares S&P 500 (AUD Hedged) ETF",
+    "IHWL": "iShares Core MSCI World All Cap (AUD Hedged) ETF",
+    "HGBL": "BetaShares Global Government Bond 20+ yr (AUD Hedged) ETF",
+    "GBND": "BetaShares Sustainability Leades Diversified Bond ETF",
+    "OOO": "BetaShares Crude Oil Index ETF",
 }
 
-TOP_ASX200_SYMBOLS = [
-    "BHP", "CBA", "CSL", "WBC", "NAB", "ANZ", "WES", "WOW", "TLS", "RIO"
-]
+# Try to load broader ASX_COMPANIES, fallback to initial array if evaluating module early
+try:
+    TOP_ASX200_SYMBOLS = list(ASX_COMPANIES.keys())
+except NameError:
+    TOP_ASX200_SYMBOLS = [
+        "BHP", "CBA", "CSL", "WBC", "NAB", "ANZ", "WES", "WOW", "TLS", "RIO",
+        "MQG", "FMG", "WDS", "GMG", "ALL", "COL", "REA", "TCL", "QBE", "STO",
+        "XRO", "RMD", "ORG", "COH", "JBH", "APA", "MIN", "PME", "S32", "SEK",
+    ]
+TOP_ASX200_SYMBOLS_SHUFFLED = False
+_TOP_ASX200_CURSOR = 0
 
 US_COMPANIES = {
     "AAPL": "Apple Inc.",
@@ -476,7 +953,6 @@ INDIA_COMPANIES = {
     "IRFC.NS": "Indian Railway Finance Corp",
     # Telecom & Media
     "BHARTIARTL.NS": "Bharti Airtel",
-    "VODAFONE.NS": "Vodafone Idea",
     "IDEA.NS": "Vodafone Idea",
     "TATACOMM.NS": "Tata Communications",
     "MTNL.NS": "MTNL",
@@ -512,7 +988,6 @@ INDIA_COMPANIES = {
     "ACC.NS": "ACC Limited",
     "RAMCOCEM.NS": "Ramco Cements",
     # Chemicals
-    "PIDILITIND.NS": "Pidilite Industries",
     "SRF.NS": "SRF Limited",
     "DEEPAKNTR.NS": "Deepak Nitrite",
     "AAVAS.NS": "Aavas Financiers",
@@ -522,7 +997,6 @@ INDIA_COMPANIES = {
     "ESCORTS.NS": "Escorts Kubota",
     "SONACOMS.NS": "Sona BLW Precision",
     "CAMPUS.NS": "Campus Activewear",
-    "RAILVIKAS.NS": "Rail Vikas Nigam",
     "RVNL.NS": "Rail Vikas Nigam",
     "IRCON.NS": "IRCON International",
     "SUZLON.NS": "Suzlon Energy",
@@ -540,7 +1014,6 @@ INDIA_COMPANIES = {
     "APOLLOTYRE.NS": "Apollo Tyres",
     "MRF.NS": "MRF Limited",
     "CEATLTD.NS": "CEAT Limited",
-    "PIDILITIND.NS": "Pidilite Industries",
     "PAGEIND.NS": "Page Industries",
     "TRENT.NS": "Trent Limited",
     "VARUNBEV.NS": "Varun Beverages",
@@ -571,8 +1044,7 @@ _IN_SYMBOLS = {k.replace(".NS", "") for k in INDIA_COMPANIES}
 
 def detect_market(symbol: str) -> str:
     """Detect the market (AU/US/IN) for a bare symbol.
-    Priority: explicit US list → explicit AU list → default to IN (NSE).
-    Any symbol not known to be AU or US is treated as an NSE stock.
+    Priority: explicit US list → explicit AU list → IN company list → try ASX live → default AU.
     """
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if s in US_COMPANIES:
@@ -581,8 +1053,15 @@ def detect_market(symbol: str) -> str:
         return "AU"
     if s in _IN_SYMBOLS:
         return "IN"
-    # Unknown symbol — default to NSE (India) rather than ASX
-    return "IN"
+    # Unknown symbol: probe yfinance to see if it trades on ASX before falling back.
+    try:
+        probe = yf.Ticker(f"{s}.AX").fast_info
+        if getattr(probe, "last_price", None) or getattr(probe, "regular_market_price", None):
+            return "AU"
+    except Exception:
+        pass
+    # Final default: treat as ASX since this is an ASX-focused app.
+    return "AU"
 
 
 def format_ticker(symbol: str, market: str = "AU") -> str:
@@ -606,7 +1085,8 @@ def get_market_companies(market: str) -> dict:
 
 
 def get_stock_data(symbol: str, market: str = None) -> dict:
-    """Fetch the latest price and change for a symbol across any market."""
+    """Fetch the latest price and change for a symbol across any market.
+    Includes staleness check: rejects data older than 5 trading days."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
         market = detect_market(s)
@@ -614,6 +1094,18 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
     stock = yf.Ticker(ticker_str)
     try:
         hist = stock.history(period="5d")
+        # Fallback: if empty and not already trying ASX, retry as ASX
+        if hist.empty and market != "AU":
+            hist = yf.Ticker(format_ticker(s, "AU")).history(period="5d")
+        # Staleness check: reject if last data point is older than 5 calendar days
+        if not hist.empty and len(hist) >= 1:
+            last_date = hist.index[-1]
+            if hasattr(last_date, 'date'):
+                days_stale = (datetime.utcnow().date() - last_date.date()).days
+            else:
+                days_stale = 0
+            if days_stale > 5:
+                return {"current_price": 0.0, "change_percent": 0.0, "name": ASX_COMPANIES.get(s) or ALL_COMPANIES.get(s, s)}
         if len(hist) >= 2:
             current_price = float(hist["Close"].iloc[-1])
             prev_close = float(hist["Close"].iloc[-2])
@@ -625,10 +1117,15 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
         change = ((current_price - prev_close) / prev_close * 100) if prev_close else 0.0
     except Exception:
         current_price, change = 0.0, 0.0
+    # Resolve company name: check ASX dict first, then ALL_COMPANIES, then use symbol
+    name = ASX_COMPANIES.get(s) or ALL_COMPANIES.get(s, s)
     return {
         "current_price": current_price,
         "change_percent": change,
-        "name": ALL_COMPANIES.get(s, s),
+        "name": name,
+        "volume": int(hist["Volume"].iloc[-1]) if len(hist) >= 1 and "Volume" in hist.columns else None,
+        "avg_volume_5d": round(float(hist["Volume"].tail(5).mean()), 0) if len(hist) >= 1 and "Volume" in hist.columns else None,
+        "volume_spike": round(float(hist["Volume"].iloc[-1]) / float(hist["Volume"].tail(5).mean()), 2) if len(hist) >= 1 and "Volume" in hist.columns and float(hist["Volume"].tail(5).mean()) > 0 else None,
     }
 
 
@@ -653,6 +1150,65 @@ def get_valuation_metrics(symbol: str) -> dict:
     if market_cap is not None:
         market_cap = float(market_cap)
     
+    # Analyst consensus targets
+    target_mean = info.get('targetMeanPrice')
+    target_high = info.get('targetHighPrice')
+    target_low  = info.get('targetLowPrice')
+    current_p   = info.get('currentPrice') or info.get('regularMarketPreviousClose') or 0
+    upside_to_target = None
+    if target_mean and current_p and current_p > 0:
+        upside_to_target = round(((float(target_mean) - float(current_p)) / float(current_p)) * 100, 2)
+
+    # 52-week range context
+    high_52w = info.get('fiftyTwoWeekHigh')
+    low_52w  = info.get('fiftyTwoWeekLow')
+    pct_from_52w_high = None
+    if high_52w and current_p and current_p > 0:
+        pct_from_52w_high = round(((float(current_p) - float(high_52w)) / float(high_52w)) * 100, 2)
+
+    # Short interest (institutional sentiment)
+    short_pct = info.get('shortPercentOfFloat')
+    if short_pct is not None and short_pct < 1:
+        short_pct = round(float(short_pct) * 100, 2)
+
+    # EPS growth trajectory
+    trailing_eps = info.get('trailingEps')
+    forward_eps  = info.get('forwardEps')
+    eps_growth_fwd = None
+    if trailing_eps and forward_eps and float(trailing_eps) != 0:
+        eps_growth_fwd = round(((float(forward_eps) - float(trailing_eps)) / abs(float(trailing_eps))) * 100, 2)
+
+    # Next earnings date (from calendar)
+    next_earnings_date = None
+    days_to_earnings = None
+    try:
+        cal = stock.calendar
+        if cal is not None:
+            if hasattr(cal, 'T'):
+                # older yfinance returns a DataFrame
+                if 'Earnings Date' in cal.index:
+                    raw_ed = cal.loc['Earnings Date']
+                    raw_ed = raw_ed.dropna() if hasattr(raw_ed, 'dropna') else raw_ed
+                    if hasattr(raw_ed, 'iloc') and len(raw_ed) > 0:
+                        raw_ed = raw_ed.iloc[0]
+                    if hasattr(raw_ed, 'date'):
+                        next_earnings_date = str(raw_ed.date())
+            elif isinstance(cal, dict):
+                raw_ed = cal.get('Earnings Date')
+                if raw_ed:
+                    if isinstance(raw_ed, list) and len(raw_ed) > 0:
+                        raw_ed = raw_ed[0]
+                    if hasattr(raw_ed, 'date'):
+                        next_earnings_date = str(raw_ed.date())
+                    elif isinstance(raw_ed, str):
+                        next_earnings_date = raw_ed
+        if next_earnings_date:
+            from datetime import date as _date
+            ed = _date.fromisoformat(next_earnings_date)
+            days_to_earnings = (ed - datetime.utcnow().date()).days
+    except Exception:
+        pass
+
     return {
         "pe": info.get('trailingPE'),
         "forward_pe": info.get('forwardPE'),
@@ -662,6 +1218,26 @@ def get_valuation_metrics(symbol: str) -> dict:
         "market_cap": market_cap,
         "sector": info.get('sector'),
         "industry": info.get('industry'),
+        # Analyst consensus
+        "analyst_target_mean": round(float(target_mean), 2) if target_mean else None,
+        "analyst_target_high": round(float(target_high), 2) if target_high else None,
+        "analyst_target_low":  round(float(target_low), 2)  if target_low  else None,
+        "analyst_upside_pct": upside_to_target,
+        "analyst_recommendation": info.get('recommendationKey'),
+        "num_analyst_opinions": info.get('numberOfAnalystOpinions'),
+        # Earnings
+        "next_earnings_date": next_earnings_date,
+        "days_to_earnings": days_to_earnings,
+        "trailing_eps": round(float(trailing_eps), 3) if trailing_eps else None,
+        "forward_eps":  round(float(forward_eps), 3)  if forward_eps  else None,
+        "eps_growth_fwd_pct": eps_growth_fwd,
+        "revenue_growth": info.get('revenueGrowth'),
+        "earnings_growth": info.get('earningsGrowth'),
+        # Market structure
+        "short_pct_float": short_pct,
+        "52w_high": round(float(high_52w), 3) if high_52w else None,
+        "52w_low":  round(float(low_52w), 3)  if low_52w  else None,
+        "pct_from_52w_high": pct_from_52w_high,
     }
 
 
@@ -726,6 +1302,147 @@ def get_risk_metrics(symbol: str) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CATALYST & ENTRY TIMING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict) -> dict:
+    """Return a structured entry timing signal combining catalyst risk and technical confirmation.
+
+    Returns:
+        {
+          "entry_ok": bool,
+          "entry_zone": "clear|caution|avoid",
+          "reason": str,
+          "days_to_earnings": int|None,
+          "earnings_risk": "high|moderate|low|none",
+          "technical_confirmed": bool,
+          "upside_to_target_pct": float|None,
+        }
+    """
+    days_to_e = valuation.get('days_to_earnings')
+    upside = valuation.get('analyst_upside_pct')
+    rsi = indicators.get('rsi') or 50
+    current_price = prediction.get('current_price', 0)
+    sma50 = indicators.get('sma_50', 0) or 0
+
+    # ── Earnings proximity guard ──────────────────────────────────────────────
+    if days_to_e is not None:
+        if days_to_e < 0:
+            earnings_risk = "none"           # past earnings — post-earnings drift window
+            entry_zone_e = "clear"
+        elif days_to_e <= 7:
+            earnings_risk = "high"           # too close — binary event risk
+            entry_zone_e = "avoid"
+        elif days_to_e <= 14:
+            earnings_risk = "moderate"
+            entry_zone_e = "caution"
+        elif days_to_e <= 30:
+            earnings_risk = "low"
+            entry_zone_e = "caution"
+        else:
+            earnings_risk = "none"
+            entry_zone_e = "clear"
+    else:
+        earnings_risk = "unknown"
+        entry_zone_e = "caution"
+
+    # ── Technical confirmation ────────────────────────────────────────────────
+    # Price > SMA50 AND RSI not overbought (< 72) AND momentum positive
+    momentum_20 = indicators.get('momentum_20', 0) or 0
+    macd_hist = indicators.get('macd_hist', 0) or 0
+    technical_confirmed = (
+        current_price > sma50 > 0
+        and rsi < 72
+        and momentum_20 > -5
+        and macd_hist > -0.05 * abs(sma50) * 0.001
+    )
+
+    # ── Analyst upside threshold ──────────────────────────────────────────────
+    # Only interesting if analysts see meaningful upside
+    analyst_ok = (upside is None) or (upside >= 5.0)
+
+    # ── Combine ───────────────────────────────────────────────────────────────
+    if entry_zone_e == "avoid":
+        entry_zone = "avoid"
+        entry_ok = False
+        reason = f"Earnings in {days_to_e}d — binary event risk. Wait for post-result clarity."
+    elif entry_zone_e == "caution" and not technical_confirmed:
+        entry_zone = "avoid"
+        entry_ok = False
+        reason = "Earnings approaching + technicals not confirmed. No clear entry."
+    elif entry_zone_e == "caution":
+        entry_zone = "caution"
+        entry_ok = True
+        reason = f"Earnings in {days_to_e}d — proceed with tighter stop. Technicals confirmed."
+    elif not technical_confirmed:
+        entry_zone = "caution"
+        entry_ok = False
+        reason = "Technicals not yet confirmed (price below SMA50, RSI overbought, or negative momentum)."
+    elif not analyst_ok:
+        entry_zone = "caution"
+        entry_ok = False
+        reason = f"Analyst consensus target offers only {upside:.1f}% upside — risk/reward marginal."
+    else:
+        entry_zone = "clear"
+        entry_ok = True
+        reason = "Technicals confirmed, no imminent earnings risk, analyst upside sufficient."
+
+    return {
+        "entry_ok": entry_ok,
+        "entry_zone": entry_zone,
+        "reason": reason,
+        "days_to_earnings": days_to_e,
+        "earnings_risk": earnings_risk,
+        "technical_confirmed": technical_confirmed,
+        "upside_to_target_pct": upside,
+    }
+
+
+def _build_wealth_signal_message(symbol: str, name: str, signal: dict, valuation: dict,
+                                  prediction: dict, entry_timing: dict) -> str:
+    """Build a rich, emoji-annotated Telegram HTML message for a wealth-builder signal."""
+    score = signal.get('score', 0) or 0
+    trend = (prediction.get('trend') or 'neutral').upper()
+    upside = valuation.get('analyst_upside_pct')
+    rec = (valuation.get('analyst_recommendation') or '').upper()
+    n_analysts = valuation.get('num_analyst_opinions') or '?'
+    days_e = entry_timing.get('days_to_earnings')
+    dte_str = f"{days_e}d" if days_e is not None else 'N/A'
+
+    zone_emoji = {"clear": "🟢", "caution": "🟡", "avoid": "🔴"}.get(entry_timing['entry_zone'], "⚪")
+    trend_emoji = "📈" if trend == "BULLISH" else ("📉" if trend == "BEARISH" else "➡️")
+
+    upside_str = f"{upside:+.1f}%" if upside is not None else 'N/A'
+    pe_str = f"{valuation.get('pe'):.1f}x" if valuation.get('pe') else 'N/A'
+    fpe_str = f"{valuation.get('forward_pe'):.1f}x" if valuation.get('forward_pe') else 'N/A'
+    high52_str = f"${valuation.get('52w_high'):.2f}" if valuation.get('52w_high') else 'N/A'
+    from_peak = valuation.get('pct_from_52w_high')
+    from_peak_str = f"{from_peak:+.1f}%" if from_peak is not None else 'N/A'
+    short_str = f"{valuation.get('short_pct_float'):.1f}%" if valuation.get('short_pct_float') else 'N/A'
+    pred_chg = prediction.get('change_from_current', 0) or 0
+
+    return (
+        f"<b>{zone_emoji} WEALTH SIGNAL — {symbol}</b>\n"
+        f"{name}\n\n"
+        f"{trend_emoji} <b>90-Day Forecast:</b> {trend} | <b>+{pred_chg:.1f}%</b> model forecast\n"
+        f"📊 <b>Score:</b> {score:.2f} | <b>P(≥5%):</b> {signal.get('prob_ge_5pct', 0):.1f}%\n\n"
+        f"<b>💼 Analyst Consensus ({n_analysts} analysts)</b>\n"
+        f"  Recommendation: <b>{rec or 'N/A'}</b>\n"
+        f"  Target (consensus): ${valuation.get('analyst_target_mean') or 'N/A'}\n"
+        f"  Implied upside: <b>{upside_str}</b>\n\n"
+        f"<b>📅 Catalyst Risk</b>\n"
+        f"  Next Earnings: {valuation.get('next_earnings_date', 'N/A')} ({dte_str} away)\n"
+        f"  Earnings Risk: {entry_timing['earnings_risk'].upper()}\n"
+        f"  Entry Zone: {zone_emoji} <b>{entry_timing['entry_zone'].upper()}</b>\n"
+        f"  Reason: {entry_timing['reason']}\n\n"
+        f"<b>📐 Valuation</b>\n"
+        f"  P/E: {pe_str} | Fwd P/E: {fpe_str}\n"
+        f"  52-Week High: {high52_str} | From Peak: {from_peak_str}\n"
+        f"  Short Interest: {short_str}\n"
+    )
+
+
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 390000)
@@ -781,12 +1498,16 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     }
 
 def get_historical_data(symbol: str, period: str = "1y", market: str = None) -> pd.DataFrame:
-    """Get historical price data for any market."""
+    """Get historical price data for any market. Falls back to ASX if no data found.
+    Pass market=None to use the symbol as-is (no suffix appended)."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
-        market = detect_market(s)
-    stock = yf.Ticker(format_ticker(s, market))
-    return stock.history(period=period)
+        return yf.Ticker(symbol).history(period=period)
+    df = yf.Ticker(format_ticker(s, market)).history(period=period)
+    # If empty and market wasn't explicitly AU, retry as ASX
+    if df.empty and market != "AU":
+        df = yf.Ticker(format_ticker(s, "AU")).history(period=period)
+    return df
 
 def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     """Calculate technical indicators"""
@@ -834,7 +1555,1379 @@ def std_norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def get_trend_streak(symbol: str) -> dict:
+    """Return streak of consecutive same-trend days from daily_predictions."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT trend FROM daily_predictions
+                    WHERE symbol = :symbol
+                    ORDER BY prediction_date DESC
+                    LIMIT 7
+                """),
+                {"symbol": symbol},
+            ).fetchall()
+        if not rows:
+            return {"trend_streak": 0, "streak_label": "New signal"}
+        latest_trend = rows[0][0]
+        streak = 1
+        for row in rows[1:]:
+            if row[0] == latest_trend:
+                streak += 1
+            else:
+                break
+        trend_word = (latest_trend or "neutral").capitalize()
+        label = "New signal" if streak == 1 else f"{trend_word} {streak}d"
+        return {"trend_streak": streak, "streak_label": label}
+    except Exception:
+        return {"trend_streak": 0, "streak_label": ""}
+
+
+def get_user_telegram_recipients(user_id: str) -> list[dict]:
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, user_id, chat_id, label, is_active, created_at, updated_at
+                    FROM user_telegram_recipients
+                    WHERE user_id = :user_id AND is_active = 1
+                    ORDER BY created_at ASC
+                    """
+                ),
+                {"user_id": user_id},
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "chat_id": str(row[2]),
+                "label": row[3] or None,
+                "is_active": bool(row[4]),
+                "created_at": row[5].isoformat() if row[5] else None,
+                "updated_at": row[6].isoformat() if row[6] else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def list_recent_telegram_send_log(user_id: str, limit: int = 20) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 20), 50))
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, user_id, chat_id, message_type, market, digest_key, status,
+                           delivery_mode, source, error_message, telegram_message_id,
+                           payload_preview, created_at, sent_at
+                    FROM telegram_send_log
+                    WHERE user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT {safe_limit}
+                    """
+                ),
+                {"user_id": user_id},
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "chat_id": row[2],
+                "message_type": row[3],
+                "market": row[4],
+                "digest_key": row[5],
+                "status": row[6],
+                "delivery_mode": row[7],
+                "source": row[8],
+                "error_message": row[9],
+                "telegram_message_id": row[10],
+                "payload_preview": row[11],
+                "created_at": row[12].isoformat() if row[12] else None,
+                "sent_at": row[13].isoformat() if row[13] else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def log_position_event(trade_id: str, user_id: str, event_type: str, event_message: str, payload: Optional[dict] = None) -> None:
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO position_events (id, trade_id, user_id, event_type, event_message, payload_json, created_at)
+                    VALUES (:id, :trade_id, :user_id, :event_type, :event_message, :payload_json, :created_at)
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "trade_id": trade_id,
+                    "user_id": user_id,
+                    "event_type": event_type,
+                    "event_message": event_message,
+                    "payload_json": json.dumps(payload or {}),
+                    "created_at": datetime.utcnow(),
+                },
+            )
+    except Exception:
+        pass
+
+
+def list_position_events(user_id: str, limit: int = 30) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 30), 100))
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, trade_id, user_id, event_type, event_message, payload_json, created_at
+                    FROM position_events
+                    WHERE user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT {safe_limit}
+                    """
+                ),
+                {"user_id": user_id},
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "trade_id": row[1],
+                "user_id": row[2],
+                "event_type": row[3],
+                "event_message": row[4],
+                "payload": json.loads(row[5]) if row[5] else {},
+                "created_at": row[6].isoformat() if row[6] else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def _estimate_commission(gross_amount: float) -> float:
+    value = max(float(gross_amount or 0.0), 0.0)
+    return 10.0 if value <= 1000.0 else 20.0
+
+
+def list_advice_execution_actions(user_id: str, limit: int = 50) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 50), 200))
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, user_id, symbol, market, action_type, quantity, execution_price,
+                           gross_amount, commission, net_amount, advice_cache_key,
+                           source_message_type, notes, created_at
+                    FROM advice_execution_actions
+                    WHERE user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT {safe_limit}
+                    """
+                ),
+                {"user_id": user_id},
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "user_id": row[1],
+                "symbol": row[2],
+                "market": row[3],
+                "action_type": row[4],
+                "quantity": float(row[5] or 0),
+                "execution_price": float(row[6] or 0),
+                "gross_amount": float(row[7] or 0),
+                "commission": float(row[8] or 0),
+                "net_amount": float(row[9] or 0),
+                "advice_cache_key": row[10],
+                "source_message_type": row[11],
+                "notes": row[12],
+                "created_at": row[13].isoformat() if row[13] else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def get_user_execution_holdings(user_id: str) -> list[dict]:
+    """Aggregate user-reported executed actions into current holdings state."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT symbol, market, action_type, quantity, execution_price, commission, created_at
+                    FROM advice_execution_actions
+                    WHERE user_id = :user_id
+                    ORDER BY created_at ASC
+                    """
+                ),
+                {"user_id": user_id},
+            ).fetchall()
+    except Exception:
+        rows = []
+
+    state: dict[str, dict] = {}
+    for row in rows:
+        symbol = str(row[0] or "").upper().strip()
+        if not symbol:
+            continue
+        market = (row[1] or "AU").upper()
+        action_type = (row[2] or "BUY").upper().strip()
+        qty = max(float(row[3] or 0), 0.0)
+        price = max(float(row[4] or 0), 0.0)
+        commission = max(float(row[5] or 0), 0.0)
+        created_at = row[6]
+        if qty <= 0:
+            continue
+
+        bucket = state.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "market": market,
+                "quantity": 0.0,
+                "cost_basis": 0.0,
+                "commission_paid": 0.0,
+                "last_action_at": None,
+            },
+        )
+
+        if action_type in {"SELL", "REDUCE"}:
+            if bucket["quantity"] <= 0:
+                bucket["commission_paid"] += commission
+            else:
+                avg_cost = bucket["cost_basis"] / bucket["quantity"] if bucket["quantity"] > 0 else 0.0
+                sell_qty = min(qty, bucket["quantity"])
+                bucket["quantity"] -= sell_qty
+                bucket["cost_basis"] = max(bucket["cost_basis"] - (avg_cost * sell_qty), 0.0)
+                bucket["commission_paid"] += commission
+        else:
+            gross = qty * price
+            bucket["quantity"] += qty
+            bucket["cost_basis"] += gross + commission
+            bucket["commission_paid"] += commission
+
+        bucket["last_action_at"] = created_at or bucket["last_action_at"]
+
+    holdings = []
+    for item in state.values():
+        qty = float(item["quantity"] or 0)
+        if qty <= 0:
+            continue
+        avg_cost = item["cost_basis"] / qty if qty > 0 else 0.0
+        holdings.append(
+            {
+                "symbol": item["symbol"],
+                "market": item["market"],
+                "quantity": round(qty, 6),
+                "avg_cost": round(avg_cost, 4),
+                "invested_amount": round(float(item["cost_basis"] or 0), 2),
+                "commission_paid": round(float(item["commission_paid"] or 0), 2),
+                "last_action_at": item["last_action_at"].isoformat() if item["last_action_at"] else None,
+            }
+        )
+    holdings.sort(key=lambda row: row["invested_amount"], reverse=True)
+    return holdings
+
+
+def _build_holdings_signature(user_id: str) -> str:
+    holdings = get_user_execution_holdings(user_id)
+    if not holdings:
+        return "none"
+    return ",".join(
+        f"{item['symbol']}:{item['quantity']:.4f}:{item['avg_cost']:.2f}" for item in holdings[:20]
+    )
+
+
+def get_broker_telegram_recipients() -> list:
+    """Read active Telegram recipients from the broker app's shared database table."""
+    try:
+        broker_filter = ""
+        params = {}
+        if TELEGRAM_BROKER_ID:
+            broker_filter = "AND r.broker_id = :broker_id"
+            params["broker_id"] = TELEGRAM_BROKER_ID
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT
+                        r.broker_id,
+                        r.chat_id,
+                        COALESCE(r.name, '') AS name,
+                        r.is_active,
+                        r.created_at,
+                        s.snoozed_until,
+                        s.last_ack_at,
+                        s.last_command
+                    FROM broker_telegram_recipients r
+                    LEFT JOIN broker_telegram_state s
+                        ON s.broker_id = r.broker_id AND s.chat_id = r.chat_id
+                    WHERE r.is_active = TRUE
+                      AND (s.snoozed_until IS NULL OR s.snoozed_until <= CURRENT_TIMESTAMP)
+                      {broker_filter}
+                    ORDER BY r.created_at ASC
+                """),
+                params,
+            ).fetchall()
+        return [
+            {
+                "broker_id": row[0],
+                "chat_id": str(row[1]),
+                "name": row[2] or None,
+                "is_active": bool(row[3]),
+                "created_at": row[4],
+                "snoozed_until": row[5].isoformat() if row[5] else None,
+                "last_ack_at": row[6].isoformat() if row[6] else None,
+                "last_command": row[7],
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def _format_strategy_dashboard_html(strategy_dashboard: Optional[dict]) -> str:
+    """Render a compact, deterministic strategy block for UI and Telegram parity."""
+    if not strategy_dashboard:
+        return ""
+
+    action_mix = strategy_dashboard.get("action_mix") or {}
+    filters = strategy_dashboard.get("filters") or {}
+    risk_controls = strategy_dashboard.get("risk_controls") or []
+    portfolio_mix = strategy_dashboard.get("portfolio_mix") or {}
+
+    mix_labels = [
+        ("BUY", int(action_mix.get("buy") or 0)),
+        ("ADD", int(action_mix.get("add") or 0)),
+        ("HOLD", int(action_mix.get("hold") or 0)),
+        ("WATCH", int(action_mix.get("watch") or 0)),
+        ("REDUCE", int(action_mix.get("reduce") or 0)),
+    ]
+    mix_line = " | ".join(f"{label} {count}" for label, count in mix_labels if count > 0) or "No actions yet"
+
+    controls_line = ", ".join(str(item) for item in risk_controls[:3]) if risk_controls else "Standard risk controls active"
+    filters_line = (
+        f"Stage filters: {int(filters.get('qualified_count') or 0)} qualified"
+        f" / {int(filters.get('analyzed_count') or 0)} analysed"
+        f" / {int(filters.get('candidate_count') or 0)} candidates"
+    )
+    if filters.get("min_score") is not None:
+        filters_line += f" | min score {float(filters.get('min_score') or 0):.0f}+"
+
+    exposure_line = (
+        f"Mix target: Growth {int(portfolio_mix.get('growth_pct') or 0)}%"
+        f" | Core {int(portfolio_mix.get('core_hold_pct') or 0)}%"
+        f" | Defensive/Cash {int(portfolio_mix.get('defensive_cash_pct') or 0)}%"
+    )
+
+    return "<br/>".join([
+        "<b>Strategy Dashboard</b>",
+        f"{mix_line}",
+        filters_line,
+        exposure_line,
+        f"Risk controls: {controls_line}",
+    ])
+
+
+def _merge_summary_with_strategy(summary_html: str, strategy_dashboard: Optional[dict]) -> str:
+    strategy_html = _format_strategy_dashboard_html(strategy_dashboard)
+    if not strategy_html:
+        return summary_html or ""
+    if summary_html and "<b>Strategy Dashboard</b>" in summary_html:
+        return summary_html
+    if not summary_html:
+        return strategy_html
+    return f"{summary_html}<br/><br/>{strategy_html}"
+
+
+def _send_telegram_payload(
+    message_html: str,
+    recipients: list[dict],
+    *,
+    user_id: Optional[str] = None,
+    message_type: str = "advice",
+    market: Optional[str] = None,
+    delivery_mode: str = "manual",
+    digest_key: Optional[str] = None,
+    source: str = "asx_backend",
+    strategy_dashboard: Optional[dict] = None,
+) -> dict:
+    """Send a preformatted HTML Telegram payload and persist per-recipient results."""
+    telegram_html = _merge_summary_with_strategy(message_html or "", strategy_dashboard)
+    normalized_message = re.sub(r"<br\s*/?>", "\n", telegram_html or "")
+
+    if not recipients:
+        return {
+            "sent": False,
+            "success_count": 0,
+            "failure_count": 0,
+            "results": [],
+            "error": "No active Telegram chat IDs configured for this user.",
+        }
+
+    if not TELEGRAM_BOT_TOKEN:
+        return {
+            "sent": False,
+            "success_count": 0,
+            "failure_count": len(recipients),
+            "results": [],
+            "error": "TELEGRAM_BOT_TOKEN is not configured.",
+        }
+
+    results = []
+    success_count = 0
+    with db_conn() as conn:
+        for recipient in recipients:
+            chat_id = str(recipient.get("chat_id") or "").strip()
+            if not chat_id:
+                continue
+
+            log_id = str(uuid4())
+            error_message = None
+            telegram_message_id = None
+            status_value = "failed"
+            sent_at = None
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": normalized_message, "parse_mode": "HTML"},
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    body = resp.json() if resp.content else {}
+                    telegram_message_id = str((body.get("result") or {}).get("message_id") or "") or None
+                    status_value = "sent"
+                    sent_at = datetime.utcnow()
+                    success_count += 1
+                else:
+                    try:
+                        error_message = resp.json().get("description")
+                    except Exception:
+                        error_message = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+                    # Retry in plain text if Telegram rejects HTML entity parsing.
+                    if error_message and "can't parse entities" in error_message.lower():
+                        plain_text = re.sub(r"<[^>]+>", "", normalized_message)
+                        retry = requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": chat_id, "text": plain_text},
+                            timeout=8,
+                        )
+                        if retry.status_code == 200:
+                            retry_body = retry.json() if retry.content else {}
+                            telegram_message_id = str((retry_body.get("result") or {}).get("message_id") or "") or None
+                            status_value = "sent"
+                            sent_at = datetime.utcnow()
+                            error_message = None
+                            success_count += 1
+                        else:
+                            try:
+                                error_message = retry.json().get("description")
+                            except Exception:
+                                error_message = retry.text[:300] if retry.text else f"HTTP {retry.status_code}"
+            except Exception as exc:
+                error_message = str(exc)
+
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO telegram_send_log (
+                        id, user_id, chat_id, message_type, market, digest_key, status,
+                        delivery_mode, source, error_message, telegram_message_id,
+                        payload_preview, created_at, sent_at
+                    ) VALUES (
+                        :id, :user_id, :chat_id, :message_type, :market, :digest_key, :status,
+                        :delivery_mode, :source, :error_message, :telegram_message_id,
+                        :payload_preview, :created_at, :sent_at
+                    )
+                    """
+                ),
+                {
+                    "id": log_id,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "message_type": message_type,
+                    "market": market,
+                    "digest_key": digest_key,
+                    "status": status_value,
+                    "delivery_mode": delivery_mode,
+                    "source": source,
+                    "error_message": error_message,
+                    "telegram_message_id": telegram_message_id,
+                    "payload_preview": normalized_message,
+                    "created_at": datetime.utcnow(),
+                    "sent_at": sent_at,
+                },
+            )
+            results.append(
+                {
+                    "chat_id": chat_id,
+                    "label": recipient.get("label") or recipient.get("name"),
+                    "status": status_value,
+                    "error_message": error_message,
+                    "telegram_message_id": telegram_message_id,
+                    "sent_at": sent_at.isoformat() if sent_at else None,
+                }
+            )
+
+    return {
+        "sent": success_count > 0,
+        "success_count": success_count,
+        "failure_count": max(len(results) - success_count, 0),
+        "results": results,
+        "error": None if success_count > 0 else "Telegram delivery failed for all configured chats.",
+    }
+
+
+def has_digest_been_sent(user_id: str, market: str, digest_key: str) -> bool:
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM telegram_send_log
+                    WHERE user_id = :user_id
+                      AND message_type = 'daily_digest'
+                      AND market = :market
+                      AND digest_key = :digest_key
+                      AND status = 'sent'
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id, "market": market, "digest_key": digest_key},
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _get_scheduler_timezone() -> ZoneInfo:
+    tz_name = os.getenv("SCHEDULER_TIMEZONE", os.getenv("DAILY_DIGEST_TIMEZONE", "Australia/Melbourne"))
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Australia/Melbourne")
+
+
+def _daily_digest_cache_key() -> str:
+    # Use scheduler timezone date key so 8am local sends use the expected local day.
+    return datetime.now(_get_scheduler_timezone()).date().isoformat()
+
+
+def _ensure_cached_payload_strategy(payload: dict, *, market: str, is_digest: bool) -> dict:
+    """Backfill strategy fields for legacy cache entries created before strategy_dashboard existed."""
+    if not isinstance(payload, dict):
+        return payload
+
+    items = payload.get("items") or []
+    strategy_dashboard = payload.get("strategy_dashboard")
+    if strategy_dashboard is None:
+        if is_digest:
+            strategy_dashboard = _build_strategy_dashboard(
+                items,
+                market=(payload.get("market") or market or "AU"),
+                min_score=None,
+                candidate_count=int(payload.get("candidate_count") or len(items)),
+                analyzed_count=int(payload.get("analyzed_count") or len(items)),
+                qualified_count=int(payload.get("qualified_count") or len(items)),
+                under_one_selected=int(payload.get("under_one_selected") or 0),
+                holdings_count=0,
+            )
+        else:
+            holdings_context = payload.get("holdings_context") or []
+            strategy_dashboard = _build_strategy_dashboard(
+                items,
+                market=(payload.get("market") or market or "AU"),
+                min_score=payload.get("min_score"),
+                candidate_count=int(payload.get("candidate_count") or len(items)),
+                analyzed_count=int(payload.get("analyzed_count") or len(items)),
+                qualified_count=int(payload.get("qualified_count") or len(items)),
+                under_one_selected=int(payload.get("under_one_selected") or 0),
+                holdings_count=len(holdings_context),
+            )
+        payload["strategy_dashboard"] = strategy_dashboard
+
+    payload["summary"] = _merge_summary_with_strategy(payload.get("summary") or "", payload.get("strategy_dashboard"))
+    return payload
+
+
+def get_daily_digest_cache(market: str, limit: int = 5, cache_key: Optional[str] = None) -> dict:
+    market_key = (market or "AU").upper()
+    cache_key = cache_key or _daily_digest_cache_key()
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT payload_preview
+                    FROM telegram_send_log
+                    WHERE message_type = 'daily_digest_cache'
+                      AND market = :market
+                      AND digest_key = :digest_key
+                      AND status = 'cached'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"market": market_key, "digest_key": cache_key},
+            ).fetchone()
+            if row and row[0]:
+                payload = json.loads(row[0])
+                payload = _ensure_cached_payload_strategy(payload, market=market_key, is_digest=True)
+                payload["cache_key"] = cache_key
+                payload["cache_hit"] = True
+                return payload
+    except Exception:
+        pass
+
+    digest = build_daily_digest(market_key, limit=limit)
+    digest["cache_key"] = cache_key
+    digest["cache_hit"] = False
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO telegram_send_log (
+                        id, user_id, chat_id, message_type, market, digest_key, status,
+                        delivery_mode, source, payload_preview, created_at
+                    ) VALUES (
+                        :id, NULL, NULL, 'daily_digest_cache', :market, :digest_key, 'cached',
+                        'system', 'digest_cache', :payload_preview, :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "market": market_key,
+                    "digest_key": cache_key,
+                    "payload_preview": json.dumps(digest),
+                    "created_at": datetime.utcnow(),
+                },
+            )
+    except Exception:
+        pass
+    return digest
+
+
+def _build_hedge_advice_cache_key(symbols: list[str], market: str, limit: int, holdings_signature: str = "none") -> str:
+    key_symbols = sorted({str(symbol).upper().strip() for symbol in symbols or [] if str(symbol).strip()})
+    return f"{datetime.utcnow().strftime('%Y-%m-%d')}|{(market or 'AU').upper()}|{limit}|{','.join(key_symbols)}|{holdings_signature}"
+
+
+def get_hedge_advice_cache(user_id: str, symbols: list[str], market: str, limit: int) -> dict:
+    holdings_signature = _build_holdings_signature(user_id)
+    cache_key = _build_hedge_advice_cache_key(symbols, market, limit, holdings_signature=holdings_signature)
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT payload_preview
+                    FROM telegram_send_log
+                    WHERE user_id = :user_id
+                      AND message_type = 'hedge_advice_cache'
+                      AND digest_key = :cache_key
+                      AND status = 'cached'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": user_id, "cache_key": cache_key},
+            ).fetchone()
+            if row and row[0]:
+                payload = json.loads(row[0])
+                payload = _ensure_cached_payload_strategy(payload, market=market, is_digest=False)
+                payload["cache_key"] = cache_key
+                payload["cache_hit"] = True
+                return payload
+    except Exception:
+        pass
+
+    advice = build_hedge_advice(symbols, market=market, limit=limit, user_id=user_id)
+    advice["cache_key"] = cache_key
+    advice["cache_hit"] = False
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO telegram_send_log (
+                        id, user_id, chat_id, message_type, market, digest_key, status,
+                        delivery_mode, source, payload_preview, created_at
+                    ) VALUES (
+                        :id, :user_id, NULL, 'hedge_advice_cache', :market, :digest_key, 'cached',
+                        'system', 'advice_cache', :payload_preview, :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "user_id": user_id,
+                    "market": advice["market"],
+                    "digest_key": cache_key,
+                    "payload_preview": json.dumps(advice),
+                    "created_at": datetime.utcnow(),
+                },
+            )
+    except Exception:
+        pass
+    return advice
+
+
+def _recommend_action(item: dict) -> tuple[str, str]:
+    trend = str(item.get("trend") or "neutral").lower()
+    score = float(item.get("score") or 0)
+    warning = bool(item.get("high_volatility_warning"))
+    expected = float(item.get("expected_return_3m_pct") or 0)
+
+    if warning or trend == "bearish" or score < 45:
+        action = "REDUCE"
+    elif score >= 75 and trend == "bullish" and expected >= 5:
+        action = "BUY"
+    elif score >= 60:
+        action = "WATCH"
+    else:
+        action = "HOLD"
+
+    reasons = []
+    if expected:
+        reasons.append(f"{expected:+.2f}% 3M return")
+    if item.get("prob_ge_5pct") is not None:
+        reasons.append(f"P(≥5%) {float(item['prob_ge_5pct']):.1f}%")
+    if item.get("streak_label"):
+        reasons.append(str(item["streak_label"]))
+    if item.get("warning_message"):
+        reasons.append(str(item["warning_message"]))
+    if item.get("quality_reason"):
+        reasons.append(str(item["quality_reason"]))
+
+    return action, " · ".join(reasons[:3]) if reasons else "Model ranking summary"
+
+
+def _to_prediction_row(row) -> dict:
+    return {
+        "symbol": row[0],
+        "name": row[1],
+        "current_price": float(row[2] or 0),
+        "predicted_price_3m": float(row[3] or 0),
+        "trend": row[4],
+        "score": float(row[5] or 0),
+        "prob_ge_5pct": float(row[6] or 0),
+        "expected_return_3m_pct": float(row[7] or 0),
+        "high_volatility_warning": bool(row[8]),
+        "warning_message": row[9],
+        "warning_type": row[10],
+        "quality_reason": row[11],
+        "confidence_low": float(row[12] or 0) if row[12] is not None else None,
+        "confidence_high": float(row[13] or 0) if row[13] is not None else None,
+        "streak_label": "Cached",
+    }
+
+
+def _build_advice_candidates(symbols: list[str], market: str, max_candidates: int = 500) -> list[str]:
+    cleaned = []
+    for symbol in symbols or []:
+        symbol_clean = str(symbol).upper().strip()
+        if symbol_clean and symbol_clean not in cleaned:
+            cleaned.append(symbol_clean)
+
+    if cleaned:
+        return cleaned[: max(1, max_candidates)]
+
+    market_key = (market or "AU").upper()
+    if market_key == "AU":
+        broad = list(ASX_COMPANIES.keys())
+        # Broad-by-default: include all known AU symbols, including small caps and ETFs.
+        return broad[: max(1, max_candidates)]
+
+    fallback = TOP_SYMBOLS_BY_MARKET.get(market_key, TOP_SYMBOLS_BY_MARKET["AU"])
+    return list(fallback[: max(1, max_candidates)])
+
+
+def _load_cached_predictions_for_today(candidates: list[str]) -> dict[str, dict]:
+    if not candidates:
+        return {}
+    today_str = datetime.utcnow().date().isoformat()
+    candidate_set = set(candidates)
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT symbol, name, current_price, predicted_price, trend, score, prob_ge_5pct,
+                           expected_return_pct, high_volatility_warning, warning_message,
+                           warning_type, quality_reason, confidence_low, confidence_high
+                    FROM daily_predictions
+                    WHERE prediction_date = :prediction_date
+                    """
+                ),
+                {"prediction_date": today_str},
+            ).fetchall()
+    except Exception:
+        rows = []
+
+    cache_map: dict[str, dict] = {}
+    for row in rows:
+        symbol = str(row[0] or "").upper().strip()
+        if symbol and symbol in candidate_set:
+            cache_map[symbol] = _to_prediction_row(row)
+    return cache_map
+
+
+def _build_assistant_guidance(item: dict, action: str) -> dict:
+    expected = float(item.get("expected_return_3m_pct") or 0)
+    score = float(item.get("score") or 0)
+    trend = str(item.get("trend") or "neutral").lower()
+    warning = item.get("warning_message")
+    current_price = float(item.get("current_price") or 0)
+
+    entry_idea = "Wait for clearer confirmation before adding capital."
+    next_step = "Review tomorrow unless the score or warning state changes."
+    invalidation = "Exit if the model flips bearish or volatility warning worsens."
+    sell_trigger = "Trim if expected upside compresses below 2% or score drops below 55."
+    review_trigger = "Review on the next daily refresh."
+
+    if action == "BUY":
+        entry_idea = "Accumulate in small tranches rather than entering full size at once."
+        next_step = "Start with a pilot position and reassess after the next daily digest."
+        invalidation = "Do not add if the signal loses trend support or a fresh warning appears."
+        sell_trigger = "Take profit in stages once the upside case weakens or the score slips below 60."
+        review_trigger = "Review sooner if price jumps sharply without volume support."
+    elif action == "WATCH":
+        entry_idea = "Keep this on watch until conviction improves or price offers a better entry."
+        next_step = "Wait for score improvement or a stronger streak before committing capital."
+        invalidation = "Remove from watchlist if the model turns bearish or risk warning intensifies."
+        sell_trigger = "If already bought, trim on score deterioration below 50."
+        review_trigger = "Review after the next signal update or regime shift."
+    elif action == "REDUCE":
+        entry_idea = "Avoid new exposure while the risk-reward is deteriorating."
+        next_step = "Cut exposure, tighten stops, or move to watch-only mode."
+        invalidation = "Stay defensive until warnings clear and the score rebuilds."
+        sell_trigger = "Sell or hedge immediately if price confirms the bearish move or warning persists."
+        review_trigger = "Review only if risk clears and the trend stabilizes."
+    elif action == "HOLD":
+        entry_idea = "No fresh size increase yet; maintain only if it still fits your plan."
+        next_step = "Hold existing size and wait for either stronger conviction or a clearer exit signal."
+        invalidation = "Reduce if the score fades or volatility expands further."
+        sell_trigger = "Trim on a bearish flip, a score below 50, or a broken trailing stop."
+        review_trigger = "Review on tomorrow's digest or after a material price swing."
+
+    if current_price > 0:
+        invalidation = f"{invalidation} Reference price: {current_price:.2f}."
+    if expected >= 8 and score >= 70 and trend == "bullish" and action in {"BUY", "HOLD"}:
+        sell_trigger = "Scale out progressively once momentum cools after a strong run or the score drops below 62."
+    if warning:
+        next_step = f"Risk first: {warning}"
+
+    return {
+        "entry_idea": entry_idea,
+        "next_step": next_step,
+        "invalidation": invalidation,
+        "sell_trigger": sell_trigger,
+        "review_trigger": review_trigger,
+    }
+
+
+def _build_strategy_dashboard(
+    items: list[dict],
+    *,
+    market: str,
+    min_score: Optional[float],
+    candidate_count: int,
+    analyzed_count: int,
+    qualified_count: int,
+    under_one_selected: int,
+    holdings_count: int,
+) -> dict:
+    action_mix = {"buy": 0, "add": 0, "hold": 0, "watch": 0, "reduce": 0}
+    warning_count = 0
+    bullish_count = 0
+    avg_score = 0.0
+
+    if items:
+        total_score = 0.0
+        for row in items:
+            action = str(row.get("action") or "").strip().lower()
+            if action in action_mix:
+                action_mix[action] += 1
+            score = float(row.get("score") or 0.0)
+            total_score += score
+            if str(row.get("trend") or "").lower() == "bullish":
+                bullish_count += 1
+            if row.get("warning_message"):
+                warning_count += 1
+        avg_score = total_score / len(items)
+
+    growth_slots = action_mix["buy"] + action_mix["add"]
+    defensive_slots = action_mix["reduce"] + max(1 if warning_count > 0 else 0, 0)
+    defensive_cash_pct = min(50, 15 + defensive_slots * 10)
+    growth_pct = min(70, 25 + growth_slots * 10)
+    if growth_pct + defensive_cash_pct > 90:
+        growth_pct = max(20, 90 - defensive_cash_pct)
+    core_hold_pct = max(10, 100 - (growth_pct + defensive_cash_pct))
+
+    confidence = "low"
+    if avg_score >= 75:
+        confidence = "high"
+    elif avg_score >= 65:
+        confidence = "medium"
+
+    filters = {
+        "market": (market or "AU").upper(),
+        "min_score": min_score,
+        "candidate_count": int(candidate_count),
+        "analyzed_count": int(analyzed_count),
+        "qualified_count": int(qualified_count),
+        "under_one_selected": int(under_one_selected),
+        "bullish_selected": int(bullish_count),
+        "warning_selected": int(warning_count),
+        "holdings_tracked": int(holdings_count),
+    }
+
+    risk_controls = [
+        "staged_entries",
+        "score_recheck_on_daily_digest",
+        "position_size_capped_for_sub_1",
+    ]
+    if warning_count > 0:
+        risk_controls.append("warning_flag_reduction")
+
+    return {
+        "confidence": confidence,
+        "avg_score": round(avg_score, 2),
+        "action_mix": action_mix,
+        "filters": filters,
+        "portfolio_mix": {
+            "growth_pct": int(growth_pct),
+            "core_hold_pct": int(core_hold_pct),
+            "defensive_cash_pct": int(defensive_cash_pct),
+        },
+        "risk_controls": risk_controls,
+    }
+
+
+def build_hedge_advice(symbols: list[str], market: str = "AU", limit: int = 5, user_id: Optional[str] = None) -> dict:
+    output_limit = max(1, min(limit, 10))
+    min_score = float(os.getenv("ADVICE_MIN_SCORE", "65"))
+    under_one_quota = max(0, int(os.getenv("ADVICE_UNDER_ONE_QUOTA", "2")))
+    max_candidates = max(100, int(os.getenv("ADVICE_MAX_CANDIDATES", "500")))
+    max_live_eval = max(0, int(os.getenv("ADVICE_MAX_LIVE_EVAL", "60")))
+
+    candidates = _build_advice_candidates(symbols, market, max_candidates=max_candidates)
+    cached_rows = _load_cached_predictions_for_today(candidates)
+
+    ranked = []
+    for symbol in candidates:
+        cached = cached_rows.get(symbol)
+        if cached:
+            ranked.append(cached)
+
+    live_eval_count = 0
+    for symbol in candidates:
+        if symbol in cached_rows:
+            continue
+        if live_eval_count >= max_live_eval:
+            break
+        try:
+            ranked.append(get_probability_and_score(symbol))
+            live_eval_count += 1
+        except Exception:
+            continue
+
+    qualified = [row for row in ranked if float(row.get("score") or 0) >= min_score]
+    qualified.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
+
+    selected = []
+    if under_one_quota > 0:
+        sub_one = [row for row in qualified if float(row.get("current_price") or 0) > 0 and float(row.get("current_price") or 0) < 1.0]
+        selected.extend(sub_one[: min(len(sub_one), under_one_quota, output_limit)])
+
+    used_symbols = {str(item.get("symbol") or "") for item in selected}
+    for row in qualified:
+        symbol = str(row.get("symbol") or "")
+        if symbol in used_symbols:
+            continue
+        selected.append(row)
+        used_symbols.add(symbol)
+        if len(selected) >= output_limit:
+            break
+
+    holdings_context = get_user_execution_holdings(user_id) if user_id else []
+    holdings_map = {item["symbol"]: item for item in holdings_context}
+
+    advice_items = []
+    for item in selected:
+        action, reason = _recommend_action(item)
+        held = holdings_map.get(item["symbol"])
+        held_qty = float(held.get("quantity") or 0) if held else 0.0
+        held_avg_cost = float(held.get("avg_cost") or 0) if held else 0.0
+        guidance = _build_assistant_guidance(item, action)
+
+        if held_qty > 0 and action == "BUY":
+            action = "ADD"
+            reason = f"Already held ({held_qty:.2f} shares). {reason}"
+        elif held_qty > 0 and action == "WATCH":
+            action = "HOLD"
+            reason = f"Already held ({held_qty:.2f} shares). Hold bias while signal matures."
+
+        hedge_note = "Add defensives or cash buffer" if action == "REDUCE" else "Hold unless trend weakens"
+        if action in {"BUY", "ADD"}:
+            hedge_note = "Consider gradual entry; keep size modest"
+        elif action == "WATCH":
+            hedge_note = "Wait for confirmation before sizing up"
+
+        current_price = float(item.get("current_price") or 0)
+        unrealized_pct = None
+        if held_qty > 0 and held_avg_cost > 0 and current_price > 0:
+            unrealized_pct = ((current_price - held_avg_cost) / held_avg_cost) * 100.0
+
+        advice_items.append({
+            "symbol": item["symbol"],
+            "name": item.get("name"),
+            "action": action,
+            "trend": item.get("trend"),
+            "score": item.get("score"),
+            "prob_ge_5pct": item.get("prob_ge_5pct"),
+            "expected_return_3m_pct": item.get("expected_return_3m_pct"),
+            "warning_message": item.get("warning_message"),
+            "warning_type": item.get("warning_type"),
+            "streak_label": item.get("streak_label"),
+            "reason": reason,
+            "hedge_note": hedge_note,
+            "entry_idea": guidance["entry_idea"],
+            "next_step": guidance["next_step"],
+            "invalidation": guidance["invalidation"],
+            "sell_trigger": guidance["sell_trigger"],
+            "review_trigger": guidance["review_trigger"],
+            "held_quantity": round(held_qty, 6),
+            "held_avg_cost": round(held_avg_cost, 4) if held_qty > 0 else None,
+            "held_unrealized_pct": round(float(unrealized_pct), 2) if unrealized_pct is not None else None,
+        })
+
+    strategy_dashboard = _build_strategy_dashboard(
+        advice_items,
+        market=market,
+        min_score=min_score,
+        candidate_count=len(candidates),
+        analyzed_count=len(ranked),
+        qualified_count=len(qualified),
+        under_one_selected=len([item for item in selected if float(item.get("current_price") or 0) > 0 and float(item.get("current_price") or 0) < 1.0]),
+        holdings_count=len(holdings_context),
+    )
+
+    if advice_items:
+        summary_parts = []
+        for item in advice_items[:3]:
+            summary_parts.append(f"<b>{item['symbol']}</b> {item['action']} ({item['trend']})")
+        summary = (
+            "<b>ASX Hedge Assistant</b><br/>"
+            f"Top actions: {' | '.join(summary_parts)}<br/>"
+            "Use this as decision support, not an automatic trade signal."
+        )
+        if holdings_context:
+            top_held = ", ".join(item["symbol"] for item in holdings_context[:5])
+            summary = f"{summary}<br/>Holdings tracked: {top_held}"
+        summary = _merge_summary_with_strategy(summary, strategy_dashboard)
+    else:
+        summary = (
+            "<b>ASX Hedge Assistant</b><br/>"
+            f"No symbols met the minimum score threshold of {min_score:.0f} today."
+        )
+        summary = _merge_summary_with_strategy(summary, strategy_dashboard)
+
+    return {
+        "summary": summary,
+        "items": advice_items,
+        "market": (market or "AU").upper(),
+        "strategy_dashboard": strategy_dashboard,
+        "holdings_context": holdings_context,
+        "min_score": min_score,
+        "candidate_count": len(candidates),
+        "analyzed_count": len(ranked),
+        "qualified_count": len(qualified),
+        "under_one_selected": len([item for item in selected if float(item.get("current_price") or 0) > 0 and float(item.get("current_price") or 0) < 1.0]),
+    }
+
+
+def build_daily_digest(market: str = "AU", limit: int = 5) -> dict:
+    """Generate a concise daily digest from the highest-ranked tracked universe."""
+    market_key = (market or "AU").upper()
+    symbols = TOP_SYMBOLS_BY_MARKET.get(market_key, TOP_SYMBOLS_BY_MARKET["AU"])
+    universe_cap = max(5, int(os.getenv("DAILY_DIGEST_UNIVERSE_CAP", "25")))
+    capped_symbols = list(symbols[:universe_cap])
+
+    today_str = datetime.utcnow().date().isoformat()
+    cached_map: dict[str, dict] = {}
+    if capped_symbols:
+        try:
+            params = {"prediction_date": today_str}
+            placeholders = []
+            for idx, symbol in enumerate(capped_symbols):
+                key = f"s{idx}"
+                params[key] = symbol
+                placeholders.append(f":{key}")
+
+            with db_conn() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT symbol, name, current_price, predicted_price, trend, score, prob_ge_5pct,
+                               expected_return_pct, high_volatility_warning, warning_message,
+                               warning_type, quality_reason, confidence_low, confidence_high
+                        FROM daily_predictions
+                        WHERE prediction_date = :prediction_date
+                          AND symbol IN ({', '.join(placeholders)})
+                        """
+                    ),
+                    params,
+                ).fetchall()
+
+            for row in rows:
+                symbol = row[0]
+                streak_data = get_trend_streak(symbol)
+                cached_map[symbol] = {
+                    "symbol": symbol,
+                    "name": row[1] or symbol,
+                    "current_price": float(row[2] or 0),
+                    "predicted_price_3m": float(row[3] or 0),
+                    "trend": row[4] or "neutral",
+                    "score": float(row[5] or 0),
+                    "prob_ge_5pct": float(row[6] or 0),
+                    "expected_return_3m_pct": float(row[7] or 0),
+                    "high_volatility_warning": bool(row[8]),
+                    "warning_message": row[9],
+                    "warning_type": row[10],
+                    "quality_reason": row[11],
+                    "confidence_low": float(row[12] or 0),
+                    "confidence_high": float(row[13] or 0),
+                    "streak_label": streak_data.get("streak_label"),
+                }
+        except Exception:
+            cached_map = {}
+
+    ranked: list[dict] = []
+    for symbol in capped_symbols:
+        cached = cached_map.get(symbol)
+        if cached:
+            ranked.append(cached)
+            continue
+        try:
+            ranked.append(get_probability_and_score(symbol))
+        except Exception:
+            continue
+    ranked.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
+    top_items = ranked[: max(1, min(limit, 10))]
+
+    if not top_items:
+        strategy_dashboard = _build_strategy_dashboard(
+            [],
+            market=market_key,
+            min_score=None,
+            candidate_count=len(capped_symbols),
+            analyzed_count=len(ranked),
+            qualified_count=0,
+            under_one_selected=0,
+            holdings_count=0,
+        )
+        return {
+            "market": market_key,
+            "summary": _merge_summary_with_strategy(
+                f"<b>ASX Daily Digest</b><br/>No ranked candidates were available for {market_key}.",
+                strategy_dashboard,
+            ),
+            "items": [],
+            "strategy_dashboard": strategy_dashboard,
+            "breakdown": {"buy": [], "hold": [], "reduce": []},
+        }
+
+    buy_list = []
+    hold_list = []
+    reduce_list = []
+    for item in top_items:
+        action, reason = _recommend_action(item)
+        guidance = _build_assistant_guidance(item, action)
+        row = {
+            "symbol": item["symbol"],
+            "name": item.get("name"),
+            "action": action,
+            "trend": item.get("trend"),
+            "score": item.get("score"),
+            "expected_return_3m_pct": item.get("expected_return_3m_pct"),
+            "prob_ge_5pct": item.get("prob_ge_5pct"),
+            "reason": reason,
+            "streak_label": item.get("streak_label"),
+            "warning_message": item.get("warning_message"),
+            "entry_idea": guidance["entry_idea"],
+            "next_step": guidance["next_step"],
+            "invalidation": guidance["invalidation"],
+            "sell_trigger": guidance["sell_trigger"],
+            "review_trigger": guidance["review_trigger"],
+        }
+        if action == "BUY":
+            buy_list.append(row)
+        elif action == "REDUCE":
+            reduce_list.append(row)
+        else:
+            hold_list.append(row)
+
+    strategy_dashboard = _build_strategy_dashboard(
+        buy_list + hold_list + reduce_list,
+        market=market_key,
+        min_score=None,
+        candidate_count=len(capped_symbols),
+        analyzed_count=len(ranked),
+        qualified_count=len(top_items),
+        under_one_selected=len([item for item in top_items if float(item.get("current_price") or 0) > 0 and float(item.get("current_price") or 0) < 1.0]),
+        holdings_count=0,
+    )
+
+    parts = ["<b>ASX Daily Digest</b>"]
+    parts.append(f"Market: <b>{market_key}</b>")
+    parts.append(f"Buy/Watch: {len(buy_list)} · Hold: {len(hold_list)} · Reduce: {len(reduce_list)}")
+    for label, bucket in (("BUY", buy_list), ("HOLD", hold_list), ("REDUCE", reduce_list)):
+        if not bucket:
+            continue
+        lines = [f"<b>{label}</b>"]
+        for item in bucket[:3]:
+            lines.append(
+                f"• <b>{item['symbol']}</b> {item['trend']} | score {float(item['score'] or 0):.1f} | {item['reason']}"
+            )
+        parts.append("<br/>".join(lines))
+    summary = _merge_summary_with_strategy("<br/><br/>".join(parts), strategy_dashboard)
+
+    return {
+        "market": market_key,
+        "summary": summary,
+        "items": top_items,
+        "breakdown": {"buy": buy_list, "hold": hold_list, "reduce": reduce_list},
+        "strategy_dashboard": strategy_dashboard,
+    }
+
+
+def _paper_trade_snapshot(row, current_price: float) -> dict:
+    entry_price = float(row[5])
+    quantity = float(row[4])
+    side = (row[3] or "LONG").upper()
+    direction = -1.0 if side == "SHORT" else 1.0
+    
+    # Calculate gross value and CommSec tier brokerage
+    entry_value = entry_price * quantity
+    current_value = current_price * quantity
+    
+    # Commsec standard: $10 under $1000, else $20
+    entry_fee = 10.0 if entry_value <= 1000.0 else 20.0
+    exit_fee = 10.0 if current_value <= 1000.0 else 20.0
+    total_brokerage = entry_fee + exit_fee
+    
+    gross_pnl_value = (current_price - entry_price) * quantity * direction
+    net_pnl_value = gross_pnl_value - total_brokerage
+    
+    invested_capital = entry_value + entry_fee
+    net_pnl_pct = (net_pnl_value / invested_capital) * 100.0 if invested_capital > 0 else 0.0
+
+    return {
+        "id": row[0],
+        "symbol": row[1],
+        "market": row[2],
+        "side": side,
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "current_price": round(current_price, 2),
+        "target_price": float(row[6]) if row[6] is not None else None,
+        "status": row[7],
+        "signal_score": float(row[8]) if row[8] is not None else None,
+        "signal_trend": row[9],
+        "signal_warning": row[10],
+        "notes": row[11],
+        "created_at": row[12].isoformat() if row[12] else None,
+        "closed_at": row[13].isoformat() if row[13] else None,
+        "peak_price": float(row[14]) if row[14] is not None else None,
+        "stop_loss_price": float(row[15]) if row[15] is not None else None,
+        "take_profit_price": float(row[16]) if row[16] is not None else None,
+        "trailing_stop_pct": float(row[17]) if row[17] is not None else 3.0,
+        "review_date": row[18].isoformat() if row[18] else None,
+        "last_alert_at": row[19].isoformat() if row[19] else None,
+        "position_stage": row[20] or "entered",
+        "recommendation_action": row[21],
+        "source_reason": row[22],
+        "unrealized_pnl_pct": round(net_pnl_pct, 2),
+        "unrealized_pnl_value": round(net_pnl_value, 2),
+        "brokerage_fees": total_brokerage,
+    }
+
+
+def list_paper_trades(user_id: str) -> list[dict]:
+    with db_conn() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, symbol, market, side, quantity, entry_price, target_price, status,
+                      signal_score, signal_trend, signal_warning, notes, created_at, closed_at,
+                      peak_price, stop_loss_price, take_profit_price, trailing_stop_pct,
+                      review_date, last_alert_at, position_stage, recommendation_action, source_reason
+                FROM paper_trades
+                WHERE user_id = :user_id
+                ORDER BY created_at DESC
+            """),
+            {"user_id": user_id},
+        ).fetchall()
+
+    results = []
+    for row in rows:
+        symbol = row[1]
+        market = row[2] or "AU"
+        current_price = get_stock_data(symbol, market).get("current_price") or float(row[5])
+        results.append(_paper_trade_snapshot(row, float(current_price)))
+    return results
+
+
 def get_probability_and_score(symbol: str) -> dict:
+    # ── Daily prediction cache ────────────────────────────────────────────────
+    today_str = datetime.utcnow().date().isoformat()
+    try:
+        with db_conn() as conn:
+            cached = conn.execute(
+                text("""
+                    SELECT name, current_price, predicted_price, trend, score, prob_ge_5pct,
+                           expected_return_pct, high_volatility_warning, warning_message,
+                           warning_type, quality_reason, score_raw, confidence_low, confidence_high
+                    FROM daily_predictions
+                    WHERE symbol = :symbol AND prediction_date = :date
+                """),
+                {"symbol": symbol, "date": today_str},
+            ).fetchone()
+        if cached:
+            streak_data = get_trend_streak(symbol)
+            return {
+                "symbol": symbol,
+                "name": cached[0] or symbol,
+                "current_price": round(float(cached[1] or 0), 2),
+                "predicted_price_3m": cached[2],
+                "expected_return_3m_pct": round(float(cached[6] or 0), 2),
+                "prob_ge_5pct": round(float(cached[5] or 0), 2),
+                "trend": cached[3],
+                "score": round(float(cached[4] or 0), 2),
+                "high_volatility_warning": bool(cached[7]),
+                "warning_message": cached[8],
+                "warning_type": cached[9],
+                "quality_reason": cached[10],
+                "score_raw": round(float(cached[11] or 0), 2),
+                "learning_note": cached[14] if len(cached) > 14 else None,
+                **streak_data,
+            }
+    except Exception:
+        pass  # Fall through to fresh computation
+    # ─────────────────────────────────────────────────────────────────────────
+
     stock_data = get_stock_data(symbol)
     hist = get_historical_data(symbol, period="1y")
     if len(hist) < 120:
@@ -845,32 +2938,183 @@ def get_probability_and_score(symbol: str) -> dict:
     prediction = generate_statistical_prediction(hist, current_price)
 
     mu = prediction["change_from_current"] / 100.0
+    
+    # --- Constraint Model Layer ---
+    # 1. Cap astronomical returns based on reality
+    max_allowable_return = 0.12 # Max 12% swing in a 3 month window for standard tracking
+    adjusted_mu = max(-max_allowable_return, min(max_allowable_return, mu))
+
+    # 2. Mean Reversion Penalty (Overbought check)
+    rsi = indicators.get("rsi", 50)
+    if rsi > 70:
+        adjusted_mu -= 0.03  # Shave 3% off expected return if overbought
+    elif rsi < 30:
+        adjusted_mu += 0.01  # Small boost for oversold bounce potential
+        
+    # Apply capped return back to prediction to avoid unrealistic numbers in UI
+    if adjusted_mu != mu:
+        prediction["change_from_current"] = adjusted_mu * 100.0
+        prediction["predicted_price"] = current_price * (1 + adjusted_mu)
+
+    # 3. Calculate capped probability
     daily_vol = float(hist["Close"].pct_change().dropna().std())
     sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
-    z = (0.05 - mu) / sigma_63
+    z = (0.05 - adjusted_mu) / sigma_63
     prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
 
     trend = prediction["trend"]
     trend_score = 0.9 if trend == "bullish" else 0.55 if trend == "neutral" else 0.2
 
-    rsi = indicators.get("rsi", 50)
     momentum = indicators.get("momentum_20", 0)
     quality_score = max(0.0, min(1.0, (1 - abs(rsi - 55) / 55) * 0.6 + (0.5 + momentum / 40) * 0.4))
 
     regime_fit = 0.65 if trend == "bullish" else 0.45 if trend == "neutral" else 0.3
+    
+    # Initialize warning flags
+    high_volatility_warning = False
+    warning_message = None
+    warning_type = None
 
     avg_vol = float(hist["Volume"].tail(20).mean()) if "Volume" in hist else 0
     liquidity_score = max(0.1, min(1.0, avg_vol / 8_000_000))
 
-    score = (
+    # --- Volume-Price Divergence Logic ---
+    current_vol = float(hist["Volume"].iloc[-1]) if "Volume" in hist else 0
+    vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+    price_spike = (current_price - float(hist["Close"].iloc[-2])) / float(hist["Close"].iloc[-2]) if len(hist) > 1 else 0
+
+    if price_spike > 0.05 and vol_ratio < 1.0:
+        high_volatility_warning = True
+        warning_type = "volume_divergence"
+        warning_message = "Weak Spike Detected: Price jumped >5% on below-average volume. High risk of reversal."
+        liquidity_score *= 0.5  # Penalize score for weak volume support
+    elif price_spike > 0.05 and vol_ratio > 2.0:
+        # Increase confidence slightly on high-conviction moves
+        quality_score = min(1.0, quality_score * 1.1)
+
+    # 4. Drawdown Risk Quantification (3-month window for relevance)
+    hist_3m = hist.tail(63)
+    peak_price = float(hist_3m["Close"].max())
+    mean_price = float(hist_3m["Close"].mean())
+    std_price = float(hist_3m["Close"].std())
+    max_drawdown_expected = peak_price - (mean_price - 2 * std_price)
+    drawdown_pct = max_drawdown_expected / current_price if current_price > 0 else 0
+
+    drawdown_penalty = 0.0
+    if drawdown_pct > 0.25:
+        high_volatility_warning = True
+        warning_type = "drawdown_severe"
+        warning_message = f"HIGH DRAWDOWN RISK: Severe potential downside detected (~{int(drawdown_pct*100)}%)."
+        drawdown_penalty = 0.20
+    elif drawdown_pct > 0.15:
+        if not high_volatility_warning:
+            high_volatility_warning = True
+            warning_type = "drawdown_moderate"
+            warning_message = "MODERATE DRAWDOWN RISK: Elevated historical variance."
+        drawdown_penalty = 0.08
+
+    # 5. Beta-Adjusted Returns & Regime Detection
+    # Baseline ASX200 daily volatility ~0.9%
+    assumed_beta = min(3.0, daily_vol / 0.009) 
+    hurdle_rate_3m = (0.04 + (assumed_beta * 0.06)) / 4.0
+    if (adjusted_mu - hurdle_rate_3m) < 0:
+        trend_score *= 0.5  # Penalize if it doesn't beat its CAPM risk hurdle
+
+    sma_20 = float(hist["Close"].rolling(20).mean().iloc[-1])
+    sma_50 = float(hist["Close"].rolling(min(50, len(hist))).mean().iloc[-1])
+    sma_long = float(hist["Close"].rolling(min(120, len(hist))).mean().iloc[-1])
+    
+    if current_price > sma_20 > sma_50 > sma_long:
+        regime_fit = 0.85  # Clean trending bull regime
+    elif current_price < sma_20 and current_price > sma_long:
+        regime_fit = 0.40  # Choppy/Mean-reverting regime
+    else:
+        regime_fit = 0.30  # Bear or broken regime
+
+    # --- Regime-Specific Volatility Triggers (VIX) ---
+    snapshot = compute_regime_snapshot()
+    vix = snapshot.get("vix_level", 20)
+    vix_penalty = 0.0
+    if vix > 30:
+        # High volatility regime: market-wide drawdown risk
+        vix_penalty = 0.15
+        quality_score *= 0.8  # Deflate quality on high panic
+        if not high_volatility_warning:
+            high_volatility_warning = True
+            warning_type = "systemic_vix"
+            warning_message = f"SYSTEMIC RISK: Market fear is extremely elevated (VIX {vix}). Hit rates degrade."
+    elif vix > 22:
+        vix_penalty = 0.05
+    elif vix < 15:
+        # Low volatility regime: trends tend to persist with higher hit rates
+        regime_fit = min(1.0, regime_fit * 1.1)
+        prob_ge_5pct = min(1.0, prob_ge_5pct * 1.05)
+    # ---------------------------------------------------
+
+    raw_score = (
         0.45 * prob_ge_5pct
         + 0.20 * trend_score
         + 0.15 * quality_score
         + 0.10 * regime_fit
         + 0.10 * liquidity_score
-    )
+    ) - drawdown_penalty - vix_penalty
+    
+    # 6. Cap maximum composite score
+    score = max(0.0, min(0.92, raw_score))
+    
+    # 7. Minimum quality gate — flag stocks unlikely to deliver 5% in 2-3 months
+    quality_reason = None
+    if score < 0.45:
+        if prob_ge_5pct < 0.30:
+            quality_reason = f"Low probability of 5% return ({prob_ge_5pct*100:.0f}%)"
+        elif drawdown_pct > 0.15:
+            quality_reason = f"High drawdown risk ({drawdown_pct*100:.0f}%)"
+        elif rsi > 70:
+            quality_reason = "Overbought with mean reversion risk"
+        else:
+            quality_reason = "Composite score below quality threshold"
+    
+    # 8. Self-Learning / Adaptive Penalty Logic
+    learning_note = None
+    try:
+        with db_conn() as conn:
+            avg_miss = conn.execute(
+                text("""
+                    SELECT AVG(actual_return_14d - target_return_14d) 
+                    FROM tracking_windows 
+                    WHERE symbol = :sym AND status = 'completed'
+                """), 
+                {"sym": symbol}
+            ).fetchone()
+            
+            if avg_miss and avg_miss[0] is not None:
+                hist_bias = float(avg_miss[0])
+                if hist_bias < -0.03: 
+                    score = score * 0.85
+                    learning_note = f"Self-Learning: Score discounted due to historical over-optimism ({hist_bias*100:.1f}% avg miss)"
+                elif hist_bias < -0.01:
+                    score = score * 0.95
+                    learning_note = "Self-Learning: Marginal penalty applied for historical over-prediction"
+                elif hist_bias > 0.02:
+                    score = min(0.95, score * 1.05)
+                    learning_note = f"Self-Learning: Score boosted due to historical outperformance ({hist_bias*100:.1f}% avg beat)"
+    except Exception:
+        pass
 
-    return {
+    # 8. Flag severe anomalies for the user
+    # Warning flags initialized early for Volume & Drawdown logic
+    if not high_volatility_warning:
+        if mu > 0.20 or mu < -0.20:
+            high_volatility_warning = True
+            warning_type = "extreme_projection"
+            warning_message = "Extreme statistical projection detected. Guardrails applied to bound targets."
+        elif rsi > 70:
+            high_volatility_warning = True
+            warning_type = "overbought"
+            warning_message = "Stock is highly overbought (RSI > 70). High risk of immediate mean reversion."
+    # ------------------------------
+
+    result = {
         "symbol": symbol,
         "name": stock_data["name"],
         "current_price": round(float(current_price), 2),
@@ -879,7 +3123,54 @@ def get_probability_and_score(symbol: str) -> dict:
         "prob_ge_5pct": round(prob_ge_5pct * 100, 2),
         "trend": trend,
         "score": round(score * 100, 2),
+        "high_volatility_warning": high_volatility_warning,
+        "warning_message": warning_message,
+        "warning_type": warning_type,
+        "quality_reason": quality_reason,
+        "score_raw": round(raw_score * 100, 2),
+        "learning_note": learning_note,
     }
+
+    # Persist to daily prediction cache (non-critical)
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO daily_predictions
+                        (symbol, prediction_date, name, current_price, predicted_price, trend, score,
+                         prob_ge_5pct, expected_return_pct, high_volatility_warning, warning_message,
+                         warning_type, confidence_low, confidence_high, quality_reason, score_raw, learning_note)
+                    VALUES
+                        (:symbol, :date, :name, :current_price, :predicted_price, :trend, :score,
+                         :prob_ge_5pct, :expected_return_pct, :high_volatility_warning, :warning_message,
+                         :warning_type, :confidence_low, :confidence_high, :quality_reason, :score_raw)
+                    ON CONFLICT (symbol, prediction_date) DO NOTHING
+                """),
+                {
+                    "symbol": symbol,
+                    "date": today_str,
+                    "name": result["name"],
+                    "current_price": result["current_price"],
+                    "predicted_price": result["predicted_price_3m"],
+                    "trend": result["trend"],
+                    "score": result["score"],
+                    "prob_ge_5pct": result["prob_ge_5pct"],
+                    "expected_return_pct": result["expected_return_3m_pct"],
+                    "high_volatility_warning": 1 if result["high_volatility_warning"] else 0,
+                    "warning_message": result["warning_message"],
+                    "warning_type": result["warning_type"],
+                    "confidence_low": prediction.get("confidence_low"),
+                    "confidence_high": prediction.get("confidence_high"),
+                    "quality_reason": result["quality_reason"],
+                    "score_raw": result["score_raw"],
+                },
+            )
+    except Exception:
+        pass  # Non-critical — do not fail the prediction on cache write error
+
+    streak_data = get_trend_streak(symbol)
+    result.update(streak_data)
+    return result
 
 
 def create_tracking_window(user_id: str, symbol: str, source: str = "manual_add") -> None:
@@ -976,21 +3267,36 @@ def heuristic_symbols_from_query(query: str, max_symbols: int) -> List[str]:
     q = query.lower()
     keyword_map = {
         "bank": ["CBA", "NAB", "WBC", "ANZ"],
-        "financial": ["CBA", "NAB", "WBC", "ANZ", "QBE"],
-        "mining": ["BHP", "RIO", "FMG", "S32", "MIN"],
-        "miner": ["BHP", "RIO", "FMG", "S32", "MIN"],
-        "energy": ["WDS", "STO", "OSH"],
-        "oil": ["WDS", "STO", "ORG"],
-        "gas": ["WDS", "STO", "ORG"],
-        "retail": ["WOW", "WES", "HVN", "PMV"],
-        "health": ["CSL", "RHC", "SHL"],
-        "tech": ["REA", "SEK", "XRO"],
-        "telecom": ["TLS", "VOC", "SPK"],
-        "defensive": ["TLS", "WOW", "WES", "CSL"],
+        "financial": ["CBA", "NAB", "WBC", "ANZ", "QBE", "MQG"],
+        "mining": ["BHP", "RIO", "FMG", "S32", "MIN", "EVN", "NST"],
+        "miner": ["BHP", "RIO", "FMG", "S32", "MIN", "EVN", "NST"],
+        "gold": ["NST", "EVN", "GOR", "SBM", "RMS"],
+        "lithium": ["PLS", "MIN", "IGO", "LTR", "SYR"],
+        "energy": ["WDS", "STO", "OSH", "ORG", "APA"],
+        "oil": ["WDS", "STO", "ORG", "FMG"],
+        "gas": ["WDS", "STO", "ORG", "APA"],
+        "retail": ["WOW", "WES", "HVN", "PMV", "JBH", "SUL"],
+        "consumer": ["WOW", "WES", "COL", "WTC", "HVN"],
+        "health": ["CSL", "RHC", "SHL", "RMD", "COH", "PME"],
+        "tech": ["REA", "SEK", "XRO", "WTC", "TNE"],
+        "telecom": ["TLS", "SPK", "TNE"],
+        "property": ["GMG", "SGP", "MGR", "SCG", "ALL"],
+        "infrastructure": ["TCL", "APA", "ALL", "SYD"],
+        "dividend": ["TLS", "WOW", "WES", "CBA", "CSL", "BHP"],
+        "growth": ["PME", "XRO", "REA", "WTC", "COH"],
+        "value": ["BHP", "WBC", "ANZ", "FMG", "NAB", "TLS"],
+        "defensive": ["TLS", "WOW", "WES", "CSL", "COL"],
         "defence": ["DRO", "EOS", "ASB"],
         "defense": ["DRO", "EOS", "ASB"],
         "aerospace": ["ASB", "DRO", "EOS"],
         "military": ["DRO", "EOS", "ASB"],
+        "smallcap": ["DRO", "WTC", "BRN", "VUL", "CXO", "SYR"],
+        "midcap": ["PME", "JBH", "MIN", "APA", "XRO", "ORG"],
+        "bluechip": ["BHP", "CBA", "CSL", "WBC", "NAB", "WES"],
+        "turnaround": ["FMG", "PLS", "MIN", "WDS", "IGO"],
+        "uranium": ["DYL", "PDN", "BOE", "ERA"],
+        "rareearth": ["LYC", "VML", "ILU"],
+        "agriculture": ["GNC", "ELD", "RIC"],
     }
 
     picks: List[str] = []
@@ -1009,7 +3315,15 @@ def heuristic_symbols_from_query(query: str, max_symbols: int) -> List[str]:
         if len(picks) >= max_symbols:
             return picks
 
-    for symbol in TOP_ASX200_SYMBOLS:
+    # Rotating cursor through the diversified universe to avoid always returning the same top shares
+    global _TOP_ASX200_CURSOR, TOP_ASX200_SYMBOLS_SHUFFLED
+    if not TOP_ASX200_SYMBOLS_SHUFFLED:
+        random.shuffle(TOP_ASX200_SYMBOLS)
+        TOP_ASX200_SYMBOLS_SHUFFLED = True
+    cursor = _TOP_ASX200_CURSOR % len(TOP_ASX200_SYMBOLS)
+    _TOP_ASX200_CURSOR = (cursor + max_symbols) % len(TOP_ASX200_SYMBOLS)
+    for i in range(len(TOP_ASX200_SYMBOLS)):
+        symbol = TOP_ASX200_SYMBOLS[(cursor + i) % len(TOP_ASX200_SYMBOLS)]
         if symbol not in picks:
             picks.append(symbol)
         if len(picks) >= max_symbols:
@@ -1025,7 +3339,34 @@ def domain_seed_symbols(query: str, max_symbols: int) -> List[str]:
         seeds.extend(["DRO", "EOS", "ASB", "TLS"])
 
     if any(word in q for word in ["energy", "oil", "gas", "lng"]):
-        seeds.extend(["WDS", "STO", "ORG"])
+        seeds.extend(["WDS", "STO", "ORG", "APA"])
+
+    if any(word in q for word in ["mining", "miner", "iron ore", "copper", "commodity"]):
+        seeds.extend(["BHP", "RIO", "FMG", "S32", "MIN"])
+
+    if any(word in q for word in ["gold", "precious metal", "bullion"]):
+        seeds.extend(["NST", "EVN", "GOR", "RMS", "SBM"])
+
+    if any(word in q for word in ["lithium", "battery metal", "rare earth", "ev battery"]):
+        seeds.extend(["PLS", "MIN", "IGO", "LTR", "LYC"])
+
+    if any(word in q for word in ["bank", "banking", "financial", "finance"]):
+        seeds.extend(["CBA", "NAB", "WBC", "ANZ", "MQG", "QBE"])
+
+    if any(word in q for word in ["health", "healthcare", "biotech", "medical"]):
+        seeds.extend(["CSL", "RMD", "COH", "PME", "RHC"])
+
+    if any(word in q for word in ["tech", "technology", "software", "saas"]):
+        seeds.extend(["XRO", "WTC", "TNE", "SEK", "REA"])
+
+    if any(word in q for word in ["property", "real estate", "reit"]):
+        seeds.extend(["GMG", "SGP", "MGR", "SCG", "ALL"])
+
+    if any(word in q for word in ["retail", "consumer", "discretionary"]):
+        seeds.extend(["WOW", "WES", "COL", "HVN", "JBH"])
+
+    if any(word in q for word in ["dividend", "income", "yield"]):
+        seeds.extend(["TLS", "WOW", "WES", "BHP", "CBA", "FMG"])
 
     unique: List[str] = []
     for symbol in seeds:
@@ -1087,7 +3428,7 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
         "Use only valid ASX symbols and no commentary."
     )
 
-    provider_errors = {"local": "", "openai": ""}
+    provider_errors = {"local": "", "openai": "", "groq": ""}
 
     def try_local_provider() -> Optional[List[str]]:
         try:
@@ -1101,20 +3442,20 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
                             {"role": "system", "content": "You output strict JSON only."},
                             {"role": "user", "content": prompt},
                         ],
-                        "max_tokens": 220,
-                        "temperature": 0.1,
+                        "max_tokens": 600,
+                        "temperature": 0.0,
                     },
-                    timeout=45,
+                    timeout=60,
                 )
                 if response.status_code != 200:
                     continue
-                content = response.json()["choices"][0]["message"]["content"]
+                content = strip_think_tags(response.json()["choices"][0]["message"]["content"])
                 symbols = extract_json_symbols(content)
                 if not symbols:
                     symbols = parse_candidate_symbols(content, max_symbols=max_symbols)
                 if symbols:
                     break
-            valid = [s for s in symbols if s in ASX_COMPANIES]
+            valid = [s for s in symbols if s in ASX_COMPANIES or re.match(r'^[A-Z0-9]{2,6}$', s)]
             return align_symbols_to_query(query, valid, max_symbols)
         except Exception as exc:
             provider_errors["local"] = str(exc)
@@ -1130,14 +3471,14 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
                     {"role": "system", "content": "You output strict JSON only."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=220,
-                temperature=0.1,
+                max_tokens=600,
+                temperature=0.0,
             )
-            content = response.choices[0].message.content or "{}"
+            content = strip_think_tags(response.choices[0].message.content or "{}")
             symbols = extract_json_symbols(content)
             if not symbols:
                 symbols = parse_candidate_symbols(content, max_symbols=max_symbols)
-            valid = [s for s in symbols if s in ASX_COMPANIES]
+            valid = [s for s in symbols if s in ASX_COMPANIES or re.match(r'^[A-Z0-9]{2,6}$', s)]
             return align_symbols_to_query(query, valid, max_symbols)
         except Exception as exc:
             provider_errors["openai"] = str(exc)
@@ -1151,11 +3492,38 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
     else:
         provider_order = LLM_PROVIDER_ORDER
 
+    def try_groq_suggest() -> Optional[List[str]]:
+        if not groq_client:
+            return None
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "You output strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=300,
+                temperature=0.0,
+            )
+            content = strip_think_tags(response.choices[0].message.content or "{}")
+            symbols = extract_json_symbols(content)
+            if not symbols:
+                symbols = parse_candidate_symbols(content, max_symbols=max_symbols)
+            valid = [s for s in symbols if s in ASX_COMPANIES or re.match(r'^[A-Z0-9]{2,6}$', s)]
+            return align_symbols_to_query(query, valid, max_symbols)
+        except Exception as exc:
+            provider_errors["groq"] = str(exc)
+            return None
+
     for provider in provider_order:
         if provider == "local":
             result = try_local_provider()
             if result:
                 return result, "local", ""
+        if provider == "groq":
+            result = try_groq_suggest()
+            if result:
+                return result, "groq", ""
         if provider == "openai":
             result = try_openai_provider()
             if result:
@@ -1166,37 +3534,103 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
 
     return heuristic_symbols_from_query(query, max_symbols=max_symbols), "fallback", ""
 
-def generate_statistical_prediction(df: pd.DataFrame, current_price: float) -> dict:
-    """Generate statistical prediction using multiple methods"""
-    
-    # Method 1: Linear trend projection
+def generate_statistical_prediction(df: pd.DataFrame, current_price: float, sector: str = "", symbol: str = "") -> dict:
+    """Generate statistical prediction using multiple methods (LR, ARIMA, XGBoost, SMA, and Macro overlay)."""
+
+    future_days = 90
+    close = df['Close'].values
+    model_count = 0
+    method_preds = []
+
+    # Method 1: Linear trend projection (always available)
     X = np.arange(len(df)).reshape(-1, 1)
-    y = df['Close'].values
-    
     from sklearn.linear_model import LinearRegression
     lr = LinearRegression()
-    lr.fit(X, y)
-    
-    # Project 90 days (approx 3 months trading days)
-    future_days = 90
+    lr.fit(X, close)
     future_X = np.arange(len(df), len(df) + future_days).reshape(-1, 1)
-    lr_pred = lr.predict(future_X)[-1]
-    
-    # Method 2: Simple moving average projection
-    sma_50 = df['Close'].rolling(50).mean().iloc[-1]
-    sma_200 = df['Close'].rolling(200).mean().iloc[-1] if len(df) >= 200 else sma_50
-    
-    # Method 3: Weighted average (favor recent data)
-    weights = np.linspace(1, 2, min(50, len(df)))
-    weighted_avg = np.average(df['Close'].tail(50), weights=weights)
-    
-    # Combine methods
-    combined_pred = (lr_pred * 0.4 + sma_50 * 0.3 + weighted_avg * 0.3)
-    
-    # Calculate confidence interval based on volatility
-    volatility = df['Close'].pct_change().std()
+    lr_pred = float(lr.predict(future_X)[-1])
+    model_count += 1
+
+    # Method 2: ARIMA(2,1,2) — requires statsmodels
+    arima_pred: Optional[float] = None
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+        series = pd.Series(close[-min(252, len(close)):])
+        arima_fit = ARIMA(series, order=(2, 1, 2)).fit()
+        arima_forecast = arima_fit.forecast(steps=future_days)
+        arima_pred = float(arima_forecast.iloc[-1])
+        if abs(arima_pred - current_price) / max(current_price, 1e-6) > 0.30:
+            arima_pred = None
+        else:
+            model_count += 1
+    except Exception:
+        pass
+
+    # Method 3: XGBoost — requires xgboost
+    xgb_pred: Optional[float] = None
+    try:
+        import xgboost as xgb
+        returns = pd.Series(close).pct_change().dropna().values
+        if len(returns) >= 30:
+            lags = [1, 3, 5, 10, 20]
+            feature_rows = []
+            targets = []
+            min_lag = max(lags)
+            for i in range(min_lag, len(returns) - 1):
+                row = [returns[i - lag] for lag in lags]
+                feature_rows.append(row)
+                targets.append(returns[i + 1])
+            if len(feature_rows) >= 10:
+                X_xgb = np.array(feature_rows)
+                y_xgb = np.array(targets)
+                model_xgb = xgb.XGBRegressor(
+                    n_estimators=100, max_depth=4, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8,
+                    random_state=42, verbosity=0
+                )
+                model_xgb.fit(X_xgb, y_xgb)
+                # Predict the average daily return for the next ~future_days
+                last_row = np.array([[returns[-lag] for lag in lags]])
+                daily_ret = float(model_xgb.predict(last_row)[0])
+                # Clamp daily return to prevent absurd compounding (max ±0.5%/day)
+                daily_ret = max(-0.005, min(0.005, daily_ret))
+                xgb_pred = current_price * (1 + daily_ret) ** future_days
+                # Reject if prediction is more than ±30% from current (outlier)
+                if abs(xgb_pred - current_price) / current_price > 0.30:
+                    xgb_pred = None
+                model_count += 1
+    except Exception:
+        pass
+
+    # Method 4: SMA projection (always available)
+    sma_50 = float(df['Close'].rolling(50).mean().iloc[-1]) if len(df) >= 50 else float(np.mean(close))
+    model_count += 1
+
+    # Blend weights depend on which models succeeded
+    if arima_pred is not None and xgb_pred is not None:
+        combined_pred = lr_pred * 0.20 + arima_pred * 0.30 + xgb_pred * 0.30 + sma_50 * 0.20
+    elif arima_pred is not None:
+        combined_pred = lr_pred * 0.30 + arima_pred * 0.40 + sma_50 * 0.30
+    elif xgb_pred is not None:
+        combined_pred = lr_pred * 0.30 + xgb_pred * 0.40 + sma_50 * 0.30
+    else:
+        # Legacy blend (no advanced models)
+        weights = np.linspace(1, 2, min(50, len(df)))
+        weighted_avg = float(np.average(df['Close'].tail(50), weights=weights))
+        combined_pred = lr_pred * 0.40 + sma_50 * 0.30 + weighted_avg * 0.30
+
+    # Apply Macroeconomic Top-Down Adjustments
+    try:
+        macro_adj = macro_model.calculate_macro_adjustment(sector, _get_macro_data_cached())
+    except Exception:
+        macro_adj = 1.0
+
+    combined_pred = combined_pred * macro_adj
+
+    # Confidence interval based on volatility
+    volatility = float(pd.Series(close).pct_change().std())
     confidence_margin = combined_pred * volatility * 2
-    
+
     # Determine trend
     if combined_pred > current_price * 1.05:
         trend = "bullish"
@@ -1204,13 +3638,16 @@ def generate_statistical_prediction(df: pd.DataFrame, current_price: float) -> d
         trend = "bearish"
     else:
         trend = "neutral"
-    
+
     return {
         "predicted_price": round(combined_pred, 2),
         "confidence_low": round(combined_pred - confidence_margin, 2),
         "confidence_high": round(combined_pred + confidence_margin, 2),
         "trend": trend,
-        "change_from_current": round(((combined_pred - current_price) / current_price * 100), 2)
+        "change_from_current": round(((combined_pred - current_price) / current_price * 100), 2),
+        "model_count": model_count,
+        "arima_pred": round(arima_pred, 2) if arima_pred is not None else None,
+        "xgb_pred": round(xgb_pred, 2) if xgb_pred is not None else None,
     }
 
 async def get_llm_analysis(
@@ -1223,8 +3660,15 @@ async def get_llm_analysis(
     regime: dict = None,
     historical_accuracy: dict = None
 ) -> str:
-    """Get LLM analysis from configured providers with comprehensive context."""
-    
+    """Two-stage LLM analysis pipeline.
+
+    Stage 1 (local DeepSeek 7B): raw data → compact structured JSON.
+    Stage 2 (Groq Llama 70B): structured JSON → broker-grade narrative.
+
+    Falls back to Groq/OpenAI with full prompt if Stage 1 is unavailable,
+    and to mock analysis if no LLM is reachable.
+    """
+
     # Default values for optional params
     if valuation is None:
         valuation = {}
@@ -1234,7 +3678,7 @@ async def get_llm_analysis(
         regime = {}
     if historical_accuracy is None:
         historical_accuracy = {}
-    
+
     # Format market cap nicely
     market_cap = valuation.get('market_cap')
     if market_cap:
@@ -1246,18 +3690,78 @@ async def get_llm_analysis(
             market_cap_str = f"${market_cap/1e6:.2f}M"
     else:
         market_cap_str = "N/A"
-    
-    prompt = f"""You are a financial data analyst. 
-You do not give financial advice. 
+
+    # Full raw prompt — used by Stage 1 and as fallback for cloud providers
+    model_note = ""
+    if prediction.get("model_count", 1) >= 3:
+        notes = []
+        if prediction.get("arima_pred") is not None:
+            notes.append(f"ARIMA=${prediction['arima_pred']:.2f}")
+        if prediction.get("xgb_pred") is not None:
+            notes.append(f"XGBoost=${prediction['xgb_pred']:.2f}")
+        if notes:
+            model_note = f"\n- Individual model forecasts: {', '.join(notes)}"
+
+    # Try to insert latest macro snapshot into prompt
+    macro_notes = ""
+    try:
+        if macro_model:
+            md = _get_macro_data_cached()
+            if md:
+                au_yield_str = f"- AU 10-Yr Bond Yield: {md.get('au_10y_yield', {}).get('current', 0.0):.2f}% (Trend: {md.get('au_10y_yield', {}).get('trend_30d', 0):.1f}%)\n" if md.get('au_10y_yield', {}).get('current', 0) > 0 else ""
+                macro_notes = f"\nMacroeconomic Snapshot:\n- ASX200 (Market): {md.get('asx200', {}).get('trend_30d', 0):.2f}% (30d)\n- AUD/USD: {md.get('aud_usd', {}).get('current', 0):.4f}\n{au_yield_str}- Copper: {md.get('copper', {}).get('trend_30d', 0):.1f}% (30d)\n- Gold: {md.get('gold', {}).get('trend_30d', 0):.1f}% (30d)\n- Crude Oil: {md.get('crude_oil', {}).get('trend_30d', 0):.1f}% (30d)\n"
+    except Exception:
+        pass
+
+    # ── Analyst consensus + catalyst block ────────────────────────────────────
+    analyst_consensus_block = ""
+    if valuation.get('analyst_target_mean') or valuation.get('analyst_recommendation'):
+        rec = (valuation.get('analyst_recommendation') or 'N/A').upper()
+        n_opinions = valuation.get('num_analyst_opinions') or 'N/A'
+        t_mean  = f"${valuation['analyst_target_mean']:.2f}" if valuation.get('analyst_target_mean') else 'N/A'
+        t_high  = f"${valuation['analyst_target_high']:.2f}" if valuation.get('analyst_target_high') else 'N/A'
+        t_low   = f"${valuation['analyst_target_low']:.2f}"  if valuation.get('analyst_target_low')  else 'N/A'
+        upside  = f"{valuation['analyst_upside_pct']:+.1f}%" if valuation.get('analyst_upside_pct') is not None else 'N/A'
+        analyst_consensus_block = f"""
+Analyst Consensus ({n_opinions} analysts):
+- Recommendation: {rec}
+- Consensus Price Target: {t_mean} (range {t_low} – {t_high})
+- Implied Upside/Downside vs Current: {upside}"""
+
+    catalyst_block = ""
+    earnings_warning = ""
+    days_to_e = valuation.get('days_to_earnings')
+    if valuation.get('next_earnings_date') or valuation.get('short_pct_float') or valuation.get('pct_from_52w_high') is not None:
+        dte_str = f"{days_to_e}d" if days_to_e is not None else 'N/A'
+        short_str = f"{valuation['short_pct_float']:.1f}%" if valuation.get('short_pct_float') else 'N/A'
+        high_52_str = f"${valuation['52w_high']:.2f}" if valuation.get('52w_high') else 'N/A'
+        low_52_str  = f"${valuation['52w_low']:.2f}"  if valuation.get('52w_low')  else 'N/A'
+        from_peak_str = f"{valuation['pct_from_52w_high']:+.1f}% from 52-week high" if valuation.get('pct_from_52w_high') is not None else 'N/A'
+        eps_growth_str = f"{valuation['eps_growth_fwd_pct']:+.1f}%" if valuation.get('eps_growth_fwd_pct') is not None else 'N/A'
+        rev_growth_str = f"{valuation['revenue_growth']*100:+.1f}%" if valuation.get('revenue_growth') else 'N/A'
+        catalyst_block = f"""
+Catalyst & Market Structure:
+- Next Earnings Date: {valuation.get('next_earnings_date', 'N/A')} ({dte_str} away)
+- 52-Week Range: {low_52_str} – {high_52_str} | Position: {from_peak_str}
+- Short Interest (% float): {short_str}
+- EPS (Trailing / Forward): ${valuation.get('trailing_eps', 'N/A')} / ${valuation.get('forward_eps', 'N/A')} | Fwd EPS Growth: {eps_growth_str}
+- Revenue Growth (YoY): {rev_growth_str}"""
+        if days_to_e is not None and 0 <= days_to_e <= 10:
+            earnings_warning = f"\n⚠️  EARNINGS IN {days_to_e} DAYS — elevated event risk. Avoid new entry; existing positions consider protective stops."
+        elif days_to_e is not None and 0 < days_to_e <= 30:
+            earnings_warning = f"\n📅  Earnings in {days_to_e} days — watch for analyst estimate revisions pre-result."
+
+    full_prompt = f"""You are a financial data analyst.
+You do not give financial advice.
 You only analyse data, identify patterns, compare companies, and explain market behaviour.
 
 Stock: {symbol}
 Sector: {valuation.get('sector', 'N/A')}
-Industry: {valuation.get('industry', 'N/A')}
+Industry: {valuation.get('industry', 'N/A')}{macro_notes}
 
 Current Price: ${stock_data['current_price']:.2f}
 Daily Change: {stock_data['change_percent']:.2f}%
-
+{earnings_warning}
 Technical Indicators:
 - SMA 20: ${indicators.get('sma_20', 0):.2f}
 - SMA 50: ${indicators.get('sma_50', 0):.2f}
@@ -1274,17 +3778,19 @@ Valuation:
 - Price-to-Book: {valuation.get('pb', 'N/A')}
 - Dividend Yield: {valuation.get('dividend_yield', 'N/A')}
 - Market Cap: {market_cap_str}
+{analyst_consensus_block}
+{catalyst_block}
 
 Risk Metrics:
 - Beta (vs ASX200): {risk.get('beta', 'N/A')}
 - Max Drawdown (90d): {risk.get('max_drawdown_90d', 'N/A')}%
 - Sharpe Ratio (90d): {risk.get('sharpe_90d', 'N/A')}
 
-Forecast (90 days):
+Forecast (90 days, {prediction.get('model_count', 1)}-model ensemble):
 - Predicted Price: ${prediction['predicted_price']:.2f}
 - Range: ${prediction['confidence_low']:.2f} - ${prediction['confidence_high']:.2f}
 - Trend: {prediction['trend'].upper()}
-- Expected Change: {prediction['change_from_current']:.1f}%
+- Expected Change: {prediction['change_from_current']:.1f}%{model_note}
 
 Model Confidence:
 - Probability of ≥5%: {prediction.get('prob_ge_5pct', 'N/A')}%
@@ -1299,31 +3805,93 @@ Historical Forecast Accuracy:
 - Average Error: {historical_accuracy.get('avg_error', 'N/A')}%
 
 Task:
-Explain the stock's outlook based on the above data.
-Identify key drivers, risks, sector context, and how the forecast aligns with the indicators.
+Explain the stock's outlook based on the above data. Cover: (1) technical setup and momentum, (2) valuation relative to analyst targets and own history, (3) upcoming catalyst risk (earnings proximity, short interest), (4) macro regime alignment, (5) key risks and watch points.
 Do not give buy/sell recommendations."""
-    
-    def try_local_provider() -> Optional[str]:
+
+    # Stage 1 prompt — asks DeepSeek 7B to distil data into structured JSON
+    stage1_prompt = f"""You are a quantitative data parser. Extract and summarise the following stock data as compact JSON only.
+Output ONLY valid JSON with these exact keys — no explanation, no markdown, no extra text:
+
+{{
+  "symbol": "<ticker>",
+  "trend_bias": "<bullish|bearish|neutral>",
+  "rsi_signal": "<overbought|oversold|neutral>",
+  "macd_signal": "<bullish|bearish|neutral>",
+  "price_vs_sma50": "<above|below>",
+  "price_vs_sma200": "<above|below>",
+  "volatility_level": "<low|moderate|high>",
+  "valuation_stance": "<expensive|fair|cheap|unknown>",
+  "analyst_vs_price": "<above_target|at_target|below_target|no_data>",
+  "earnings_risk": "<high|moderate|low|none|unknown>",
+  "entry_zone": "<clear|caution|avoid>",
+  "regime": "<risk_on|risk_off|liquidity_rally|mixed>",
+  "regime_fit": "<aligned|misaligned|neutral>",
+  "prediction_confidence": "<high|medium|low>",
+  "ensemble_models": <number of models used>,
+  "arima_agrees": <true|false|null>,
+  "xgb_agrees": <true|false|null>,
+  "key_risks": ["<risk1>", "<risk2>"],
+  "key_positives": ["<positive1>", "<positive2>"],
+  "catalyst_summary": "<one sentence on nearest catalyst or earnings risk>"
+}}
+
+--- RAW DATA ---
+{full_prompt}"""
+
+    # ── Stage 1: Local DeepSeek 7B → structured JSON ──────────────────────
+    def try_stage1_local() -> Optional[dict]:
         try:
             response = requests.post(
                 f"{LOCAL_LLM_URL}/chat/completions",
                 json={
                     "model": LOCAL_LLM_MODEL,
                     "messages": [
-                        {"role": "system", "content": "You are a professional stock analyst providing investment insights."},
-                        {"role": "user", "content": prompt}
+                        {"role": "system", "content": "You are a JSON-only data extraction tool. Output valid JSON and nothing else."},
+                        {"role": "user", "content": stage1_prompt}
                     ],
-                    "max_tokens": 200,
-                    "temperature": 0.7
+                    "max_tokens": 500,
+                    "temperature": 0.1,
                 },
-                timeout=60
+                timeout=60,
             )
             if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content']
+                raw = strip_think_tags(response.json()['choices'][0]['message']['content'])
+                return extract_json_from_llm(raw)
             return None
         except Exception:
             return None
 
+    # ── Stage 2: Groq Llama 3.3 70B → broker-grade narrative ──────────────
+    def try_groq_provider(structured: Optional[dict] = None) -> Optional[str]:
+        if not groq_client:
+            return None
+        try:
+            if structured:
+                stage2_prompt = f"""You are a senior equity research analyst writing a concise 3-4 paragraph stock outlook for a broker platform.
+Do not give buy/sell recommendations. Write in clear professional prose.
+
+Use this pre-processed signal summary to write the outlook:
+{json.dumps(structured, indent=2)}
+
+Reference the key signals (trend, RSI, MACD, valuation stance, regime fit, model ensemble count, ARIMA and XGBoost agreement where available).
+Cover: (1) price momentum and technical setup, (2) valuation and fundamental context, (3) macro/regime alignment, (4) top risks and watch points."""
+            else:
+                stage2_prompt = full_prompt + "\n\nWrite a 3-4 paragraph broker-grade outlook covering momentum, valuation, macro alignment, and key risks."
+
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a senior equity research analyst. Write concise, data-driven stock outlooks."},
+                    {"role": "user", "content": stage2_prompt}
+                ],
+                max_tokens=1200,
+                temperature=0.4,
+            )
+            return strip_think_tags(response.choices[0].message.content)
+        except Exception:
+            return None
+
+    # ── OpenAI fallback (full prompt, existing behaviour) ─────────────────
     def try_openai_provider() -> Optional[str]:
         if not openai_client:
             return None
@@ -1332,26 +3900,51 @@ Do not give buy/sell recommendations."""
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a professional stock analyst providing investment insights."},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": full_prompt}
                 ],
-                max_tokens=200,
-                temperature=0.7
+                max_tokens=800,
+                temperature=0.3,
             )
-            return response.choices[0].message.content
+            return strip_think_tags(response.choices[0].message.content)
         except Exception:
             return None
 
-    for provider in LLM_PROVIDER_ORDER:
-        if provider == "local":
-            content = try_local_provider()
-            if content:
-                return content
-        if provider == "openai":
-            content = try_openai_provider()
-            if content:
-                return content
+    # ── Orchestration: Groq primary → local fallback → OpenAI last resort ──
     
-    # Return mock analysis if no LLM available
+    # Stage 1: Groq does the full analysis (128K context, fast inference)
+    structured_json: Optional[dict] = None
+    if "groq" in LLM_PROVIDER_ORDER:
+        content = await asyncio.to_thread(try_groq_provider, None)
+        if content:
+            return content
+
+    # Stage 2: Local produces structured JSON, then Groq formats it as prose
+    if "local" in LLM_PROVIDER_ORDER:
+        structured_json = await asyncio.to_thread(try_stage1_local)
+
+    # Groq Stage 2 retry — pass structured JSON if Stage 1 succeeded
+    if structured_json and groq_client:
+        content = await asyncio.to_thread(try_groq_provider, structured_json)
+        if content:
+            return content
+
+    # OpenAI fallback
+    if "openai" in LLM_PROVIDER_ORDER:
+        content = await asyncio.to_thread(try_openai_provider)
+        if content:
+            return content
+
+    # Last resort: if local is the only provider and Stage 1 produced something,
+    # return a plain-text rendering of the JSON
+    if structured_json:
+        trend = structured_json.get("trend_bias", prediction["trend"])
+        risks = ", ".join(structured_json.get("key_risks", []))
+        positives = ", ".join(structured_json.get("key_positives", []))
+        return (f"{symbol} shows a {trend} outlook. "
+                f"RSI is {structured_json.get('rsi_signal', 'neutral')}, MACD is {structured_json.get('macd_signal', 'neutral')}. "
+                f"Key positives: {positives or 'N/A'}. Key risks: {risks or 'N/A'}.")
+
+    # Mock analysis if no LLM available
     rsi_val = indicators.get('rsi')
     rsi_str = f"{rsi_val:.1f}" if isinstance(rsi_val, (int, float)) and not math.isnan(rsi_val) else "N/A"
     rsi_cond = ('overbought' if isinstance(rsi_val, (int, float)) and rsi_val > 70
@@ -1427,21 +4020,51 @@ def get_weekly_data(symbol: str) -> List[dict]:
 
 
 def get_daily_return(ticker: str) -> float:
-    hist = yf.Ticker(ticker).history(period="5d")
-    if len(hist) < 2:
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if len(hist) < 2:
+            return 0.0
+        prev_close = float(hist["Close"].iloc[-2])
+        last_close = float(hist["Close"].iloc[-1])
+        if prev_close == 0 or math.isnan(prev_close) or math.isnan(last_close):
+            return 0.0
+        return ((last_close - prev_close) / prev_close) * 100.0
+    except Exception:
         return 0.0
-    prev_close = float(hist["Close"].iloc[-2])
-    last_close = float(hist["Close"].iloc[-1])
-    if prev_close == 0:
-        return 0.0
-    return ((last_close - prev_close) / prev_close) * 100.0
+
+
+_regime_snapshot_cache: dict = {"data": None, "expires": 0.0}
 
 
 def compute_regime_snapshot() -> dict:
+    now = time.monotonic()
+    if _regime_snapshot_cache["data"] is not None and now < _regime_snapshot_cache["expires"]:
+        return _regime_snapshot_cache["data"]
+
     asx200_ret = get_daily_return("^AXJO")
     sp500_ret = get_daily_return("^GSPC")
+    nifty_ret = get_daily_return("^NSEI")
+    sensex_ret = get_daily_return("^BSESN")
     gold_ret = get_daily_return("GC=F")
     dxy_ret = get_daily_return("DX-Y.NYB")
+    
+    try:
+        import yfinance as yf
+        vix_data = yf.Ticker("^VIX").history(period="5d")
+        vix_level = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else 20.0
+    except:
+        vix_level = 20.0
+
+    # Bear market detection: 200-day SMA check on ASX200
+    bear_market = False
+    try:
+        asx200_hist = yf.Ticker("^AXJO").history(period="1y")
+        if not asx200_hist.empty and len(asx200_hist) >= 200:
+            sma_200 = float(asx200_hist["Close"].rolling(200).mean().iloc[-1])
+            current_asx = float(asx200_hist["Close"].iloc[-1])
+            bear_market = current_asx < sma_200
+    except Exception:
+        pass
 
     equities_ret = asx200_ret
     safe_haven_flag = equities_ret < 0 and gold_ret > 0
@@ -1450,6 +4073,8 @@ def compute_regime_snapshot() -> dict:
 
     if safe_haven_flag:
         regime = "risk_off"
+    elif bear_market:
+        regime = "bear_market"
     elif divergence_flag:
         regime = "liquidity_rally"
     elif equities_ret > 0:
@@ -1467,18 +4092,25 @@ def compute_regime_snapshot() -> dict:
     if divergence_flag:
         tags.append("liquidity_rally_divergence")
 
-    return {
+    result = {
         "asx200_ret": round(asx200_ret, 2),
         "sp500_ret": round(sp500_ret, 2),
+        "nifty_ret": round(nifty_ret, 2),
+        "sensex_ret": round(sensex_ret, 2),
         "gold_ret": round(gold_ret, 2),
         "dxy_ret": round(dxy_ret, 2),
+        "vix_level": round(vix_level, 2),
         "regime": regime,
         "confidence": round(confidence, 2),
         "safe_haven_flag": safe_haven_flag,
         "usd_headwind_flag": usd_headwind_flag,
         "divergence_flag": divergence_flag,
+        "bear_market": bear_market,
         "tags": tags,
     }
+    _regime_snapshot_cache["data"] = result
+    _regime_snapshot_cache["expires"] = now + 300  # cache for 5 minutes
+    return result
 
 
 def regime_summary_text(snapshot: dict) -> str:
@@ -1526,6 +4158,8 @@ async def market_pulse(current_user: dict = Depends(get_current_user)):
         "metrics": {
             "asx200_ret": snapshot["asx200_ret"],
             "sp500_ret": snapshot["sp500_ret"],
+            "nifty_ret": snapshot["nifty_ret"],
+            "sensex_ret": snapshot["sensex_ret"],
             "gold_ret": snapshot["gold_ret"],
             "dxy_ret": snapshot["dxy_ret"],
         },
@@ -1622,7 +4256,7 @@ async def backtest_summary(current_user: dict = Depends(get_current_user)):
 
 
 @app.post("/api/auth/register", response_model=AuthResponse)
-async def register(payload: RegisterRequest):
+def register(payload: RegisterRequest):
     email = payload.email.strip().lower()
     password = payload.password
 
@@ -1668,7 +4302,7 @@ async def register(payload: RegisterRequest):
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
-async def login(payload: LoginRequest):
+def login(payload: LoginRequest):
     email = payload.email.strip().lower()
 
     with engine.connect() as conn:
@@ -1689,6 +4323,99 @@ async def login(payload: LoginRequest):
             "email": user[1],
             "full_name": user[2] or "",
         },
+    }
+
+
+@app.post("/api/auth/forgot-password", response_model=PasswordResetResponse)
+def forgot_password(payload: ForgotPasswordRequest):
+    email = payload.email.strip().lower()
+
+    with db_conn() as conn:
+        user = conn.execute(
+            text("SELECT id, email FROM users WHERE email = :email"),
+            {"email": email},
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        # Generate a reset token
+        reset_token = str(uuid4())
+        user_id = user[0]
+        expires_at = datetime.utcnow() + timedelta(minutes=15)  # Token valid for 15 minutes
+
+        # Store the reset token in database
+        conn.execute(
+            text(
+                """
+                INSERT INTO password_reset_tokens (token, user_id, expires_at)
+                VALUES (:token, :user_id, :expires_at)
+                """
+            ),
+            {"token": reset_token, "user_id": user_id, "expires_at": expires_at},
+        )
+
+    return {
+        "message": "Password reset token generated successfully",
+        "reset_token": reset_token,
+        "instructions": f"Use this token to reset your password. Token expires in 15 minutes. Call POST /api/auth/reset-password with your token and new password.",
+    }
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(payload: ResetPasswordRequest):
+    token = payload.token.strip()
+    new_password = payload.new_password
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    # Verify token exists, belongs to user, is not expired, and not used
+    with db_conn() as conn:
+        reset_record = conn.execute(
+            text(
+                """
+                SELECT user_id, expires_at, used FROM password_reset_tokens
+                WHERE token = :token
+                """
+            ),
+            {"token": token},
+        ).fetchone()
+
+        if not reset_record:
+            raise HTTPException(status_code=404, detail="Invalid reset token")
+
+        user_id, expires_at, used = reset_record
+
+        if used:
+            raise HTTPException(status_code=400, detail="This reset token has already been used")
+
+        if datetime.fromisoformat(expires_at.isoformat()) < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Reset token has expired")
+
+        # Update user password and mark token as used
+        conn.execute(
+            text(
+                """
+                UPDATE users SET password_hash = :password_hash
+                WHERE id = :user_id
+                """
+            ),
+            {"password_hash": hash_password(new_password), "user_id": user_id},
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE password_reset_tokens SET used = 1
+                WHERE token = :token
+                """
+            ),
+            {"token": token},
+        )
+
+    return {
+        "message": "Password reset successfully! You can now log in with your new password.",
+        "success": True,
     }
 
 
@@ -1852,6 +4579,11 @@ async def get_share_details(symbol: str, current_user: dict = Depends(get_curren
     # Get weekly data
     weekly_data = get_weekly_data(symbol)
     
+    # Entry timing assessment
+    entry_timing = _entry_timing_assessment(
+        valuation, indicators, {**prediction, "current_price": stock_data["current_price"]}
+    )
+
     return {
         "symbol": symbol,
         "name": stock_data["name"],
@@ -1861,7 +4593,8 @@ async def get_share_details(symbol: str, current_user: dict = Depends(get_curren
         "valuation_metrics": valuation,
         "risk_metrics": risk,
         "prediction_3m": prediction,
-        "weekly_data": weekly_data
+        "weekly_data": weekly_data,
+        "entry_timing": entry_timing,
     }
 
 @app.get("/api/search")
@@ -1885,42 +4618,57 @@ async def search_shares(query: str, market: str = None, _: dict = Depends(get_cu
     return results[:20]
 
 
+def _fetch_analyze_data(symbol: str, market: str = None):
+    """Collect all blocking yfinance data for analysis in parallel."""
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        f_stock = executor.submit(get_stock_data, symbol, market)
+        f_hist = executor.submit(get_historical_data, symbol, "1y", market)
+        f_val = executor.submit(get_valuation_metrics, symbol)
+        f_risk = executor.submit(get_risk_metrics, symbol)
+        f_regime = executor.submit(compute_regime_snapshot)
+        f_weekly = executor.submit(get_weekly_data, symbol)
+    return (
+        f_stock.result(),
+        f_hist.result(),
+        f_val.result(),
+        f_risk.result(),
+        f_regime.result(),
+        f_weekly.result(),
+    )
+
+
 @app.get("/api/ai/analyze/{symbol}")
-async def analyze_share(symbol: str, current_user: dict = Depends(get_current_user)):
-    """Analyze a single share without requiring it to be tracked"""
+async def analyze_share(symbol: str, market: str = None, current_user: dict = Depends(get_current_user)):
+    """Analyze a single share without requiring it to be tracked.
+    Pass ?market=AU|US|IN to force exchange lookup."""
     symbol = symbol.upper()
-    
-    # Get stock data
-    stock_data = get_stock_data(symbol)
-    
-    # Get historical data
-    hist = get_historical_data(symbol)
-    
+    # Normalise and validate market param; default to AU (ASX)
+    if market:
+        market = market.upper()
+        if market not in {"AU", "US", "IN"}:
+            market = None
+    if not market:
+        market = detect_market(symbol)
+
+    # Run all blocking yfinance calls in a single background thread to free the event loop
+    stock_data, hist, valuation, risk, regime_snapshot, weekly_data = await asyncio.to_thread(
+        _fetch_analyze_data, symbol, market
+    )
+
     if len(hist) == 0:
         raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
-    
-    # Calculate technical indicators
+
+    # Calculate technical indicators (pure Python, non-blocking)
     indicators = calculate_technical_indicators(hist)
-    
+
     # Generate prediction using multiple methods
-    prediction = generate_statistical_prediction(hist, stock_data["current_price"])
-    
-    # Get valuation metrics
-    valuation = get_valuation_metrics(symbol)
-    
-    # Get risk metrics
-    risk = get_risk_metrics(symbol)
-    
-    # Get regime context
-    regime_snapshot = compute_regime_snapshot()
+    prediction = generate_statistical_prediction(hist, stock_data["current_price"], sector=valuation.get('sector', ''), symbol=symbol)
+
     regime = {
         "name": regime_snapshot.get("regime", "N/A"),
         "confidence": regime_snapshot.get("confidence", 0)
     }
-    
-    # Get weekly data
-    weekly_data = get_weekly_data(symbol)
-    
+
     # Get LLM analysis with comprehensive context
     llm_analysis = await get_llm_analysis(
         symbol, 
@@ -1932,7 +4680,45 @@ async def analyze_share(symbol: str, current_user: dict = Depends(get_current_us
         regime=regime,
         historical_accuracy={"directional_accuracy": None, "avg_error": None}
     )
-    
+
+    # Entry timing assessment
+    entry_timing = _entry_timing_assessment(
+        valuation, indicators, {**prediction, "current_price": stock_data["current_price"]}
+    )
+
+    # ── Proactive Telegram alert if strong signal and clear entry ─────────────
+    try:
+        recipients = get_user_telegram_recipients(current_user["id"])
+        score_val = prediction.get("score") or 0
+        prob_val = prediction.get("prob_ge_5pct") or 0
+        if (recipients
+                and entry_timing["entry_ok"]
+                and entry_timing["entry_zone"] == "clear"
+                and (score_val >= 0.65 or prob_val >= 65)):
+            signal_msg = _build_wealth_signal_message(
+                symbol,
+                stock_data["name"],
+                {"score": score_val, "prob_ge_5pct": prob_val},
+                valuation,
+                prediction,
+                entry_timing,
+            )
+            signal_msg += (
+                f"\n<b>🤖 AI Summary:</b>\n"
+                f"{llm_analysis[:600]}{'…' if len(llm_analysis) > 600 else ''}"
+            )
+            _send_telegram_payload(
+                signal_msg,
+                recipients,
+                user_id=current_user["id"],
+                message_type="strong_signal",
+                market=market,
+                delivery_mode="auto",
+                source="analyze_share",
+            )
+    except Exception:
+        pass
+
     return {
         "symbol": symbol,
         "name": stock_data["name"],
@@ -1945,6 +4731,7 @@ async def analyze_share(symbol: str, current_user: dict = Depends(get_current_us
         "weekly_data": weekly_data,
         "regime": regime,
         "llm_analysis": llm_analysis,
+        "entry_timing": entry_timing,
     }
 
 
@@ -1986,20 +4773,49 @@ async def get_notes(symbol: str, current_user: dict = Depends(get_current_user))
     return {"notes": notes, "symbol": symbol}
 
 
-@app.get("/api/universe/top")
-async def get_top_universe(current_user: dict = Depends(get_current_user)):
-    del current_user
+TOP_SYMBOLS_BY_MARKET = {
+    "AU": [
+        "BHP", "CBA", "CSL", "WBC", "NAB", "ANZ", "WES", "WOW", "TLS", "RIO",
+        "MQG", "FMG", "WDS", "GMG", "ALL", "COL", "REA", "TCL", "QBE", "STO",
+        "XRO", "PME", "COH", "RMD", "JBH", "APA", "MIN", "S32", "SEK", "TNE",
+        "WTC", "ASX", "DRO", "PLS", "DHHF", "NDQ", "VAS", "STW", "IOZ", "A200",
+        # Small cap momentum and speculative (under $1 or high growth potential)
+        "SYA", "VUL", "LRS", "ZIP", "BRN", "EXR", "MAY", "88E", "DCC", "RNU",
+        "AGY", "TLG", "RAC", "IMU", "OPT", "BOT",
+    ],
+    "US": [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "V", "JPM", "JNJ",
+        "HD", "MA", "UNH", "XOM", "PG", "CVX", "ABBV", "BAC", "BRK-B", "ADBE",
+        "CRM", "COST", "AVGO", "LLY", "PEP", "MRK", "WMT", "AMD", "KO", "NFLX",
+    ],
+    "IN": [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "HINDUNILVR", "ITC", "LT",
+        "KOTAKBANK", "BAJFINANCE", "MARUTI", "AXISBANK", "HCLTECH", "SUNPHARMA", "TITAN", "WIPRO", "ADANIENT", "NTPC",
+        "ULTRACEMCO", "TATAMOTORS", "ASIANPAINT", "BAJAJFINSV", "NESTLEIND", "POWERGRID", "ONGC", "COALINDIA", "SBILIFE", "DRREDDY",
+    ],
+}
+
+def _fetch_universe_items(symbols: list, market: str) -> list:
+    """Fetch price data for a list of symbols in a single thread."""
     items = []
-    for symbol in TOP_ASX200_SYMBOLS:
-        stock_data = get_stock_data(symbol)
-        items.append(
-            {
-                "symbol": symbol,
-                "name": stock_data["name"],
-                "current_price": round(stock_data["current_price"], 2),
-                "change_percent": round(stock_data["change_percent"], 2),
-            }
-        )
+    for symbol in symbols:
+        data = get_stock_data(symbol, market)
+        items.append({
+            "symbol": symbol,
+            "name": data["name"],
+            "current_price": round(data["current_price"], 2),
+            "change_percent": round(data["change_percent"], 2),
+        })
+    return items
+
+
+@app.get("/api/universe/top")
+async def get_top_universe(market: str = "AU", current_user: dict = Depends(get_current_user)):
+    del current_user
+    m = (market or "AU").upper()
+    symbols = TOP_SYMBOLS_BY_MARKET.get(m, TOP_SYMBOLS_BY_MARKET["AU"])
+    # Run blocking yfinance calls in a background thread to free the event loop
+    items = await asyncio.to_thread(_fetch_universe_items, symbols, m)
     return {"items": items}
 
 
@@ -2035,7 +4851,7 @@ async def ai_suggest_shares(payload: AISuggestRequest, current_user: dict = Depe
         "query": payload.query,
         "provider_used": provider_used,
         "symbols": symbols,
-        "items": [{"symbol": symbol, "name": ASX_COMPANIES[symbol]} for symbol in symbols],
+        "items": [{"symbol": symbol, "name": ASX_COMPANIES.get(symbol, symbol)} for symbol in symbols],
     }
 
 
@@ -2081,13 +4897,13 @@ Be detailed and specific. This is for educational purposes only."""
                         {"role": "system", "content": "You are a professional market analyst providing detailed insights."},
                         {"role": "user", "content": prompt}
                     ],
-                    "max_tokens": 500,
-                    "temperature": 0.7
+                    "max_tokens": 1200,
+                    "temperature": 0.3
                 },
-                timeout=60
+                timeout=90
             )
             if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content']
+                return strip_think_tags(response.json()['choices'][0]['message']['content'])
         except:
             pass
         return None
@@ -2102,10 +4918,10 @@ Be detailed and specific. This is for educational purposes only."""
                     {"role": "system", "content": "You are a professional market analyst providing detailed insights."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=500,
-                temperature=0.7
+                max_tokens=1200,
+                temperature=0.3
             )
-            return response.choices[0].message.content
+            return strip_think_tags(response.choices[0].message.content)
         except:
             return None
     
@@ -2131,7 +4947,8 @@ async def get_sentiment_analysis(payload: SentimentRequest, current_user: dict =
     symbol = payload.symbol.upper().strip()
     
     # Get stock news from yfinance
-    ticker = yf.Ticker(f"{symbol}.AX")
+    market = detect_market(symbol)
+    ticker = yf.Ticker(format_ticker(symbol, market))
     news_items = []
     
     try:
@@ -2178,13 +4995,13 @@ Return JSON format:
                         {"role": "system", "content": "You are a financial sentiment analyst. Return strict JSON only."},
                         {"role": "user", "content": prompt}
                     ],
-                    "max_tokens": 300,
+                    "max_tokens": 800,
                     "temperature": 0.3
                 },
-                timeout=60
+                timeout=90
             )
             if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content']
+                return strip_think_tags(response.json()['choices'][0]['message']['content'])
         except:
             pass
         return None
@@ -2211,8 +5028,7 @@ Return JSON format:
             result = try_local()
             if result:
                 try:
-                    import json
-                    sentiment_result = json.loads(result)
+                    sentiment_result = json.loads(extract_json_from_llm(result) or result)
                 except:
                     sentiment_result = {"sentiment": "neutral", "score": 0.0, "themes": [], "summary": result[:200]}
                 break
@@ -2220,7 +5036,6 @@ Return JSON format:
             result = try_openai()
             if result:
                 try:
-                    import json
                     sentiment_result = json.loads(result)
                 except:
                     sentiment_result = {"sentiment": "neutral", "score": 0.0, "themes": [], "summary": result[:200]}
@@ -2242,7 +5057,7 @@ async def rank_symbols(payload: RankRequest, current_user: dict = Depends(get_cu
     ranked = []
     for symbol in payload.symbols:
         symbol_clean = symbol.upper().strip()
-        if symbol_clean not in ASX_COMPANIES:
+        if symbol_clean not in ALL_COMPANIES:
             continue
         try:
             ranked.append(get_probability_and_score(symbol_clean))
@@ -2545,11 +5360,11 @@ Do not give buy/sell advice."""
             r = requests.post(
                 f"{LOCAL_LLM_URL}/chat/completions",
                 json={"model": LOCAL_LLM_MODEL, "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": 600, "temperature": 0.2},
-                timeout=90,
+                      "max_tokens": 1500, "temperature": 0.2},
+                timeout=120,
             )
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
+                return strip_think_tags(r.json()["choices"][0]["message"]["content"])
         except Exception:
             pass
         return None
@@ -2580,9 +5395,10 @@ Do not give buy/sell advice."""
                 "rebalancing_actions": [], "scenarios": {}}
 
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        result = json.loads(raw[start:end]) if start >= 0 else {}
+        cleaned = extract_json_from_llm(raw) or raw
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        result = json.loads(cleaned[start:end]) if start >= 0 else {}
     except Exception:
         result = {"summary": raw[:500]}
     return result
@@ -2650,11 +5466,11 @@ async def suggest_portfolio(
                     json={"model": LOCAL_LLM_MODEL,
                           "messages": [{"role": "system", "content": "Output strict JSON only."},
                                        {"role": "user", "content": prompt}],
-                          "max_tokens": 400, "temperature": 0.2},
-                    timeout=60,
+                          "max_tokens": 1000, "temperature": 0.2},
+                    timeout=90,
                 )
                 if r.status_code == 200:
-                    content = r.json()["choices"][0]["message"]["content"]
+                    content = strip_think_tags(r.json()["choices"][0]["message"]["content"])
                     s = content.find("{"); e = content.rfind("}") + 1
                     if s >= 0:
                         parsed = json.loads(content[s:e])
@@ -2824,11 +5640,11 @@ async def ai_build_portfolio(
                     json={"model": LOCAL_LLM_MODEL,
                           "messages": [{"role": "system", "content": "Output strict JSON only."},
                                        {"role": "user", "content": prompt}],
-                          "max_tokens": 400, "temperature": 0.2},
-                    timeout=60,
+                          "max_tokens": 1000, "temperature": 0.2},
+                    timeout=90,
                 )
                 if r.status_code == 200:
-                    content = r.json()["choices"][0]["message"]["content"]
+                    content = strip_think_tags(r.json()["choices"][0]["message"]["content"])
                     s = content.find("{"); e = content.rfind("}") + 1
                     if s >= 0:
                         parsed = json.loads(content[s:e])
@@ -2967,6 +5783,3218 @@ async def ai_build_portfolio(
         "sharpe_ratio": round(float(perf[2]), 4),
         "rationale": rationale or f"AI-built {risk_profile} portfolio optimised with Modern Portfolio Theory.",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 6: Weekly Predictions, Crypto Dashboard, ETF Explorer, AI Suggestions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from pycoingecko import CoinGeckoAPI
+    cg = CoinGeckoAPI()
+    COINGECKO_AVAILABLE = True
+except ImportError:
+    cg = None
+    COINGECKO_AVAILABLE = False
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    SCHEDULER_AVAILABLE = False
+
+import time as _time
+import threading
+
+# ── Cache layer ───────────────────────────────────────────────────────────────
+_cache: dict = {}
+_cache_lock = threading.Lock()
+
+def cache_get(key: str, ttl_seconds: int = 300):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and (_time.time() - entry["ts"]) < ttl_seconds:
+            return entry["data"]
+    return None
+
+def cache_set(key: str, data):
+    with _cache_lock:
+        _cache[key] = {"data": data, "ts": _time.time()}
+
+# ── New DB tables ─────────────────────────────────────────────────────────────
+def init_phase6_tables():
+    with db_conn() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS weekly_digests (
+                id TEXT PRIMARY KEY,
+                week_iso VARCHAR(10) NOT NULL,
+                market VARCHAR(5) NOT NULL,
+                category_type VARCHAR(20) NOT NULL,
+                category VARCHAR(50) NOT NULL,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                picks TEXT NOT NULL,
+                ai_summary TEXT,
+                regime VARCHAR(30),
+                UNIQUE(week_iso, market, category_type, category)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS crypto_watchlist (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                coin_id VARCHAR(100) NOT NULL,
+                symbol VARCHAR(20) NOT NULL,
+                name VARCHAR(200),
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT,
+                UNIQUE(user_id, coin_id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS weekly_pick_evaluations (
+                id TEXT PRIMARY KEY,
+                digest_id TEXT NOT NULL,
+                symbol VARCHAR(20) NOT NULL,
+                predicted_change_pct REAL,
+                actual_change_7d_pct REAL,
+                direction_correct INTEGER,
+                evaluated_at TIMESTAMP,
+                UNIQUE(digest_id, symbol),
+                FOREIGN KEY (digest_id) REFERENCES weekly_digests(id)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS wealth_scan_cache (
+                id TEXT PRIMARY KEY,
+                market VARCHAR(5) NOT NULL,
+                scan_mode VARCHAR(20) NOT NULL DEFAULT 'broad',
+                scanned_count INTEGER NOT NULL DEFAULT 0,
+                candidates_found INTEGER NOT NULL DEFAULT 0,
+                picks TEXT NOT NULL,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(market, scan_mode)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS wealth_builder_evaluations (
+                id SERIAL PRIMARY KEY,
+                symbol VARCHAR(20) NOT NULL,
+                market VARCHAR(5) NOT NULL DEFAULT 'AU',
+                wealth_rank NUMERIC(10, 4),
+                score NUMERIC(6, 2),
+                prob_ge_5pct NUMERIC(6, 2),
+                predicted_change_pct NUMERIC(8, 2),
+                price_at_screen NUMERIC(12, 4),
+                actual_return_14d NUMERIC(8, 2),
+                actual_return_30d NUMERIC(8, 2),
+                actual_return_90d NUMERIC(8, 2),
+                actual_peak_return_90d NUMERIC(8, 2),
+                actual_max_drawdown_90d NUMERIC(8, 2),
+                entry_zone VARCHAR(10),
+                screened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                evaluated BOOLEAN DEFAULT FALSE,
+                UNIQUE(symbol, screened_at)
+            )
+        """))
+
+try:
+    init_phase6_tables()
+except Exception:
+    pass
+
+# ── Weekly Universe ───────────────────────────────────────────────────────────
+WEEKLY_UNIVERSE = {
+    "AU": {
+        "large_cap": [
+            "BHP", "CBA", "CSL", "NAB", "WBC", "ANZ", "WES", "MQG",
+            "FMG", "WDS", "TLS", "WOW", "RIO", "COL", "GMG",
+            "TCL", "ALL", "QBE", "STO", "REA", "SUN", "ORG", "WTC",
+        ],
+        "mid_cap": [
+            "XRO", "PME", "COH", "RMD", "JBH", "MIN", "APA",
+            "TWE", "SGP", "HVN", "BXB", "DOW",
+            "TNE", "SUL", "WHC", "ILU", "EVN", "NST",
+            "ASX", "QAN", "ALD", "BSL", "BPT", "AZJ", "BOQ", "CIA",
+            "GQG", "HUB", "MFG", "WOR", "AGL", "OZL", "PPT",
+        ],
+        "small_cap": [
+            "LYC", "PLS", "SYR", "IGO",
+            "LTR", "CXO", "BRN", "NVX", "VUL",
+            "RMS", "WAF", "SBM", "PRU", "DRO",
+            "APX", "BTH", "EOS", "EML",
+            "HLS", "MP1", "Z1P", "NXT", "TLX",
+            "IMU", "PNV", "CLW", "SCP", "SHL",
+            "GMA", "CUV", "IMD", "IDX", "CWY",
+            "DHG", "IEL", "GNC", "ELD", "ING",
+            "NUF", "OML", "CAR", "REH", "ARB",
+        ],
+    },
+    "US": {
+        "large_cap": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B", "JPM", "V"],
+        "mid_cap": ["CRWD", "DDOG", "NET", "SNOW", "PANW", "ZS", "MELI", "SHOP", "SQ", "COIN"],
+        "small_cap": ["SOFI", "PLTR", "RKLB", "IONQ", "APP", "SMCI", "UPST", "AFRM", "HIMS", "DUOL"],
+    },
+    "IN": {
+        "large_cap": [
+            "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BHARTIARTL",
+            "HINDUNILVR", "ITC", "SBIN", "LT", "KOTAKBANK", "BAJFINANCE",
+            "MARUTI", "AXISBANK", "HCLTECH", "SUNPHARMA", "TITAN", "WIPRO",
+            "ADANIENT", "NTPC",
+        ],
+        "mid_cap": [
+            "TRENT", "PERSISTENT", "COFORGE", "POLYCAB", "TATAELXSI", "PIIND",
+            "HAL", "BEL", "PFC", "IRFC", "SIEMENS", "ABB", "DIXON", "MPHASIS",
+            "LTIM", "GODREJCP", "CONCOR", "SBILIFE", "VEDL", "TATAPOWER",
+        ],
+        "small_cap": [
+            "SUZLON", "RVNL", "IRCON", "NHPC", "YESBANK", "ZOMATO",
+            "PAYTM", "JSWENERGY", "CANBK", "FEDERALBNK", "DEEPAKNTR", "SRF",
+            "AUROPHARMA", "BIOCON", "LUPIN", "MRF", "TVSMOTOR", "BATAINDIA",
+            "PRAJIND", "ESCORTS",
+        ],
+    },
+}
+
+SECTOR_MAPPING = {
+    "Energy": {
+        "AU": ["WDS", "STO", "ORG", "WHC", "BPT"],
+        "US": ["XOM", "CVX", "COP", "SLB", "EOG"],
+        "IN": ["RELIANCE", "NTPC", "POWERGRID", "ADANIGREEN", "TATAPOWER"],
+    },
+    "Technology": {
+        "AU": ["XRO", "WTC", "TNE", "MP1", "PME"],
+        "US": ["AAPL", "MSFT", "NVDA", "CRM", "ADBE"],
+        "IN": ["TCS", "INFY", "WIPRO", "HCLTECH", "TECHM"],
+    },
+    "Healthcare": {
+        "AU": ["CSL", "COH", "RMD", "PME", "SHL"],
+        "US": ["UNH", "JNJ", "LLY", "PFE", "ABBV"],
+        "IN": ["SUNPHARMA", "CIPLA", "DRREDDY", "AUROPHARMA", "BIOCON"],
+    },
+    "Financials": {
+        "AU": ["CBA", "NAB", "ANZ", "WBC", "MQG"],
+        "US": ["JPM", "BAC", "GS", "MS", "V"],
+        "IN": ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK"],
+    },
+    "Materials": {
+        "AU": ["BHP", "RIO", "FMG", "MIN", "S32"],
+        "US": ["LIN", "APD", "ECL", "NEM", "FCX"],
+        "IN": ["TATASTEEL", "HINDALCO", "JSWSTEEL", "VEDL", "COALINDIA"],
+    },
+    "Real Estate": {
+        "AU": ["GMG", "SCG", "GPT", "CLW", "MGR"],
+        "US": ["PLD", "AMT", "EQIX", "SPG", "O"],
+        "IN": ["DLF", "GODREJPROP", "OBEROIRLTY", "PRESTIGE", "BRIGADE"],
+    },
+    "Consumer": {
+        "AU": ["WES", "WOW", "COL", "JBH", "HVN"],
+        "US": ["AMZN", "TSLA", "HD", "NKE", "SBUX"],
+        "IN": ["HINDUNILVR", "ITC", "TITAN", "TRENT", "BATAINDIA"],
+    },
+    "Industrials": {
+        "AU": ["TCL", "BXB", "DOW", "QAN", "AZJ"],
+        "US": ["CAT", "DE", "UPS", "BA", "GE"],
+        "IN": ["LT", "SIEMENS", "ABB", "HAL", "BEL"],
+    },
+    "Automobile": {
+        "AU": [],
+        "US": ["TSLA", "F", "GM", "RIVN", "LCID"],
+        "IN": ["MARUTI", "TATAMOTORS", "M&M", "BAJAJ-AUTO", "HEROMOTOCO"],
+    },
+    "Utilities": {
+        "AU": ["APA", "AGL", "ORG"],
+        "US": ["NEE", "DUK", "SO", "D", "AEP"],
+        "IN": ["NTPC", "POWERGRID", "TATAPOWER", "ADANIGREEN", "NHPC"],
+    },
+}
+
+# ── ETF Universe ──────────────────────────────────────────────────────────────
+ETF_UNIVERSE = {
+    "AU_broad": {
+        "VAS.AX": "Vanguard Australian Shares Index",
+        "A200.AX": "Betashares ASX 200",
+        "IOZ.AX": "iShares Core S&P/ASX 200",
+        "STW.AX": "SPDR S&P/ASX 200",
+        "VLC.AX": "Vanguard Large Cap",
+        "VSO.AX": "Vanguard Small Companies",
+        "MVW.AX": "VanEck Equal Weight",
+    },
+    "AU_international": {
+        "VGS.AX": "Vanguard MSCI International",
+        "IVV.AX": "iShares S&P 500",
+        "NDQ.AX": "Betashares NASDAQ 100",
+        "VDHG.AX": "Vanguard Diversified High Growth",
+        "DHHF.AX": "Betashares Diversified All Growth",
+        "HACK.AX": "Betashares Global Cybersecurity",
+        "ASIA.AX": "Betashares Asia Technology Tigers",
+    },
+    "AU_thematic": {
+        "ATEC.AX": "Betashares S&P/ASX Technology",
+        "CLNE.AX": "Betashares Climate Innovation",
+        "ACDC.AX": "Betashares Battery Tech & Lithium",
+        "DRIV.AX": "Betashares Electric Vehicles",
+        "RBTZ.AX": "Betashares Robotics & AI",
+        "SEMI.AX": "Betashares Global Semiconductors",
+        "BNKS.AX": "Betashares Global Banks",
+    },
+    "AU_income": {
+        "VHY.AX": "Vanguard High Yield",
+        "SYI.AX": "Betashares High Income",
+        "REIT.AX": "Betashares Australian Property",
+    },
+    "US_major": {
+        "SPY": "SPDR S&P 500",
+        "QQQ": "Invesco NASDAQ 100",
+        "VTI": "Vanguard Total Stock Market",
+        "IWM": "iShares Russell 2000",
+        "DIA": "SPDR Dow Jones",
+        "ARKK": "ARK Innovation",
+    },
+    "US_sector": {
+        "XLF": "Financial Select SPDR",
+        "XLK": "Technology Select SPDR",
+        "XLE": "Energy Select SPDR",
+        "XLV": "Health Care Select SPDR",
+        "XLI": "Industrial Select SPDR",
+        "XLRE": "Real Estate Select SPDR",
+        "XLP": "Consumer Staples SPDR",
+    },
+    "US_thematic": {
+        "SOXX": "iShares Semiconductor",
+        "BOTZ": "Global Robotics & AI",
+        "TAN": "Invesco Solar",
+        "LIT": "Global Lithium & Battery",
+        "HACK": "ETFMG Prime Cyber Security",
+    },
+    "US_bond": {
+        "BND": "Vanguard Total Bond",
+        "TLT": "iShares 20+ Year Treasury",
+        "HYG": "iShares High Yield Corporate",
+        "AGG": "iShares Core U.S. Aggregate Bond",
+    },
+    "US_commodity": {
+        "GLD": "SPDR Gold Trust",
+        "SLV": "iShares Silver Trust",
+        "USO": "United States Oil Fund",
+    },
+    "IN_broad": {
+        "NIFTYBEES.NS": "Nippon Nifty 50 ETF",
+        "BANKBEES.NS": "Nippon Bank Nifty ETF",
+        "JUNIORBEES.NS": "Nippon Nifty Next 50 ETF",
+        "SETFNIF50.NS": "SBI Nifty 50 ETF",
+        "ICICNIFTY.NS": "ICICI Nifty 50 ETF",
+    },
+    "IN_sector": {
+        "SETFNIFBK.NS": "SBI Nifty Bank ETF",
+        "ITBEES.NS": "Nippon Nifty IT ETF",
+        "PHARMABEES.NS": "Nippon Nifty Pharma ETF",
+        "INFRABEES.NS": "Nippon Nifty Infra ETF",
+        "PSUBNKBEES.NS": "Nippon Nifty PSU Bank ETF",
+    },
+    "IN_gold": {
+        "GOLDBEES.NS": "Nippon Gold ETF",
+        "GOLDSHARE.NS": "UTI Gold ETF",
+    },
+    "IN_thematic": {
+        "MOM50.NS": "Motilal Oswal Midcap 50 ETF",
+        "MON100.NS": "Motilal Oswal NASDAQ 100 ETF",
+    },
+}
+
+# ── Crypto categories ─────────────────────────────────────────────────────────
+CRYPTO_CATEGORIES = {
+    "blue_chip": ["bitcoin", "ethereum", "solana", "cardano", "avalanche-2"],
+    "layer2": ["polygon-ecosystem-token", "arbitrum", "optimism", "starknet"],
+    "defi": ["uniswap", "aave", "maker", "lido-dao", "curve-dao-token"],
+    "ai_tokens": ["render-token", "fetch-ai", "ocean-protocol", "singularitynet", "akash-network"],
+    "meme": ["dogecoin", "shiba-inu", "pepe", "bonk", "floki"],
+    "gaming": ["immutable-x", "the-sandbox", "axie-infinity", "gala"],
+    "infrastructure": ["chainlink", "polkadot", "cosmos", "near", "internet-computer"],
+    "exchange": ["binancecoin", "crypto-com-chain", "okb"],
+}
+
+# ── Weekly helpers ────────────────────────────────────────────────────────────
+def get_current_iso_week() -> str:
+    now = datetime.utcnow()
+    return f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+
+
+def score_and_rank(symbols: list, market: str) -> list:
+    """Score a batch of symbols using existing ensemble engine with explicit market."""
+    results = []
+    for sym in symbols:
+        try:
+            # Pass market explicitly so symbols not in ASX/US/IN dicts work correctly
+            stock_data = get_stock_data(sym, market=market)
+            hist = get_historical_data(sym, period="1y", market=market)
+            if len(hist) < 60:
+                continue
+
+            current_price = stock_data["current_price"] or float(hist["Close"].iloc[-1])
+            if not current_price:
+                continue
+
+            indicators = calculate_technical_indicators(hist)
+            prediction = generate_statistical_prediction(hist, current_price)
+
+            mu = prediction["change_from_current"] / 100.0
+            daily_vol = float(hist["Close"].pct_change().dropna().std())
+            sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
+            z = (0.05 - mu) / sigma_63
+            prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
+
+            trend = prediction["trend"]
+            trend_score = 0.9 if trend == "bullish" else 0.55 if trend == "neutral" else 0.2
+
+            rsi = indicators.get("rsi", 50)
+            momentum = indicators.get("momentum_20", 0)
+            quality_score = max(0.0, min(1.0, (1 - abs(rsi - 55) / 55) * 0.6 + (0.5 + momentum / 40) * 0.4))
+            regime_fit = 0.65 if trend == "bullish" else 0.45 if trend == "neutral" else 0.3
+            avg_vol = float(hist["Volume"].tail(20).mean()) if "Volume" in hist else 1_000_000
+            liquidity_score = max(0.1, min(1.0, avg_vol / 8_000_000))
+
+            score = (
+                0.45 * prob_ge_5pct
+                + 0.20 * trend_score
+                + 0.15 * quality_score
+                + 0.10 * regime_fit
+                + 0.10 * liquidity_score
+            ) * 100
+
+            results.append({
+                "symbol": sym,
+                "name": stock_data.get("name", sym),
+                "current_price": round(float(current_price), 2),
+                "predicted_price_3m": prediction.get("predicted_price"),
+                "expected_return_3m_pct": round(prediction["change_from_current"], 2),
+                "prob_ge_5pct": round(prob_ge_5pct * 100, 2),
+                "trend": trend,
+                "score": round(score, 2),
+                "market": market,
+                "cap_tier": None,
+            })
+        except Exception:
+            continue
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+def get_llm_pick_summary(pick: dict, sector: str = "", cap_tier: str = "") -> str:
+    """Get a 2-3 sentence LLM summary for a weekly pick."""
+    prompt = (
+        f"You are a financial data analyst. Do not give buy/sell advice.\n"
+        f"Stock: {pick['symbol']} ({pick['name']})\n"
+        f"Sector: {sector} | Market Cap Tier: {cap_tier}\n"
+        f"Current Price: ${pick['current_price']} | Score: {pick['score']}/100\n"
+        f"Expected Return 3m: {pick['expected_return_3m_pct']}% | Trend: {pick['trend']}\n\n"
+        f"In 2-3 sentences, explain why this stock ranks well this week. "
+        f"Mention the key driver and primary risk."
+    )
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Financial analyst. Brief factual output."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 500, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    return strip_think_tags(r.json()["choices"][0]["message"]["content"]).strip()
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Financial analyst. Brief factual output."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=150, temperature=0.3,
+                )
+                return (r.choices[0].message.content or "").strip()
+        except Exception:
+            continue
+    return f"{pick['symbol']} scores {pick['score']}/100 with {pick['trend']} trend."
+
+
+def generate_weekly_digest_for_market(market: str) -> dict:
+    """Generate all weekly picks for a given market."""
+    week = get_current_iso_week()
+    digest = {
+        "week": week,
+        "market": market,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+    universe = WEEKLY_UNIVERSE.get(market, {})
+
+    # By market cap tier
+    for tier in ["large_cap", "mid_cap", "small_cap"]:
+        symbols = universe.get(tier, [])
+        if not symbols:
+            continue
+        scored = score_and_rank(symbols, market)
+        top5 = scored[:5]
+        for pick in top5:
+            pick["llm_summary"] = get_llm_pick_summary(pick, cap_tier=tier)
+        digest[f"stocks_{tier}"] = top5
+
+        # Store to DB
+        try:
+            with db_conn() as conn:
+                did = str(uuid4())
+                conn.execute(text("""
+                    INSERT INTO weekly_digests (id, week_iso, market, category_type, category, picks, regime)
+                    VALUES (:id, :week, :market, 'market_cap', :cat, :picks, :regime)
+                    ON CONFLICT (week_iso, market, category_type, category) DO UPDATE
+                    SET picks = :picks, generated_at = CURRENT_TIMESTAMP, regime = :regime
+                """), {"id": did, "week": week, "market": market, "cat": tier,
+                       "picks": json.dumps(top5), "regime": ""})
+        except Exception:
+            pass
+
+    # By sector
+    for sector, tickers_by_market in SECTOR_MAPPING.items():
+        symbols = tickers_by_market.get(market, [])
+        if not symbols:
+            continue
+        scored = score_and_rank(symbols, market)
+        top5 = scored[:5]
+        for pick in top5:
+            pick["llm_summary"] = get_llm_pick_summary(pick, sector=sector)
+        digest[f"sector_{sector.lower().replace(' ', '_')}"] = top5
+
+        try:
+            with db_conn() as conn:
+                did = str(uuid4())
+                conn.execute(text("""
+                    INSERT INTO weekly_digests (id, week_iso, market, category_type, category, picks, regime)
+                    VALUES (:id, :week, :market, 'sector', :cat, :picks, :regime)
+                    ON CONFLICT (week_iso, market, category_type, category) DO UPDATE
+                    SET picks = :picks, generated_at = CURRENT_TIMESTAMP, regime = :regime
+                """), {"id": did, "week": week, "market": market, "cat": sector,
+                       "picks": json.dumps(top5), "regime": ""})
+        except Exception:
+            pass
+
+    return digest
+
+
+# ── Weekly Prediction Endpoints ───────────────────────────────────────────────
+
+class WeeklyGenerateRequest(BaseModel):
+    market: str = "AU"
+
+@app.get("/api/weekly/latest")
+async def weekly_latest(market: str = "AU", current_user: dict = Depends(get_current_user)):
+    """Get latest weekly digest (cached, regenerated Mondays)."""
+    del current_user
+    m = (market or "AU").upper()
+    week = get_current_iso_week()
+
+    cached = cache_get(f"weekly_{m}_{week}", ttl_seconds=3600)
+    if cached:
+        return cached
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT category_type, category, picks, ai_summary, regime
+            FROM weekly_digests WHERE week_iso = :week AND market = :market
+            ORDER BY category_type, category
+        """), {"week": week, "market": m}).fetchall()
+
+    if not rows:
+        return {"week": week, "market": m, "status": "not_generated",
+                "message": "No picks generated yet for this week. Use POST /api/weekly/generate to create them."}
+
+    result = {"week": week, "market": m, "picks_by_cap": {}, "picks_by_sector": {}}
+    for row in rows:
+        cat_type, cat, picks_json, summary, regime = row
+        picks = json.loads(picks_json) if isinstance(picks_json, str) else picks_json
+        if cat_type == "market_cap":
+            result["picks_by_cap"][cat] = {"picks": picks, "ai_summary": summary}
+        else:
+            result["picks_by_sector"][cat] = {"picks": picks, "ai_summary": summary}
+
+    cache_set(f"weekly_{m}_{week}", result)
+    return result
+
+
+@app.get("/api/weekly/picks")
+async def weekly_picks(market: str = "AU", category: str = "market_cap", tier: str = None, sector: str = None, current_user: dict = Depends(get_current_user)):
+    """Get top 5 for specific category/tier/sector."""
+    del current_user
+    m = (market or "AU").upper()
+    week = get_current_iso_week()
+
+    cat_type = category.lower()
+    cat_value = tier if cat_type == "market_cap" else sector
+    if not cat_value:
+        raise HTTPException(status_code=400, detail="Specify 'tier' for market_cap or 'sector' for sector category")
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT picks, ai_summary FROM weekly_digests
+            WHERE week_iso = :week AND market = :market AND category_type = :cat_type AND category = :cat
+        """), {"week": week, "market": m, "cat_type": cat_type, "cat": cat_value}).fetchone()
+
+    if not row:
+        return {"week": week, "market": m, "category_type": cat_type, "category": cat_value, "picks": []}
+
+    return {
+        "week": week, "market": m, "category_type": cat_type, "category": cat_value,
+        "picks": json.loads(row[0]) if isinstance(row[0], str) else row[0],
+        "ai_summary": row[1],
+    }
+
+
+@app.post("/api/weekly/generate")
+async def weekly_generate(payload: WeeklyGenerateRequest, current_user: dict = Depends(get_current_user)):
+    """Force regeneration of weekly picks for a market."""
+    del current_user
+    m = (payload.market or "AU").upper()
+    if m not in WEEKLY_UNIVERSE:
+        raise HTTPException(status_code=400, detail=f"Unknown market: {m}. Use AU, US, or IN.")
+    digest = generate_weekly_digest_for_market(m)
+    return {"status": "generated", "market": m, "week": digest["week"],
+            "cap_tiers": [k for k in digest if k.startswith("stocks_")],
+            "sectors": [k for k in digest if k.startswith("sector_")]}
+
+
+@app.get("/api/weekly/history")
+async def weekly_history(market: str = "AU", weeks: int = 4, current_user: dict = Depends(get_current_user)):
+    del current_user
+    m = (market or "AU").upper()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT week_iso FROM weekly_digests
+            WHERE market = :market ORDER BY week_iso DESC LIMIT :lim
+        """), {"market": m, "lim": weeks}).fetchall()
+    return {"market": m, "weeks": [r[0] for r in rows]}
+
+
+@app.get("/api/weekly/accuracy")
+async def weekly_accuracy(market: str = "AU", current_user: dict = Depends(get_current_user)):
+    del current_user
+    m = (market or "AU").upper()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT e.symbol, e.predicted_change_pct, e.actual_change_7d_pct, e.direction_correct
+            FROM weekly_pick_evaluations e
+            JOIN weekly_digests d ON d.id = e.digest_id
+            WHERE d.market = :market AND e.actual_change_7d_pct IS NOT NULL
+            ORDER BY e.evaluated_at DESC LIMIT 50
+        """), {"market": m}).fetchall()
+
+    if not rows:
+        return {"market": m, "evaluations": [], "summary": {}}
+
+    evals = [{"symbol": r[0], "predicted": r[1], "actual": r[2], "direction_correct": bool(r[3])} for r in rows]
+    dir_acc = sum(1 for r in rows if r[3]) / len(rows) * 100
+    return {
+        "market": m,
+        "evaluations": evals,
+        "summary": {"total": len(evals), "direction_accuracy_pct": round(dir_acc, 2)},
+    }
+
+
+@app.get("/api/weekly/sectors")
+async def weekly_sectors():
+    """Return available sectors with per-market tickers."""
+    return {"sectors": {k: list(v.keys()) for k, v in SECTOR_MAPPING.items()}}
+
+
+# ── Crypto Endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/api/crypto/market")
+async def crypto_market(vs_currency: str = "usd", current_user: dict = Depends(get_current_user)):
+    """Top 20 coins + global stats + fear & greed."""
+    del current_user
+    ck = f"crypto_market_{vs_currency}"
+    cached = cache_get(ck, ttl_seconds=300)
+    if cached:
+        return cached
+
+    result = {"coins": [], "global_stats": {}, "fear_greed": {}}
+
+    # Top 20 from CoinGecko
+    if COINGECKO_AVAILABLE:
+        try:
+            coins = cg.get_coins_markets(
+                vs_currency=vs_currency, order="market_cap_desc",
+                per_page=20, page=1, sparkline=True,
+                price_change_percentage="24h,7d,30d",
+            )
+            result["coins"] = [
+                {
+                    "id": c["id"], "symbol": c["symbol"], "name": c["name"],
+                    "image": c.get("image", ""),
+                    "current_price": c.get("current_price"),
+                    "market_cap": c.get("market_cap"),
+                    "market_cap_rank": c.get("market_cap_rank"),
+                    "total_volume": c.get("total_volume"),
+                    "price_change_24h_pct": c.get("price_change_percentage_24h_in_currency"),
+                    "price_change_7d_pct": c.get("price_change_percentage_7d_in_currency"),
+                    "price_change_30d_pct": c.get("price_change_percentage_30d_in_currency"),
+                    "sparkline_7d": c.get("sparkline_in_7d", {}).get("price", []),
+                }
+                for c in coins
+            ]
+        except Exception:
+            pass
+
+        try:
+            g = cg.get_global()
+            result["global_stats"] = {
+                "total_market_cap": g.get("data", {}).get("total_market_cap", {}).get(vs_currency),
+                "total_volume": g.get("data", {}).get("total_volume", {}).get(vs_currency),
+                "btc_dominance": g.get("data", {}).get("market_cap_percentage", {}).get("btc"),
+                "eth_dominance": g.get("data", {}).get("market_cap_percentage", {}).get("eth"),
+                "active_cryptos": g.get("data", {}).get("active_cryptocurrencies"),
+            }
+        except Exception:
+            pass
+    else:
+        # Fallback: use yfinance for major cryptos
+        for sym, name in [("BTC-USD", "Bitcoin"), ("ETH-USD", "Ethereum"), ("SOL-USD", "Solana")]:
+            try:
+                tk = yf.Ticker(sym)
+                h = tk.history(period="7d")
+                if len(h) > 0:
+                    result["coins"].append({
+                        "id": name.lower(), "symbol": sym.split("-")[0].lower(), "name": name,
+                        "current_price": round(float(h["Close"].iloc[-1]), 2),
+                        "price_change_24h_pct": round(float(h["Close"].pct_change().iloc[-1] * 100), 2) if len(h) >= 2 else 0,
+                    })
+            except Exception:
+                continue
+
+    # Fear & Greed Index
+    try:
+        fng_url = os.getenv("FEAR_GREED_API_URL", "https://api.alternative.me/fng/")
+        fng_resp = requests.get(fng_url, timeout=10)
+        if fng_resp.status_code == 200:
+            fng_data = fng_resp.json().get("data", [{}])[0]
+            result["fear_greed"] = {
+                "value": int(fng_data.get("value", 0)),
+                "label": fng_data.get("value_classification", ""),
+                "timestamp": fng_data.get("timestamp", ""),
+            }
+    except Exception:
+        pass
+
+    cache_set(ck, result)
+    return result
+
+
+@app.get("/api/crypto/search")
+async def crypto_search(q: str, current_user: dict = Depends(get_current_user)):
+    del current_user
+    if not COINGECKO_AVAILABLE:
+        raise HTTPException(status_code=501, detail="CoinGecko not available")
+    try:
+        results = cg.search(query=q)
+        coins = results.get("coins", [])[:10]
+        return {"results": [{"id": c["id"], "symbol": c["symbol"], "name": c["name"],
+                             "market_cap_rank": c.get("market_cap_rank"),
+                             "thumb": c.get("thumb", "")} for c in coins]}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/crypto/{coin_id}")
+async def crypto_detail(coin_id: str, vs_currency: str = "usd", current_user: dict = Depends(get_current_user)):
+    del current_user
+    ck = f"crypto_detail_{coin_id}_{vs_currency}"
+    cached = cache_get(ck, ttl_seconds=600)
+    if cached:
+        return cached
+
+    if not COINGECKO_AVAILABLE:
+        raise HTTPException(status_code=501, detail="CoinGecko not available")
+
+    try:
+        coin = cg.get_coin_by_id(id=coin_id, localization=False, tickers=False,
+                                  community_data=False, developer_data=False)
+        md = coin.get("market_data", {})
+        result = {
+            "id": coin["id"], "symbol": coin["symbol"], "name": coin["name"],
+            "description": (coin.get("description", {}).get("en", "") or "")[:500],
+            "image": coin.get("image", {}).get("large", ""),
+            "current_price": md.get("current_price", {}).get(vs_currency),
+            "market_cap": md.get("market_cap", {}).get(vs_currency),
+            "market_cap_rank": md.get("market_cap_rank"),
+            "total_volume": md.get("total_volume", {}).get(vs_currency),
+            "high_24h": md.get("high_24h", {}).get(vs_currency),
+            "low_24h": md.get("low_24h", {}).get(vs_currency),
+            "price_change_24h_pct": md.get("price_change_percentage_24h"),
+            "price_change_7d_pct": md.get("price_change_percentage_7d"),
+            "price_change_30d_pct": md.get("price_change_percentage_30d"),
+            "ath": md.get("ath", {}).get(vs_currency),
+            "ath_change_pct": md.get("ath_change_percentage", {}).get(vs_currency),
+            "categories": coin.get("categories", []),
+        }
+        cache_set(ck, result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/crypto/{coin_id}/chart")
+async def crypto_chart(coin_id: str, days: int = 90, vs_currency: str = "usd", current_user: dict = Depends(get_current_user)):
+    del current_user
+    days = min(max(1, days), 365)
+    ck = f"crypto_chart_{coin_id}_{days}_{vs_currency}"
+    cached = cache_get(ck, ttl_seconds=600)
+    if cached:
+        return cached
+
+    if not COINGECKO_AVAILABLE:
+        raise HTTPException(status_code=501, detail="CoinGecko not available")
+
+    try:
+        data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency=vs_currency, days=days)
+        prices = [{"ts": p[0], "price": p[1]} for p in data.get("prices", [])]
+        volumes = [{"ts": v[0], "volume": v[1]} for v in data.get("total_volumes", [])]
+        result = {"coin_id": coin_id, "days": days, "vs_currency": vs_currency,
+                  "prices": prices, "volumes": volumes}
+        cache_set(ck, result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/crypto/{coin_id}/analyze")
+async def crypto_analyze(coin_id: str, vs_currency: str = "usd", current_user: dict = Depends(get_current_user)):
+    """LLM analysis of a specific coin."""
+    del current_user
+    # Get coin data first
+    if not COINGECKO_AVAILABLE:
+        raise HTTPException(status_code=501, detail="CoinGecko not available")
+
+    try:
+        coin = cg.get_coin_by_id(id=coin_id, localization=False, tickers=False,
+                                  community_data=False, developer_data=False)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Coin {coin_id} not found")
+
+    md = coin.get("market_data", {})
+    prompt = (
+        f"You are a cryptocurrency analyst. Do not give buy/sell advice.\n"
+        f"Coin: {coin['name']} ({coin['symbol'].upper()})\n"
+        f"Price: {md.get('current_price', {}).get(vs_currency, 'N/A')}\n"
+        f"Market Cap Rank: #{md.get('market_cap_rank', 'N/A')}\n"
+        f"24h: {md.get('price_change_percentage_24h', 0):.2f}% | "
+        f"7d: {md.get('price_change_percentage_7d', 0):.2f}% | "
+        f"30d: {md.get('price_change_percentage_30d', 0):.2f}%\n"
+        f"Categories: {', '.join(coin.get('categories', [])[:5])}\n\n"
+        f"In 3-4 sentences, analyze current momentum and key catalysts. Note the primary risk."
+    )
+
+    analysis = ""
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Crypto analyst. Brief factual output."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 600, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    analysis = strip_think_tags(r.json()["choices"][0]["message"]["content"]).strip()
+                    break
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Crypto analyst. Brief factual output."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=200, temperature=0.3,
+                )
+                analysis = (r.choices[0].message.content or "").strip()
+                break
+        except Exception:
+            continue
+
+    return {
+        "coin_id": coin_id, "name": coin["name"], "symbol": coin["symbol"],
+        "analysis": analysis or "Analysis unavailable — LLM providers are offline.",
+    }
+
+
+@app.get("/api/crypto/categories")
+async def crypto_categories(current_user: dict = Depends(get_current_user)):
+    """Return crypto category definitions."""
+    del current_user
+    return {"categories": CRYPTO_CATEGORIES}
+
+
+@app.post("/api/crypto/watchlist")
+async def crypto_watchlist_add(coin_id: str, symbol: str, name: str = "", current_user: dict = Depends(get_current_user)):
+    wid = str(uuid4())
+    try:
+        with db_conn() as conn:
+            conn.execute(text("""
+                INSERT INTO crypto_watchlist (id, user_id, coin_id, symbol, name)
+                VALUES (:id, :uid, :cid, :sym, :name)
+                ON CONFLICT (user_id, coin_id) DO NOTHING
+            """), {"id": wid, "uid": current_user["id"], "cid": coin_id, "sym": symbol, "name": name})
+        return {"status": "added", "coin_id": coin_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/crypto/watchlist")
+async def crypto_watchlist_get(current_user: dict = Depends(get_current_user)):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT coin_id, symbol, name, added_at FROM crypto_watchlist
+            WHERE user_id = :uid ORDER BY added_at DESC
+        """), {"uid": current_user["id"]}).fetchall()
+
+    items = [{"coin_id": r[0], "symbol": r[1], "name": r[2], "added_at": r[3].isoformat() if r[3] else None}
+             for r in rows]
+
+    # Enrich with live prices if CoinGecko available
+    if COINGECKO_AVAILABLE and items:
+        try:
+            ids = ",".join(i["coin_id"] for i in items)
+            prices = cg.get_price(ids=ids, vs_currencies="usd,inr",
+                                   include_24hr_change=True)
+            for item in items:
+                pd_data = prices.get(item["coin_id"], {})
+                item["price_usd"] = pd_data.get("usd")
+                item["price_inr"] = pd_data.get("inr")
+                item["change_24h_pct"] = pd_data.get("usd_24h_change")
+        except Exception:
+            pass
+
+    return {"watchlist": items}
+
+
+@app.delete("/api/crypto/watchlist/{coin_id}")
+async def crypto_watchlist_remove(coin_id: str, current_user: dict = Depends(get_current_user)):
+    with db_conn() as conn:
+        conn.execute(text("DELETE FROM crypto_watchlist WHERE user_id = :uid AND coin_id = :cid"),
+                     {"uid": current_user["id"], "cid": coin_id})
+    return {"status": "removed", "coin_id": coin_id}
+
+
+# ── ETF Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/api/etf/list")
+async def etf_list(market: str = None, category: str = None, current_user: dict = Depends(get_current_user)):
+    """List ETFs filtered by market prefix and/or category."""
+    del current_user
+    results = {}
+    for cat_key, etfs in ETF_UNIVERSE.items():
+        # Filter by market prefix (AU_, US_, IN_)
+        if market:
+            m = market.upper()
+            if not cat_key.startswith(m + "_"):
+                continue
+        # Filter by category suffix
+        if category and not cat_key.endswith("_" + category.lower()):
+            continue
+        results[cat_key] = [{"ticker": t, "name": n} for t, n in etfs.items()]
+
+    return {"categories": results}
+
+
+@app.get("/api/etf/search")
+async def etf_search(q: str, current_user: dict = Depends(get_current_user)):
+    del current_user
+    q_lower = q.lower()
+    matches = []
+    for cat_key, etfs in ETF_UNIVERSE.items():
+        for ticker, name in etfs.items():
+            if q_lower in ticker.lower() or q_lower in name.lower():
+                matches.append({"ticker": ticker, "name": name, "category": cat_key})
+    return {"results": matches[:20]}
+
+
+@app.get("/api/etf/{ticker:path}")
+async def etf_detail(ticker: str, current_user: dict = Depends(get_current_user)):
+    """Detailed ETF info using yfinance."""
+    del current_user
+    ck = f"etf_detail_{ticker}"
+    cached = cache_get(ck, ttl_seconds=3600)
+    if cached:
+        return cached
+
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info
+        hist = tk.history(period="1y")
+
+        ytd_start = datetime(datetime.utcnow().year, 1, 1)
+        ytd_data = hist[hist.index >= str(ytd_start)]
+        ytd_return = 0
+        if len(ytd_data) > 0 and len(hist) > 0:
+            first_price = float(ytd_data["Close"].iloc[0])
+            last_price = float(hist["Close"].iloc[-1])
+            ytd_return = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0
+
+        one_year_return = 0
+        if len(hist) > 200:
+            one_year_return = ((float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[0])) / float(hist["Close"].iloc[0])) * 100
+
+        result = {
+            "ticker": ticker,
+            "name": info.get("longName") or info.get("shortName", ticker),
+            "current_price": info.get("regularMarketPrice") or (float(hist["Close"].iloc[-1]) if len(hist) > 0 else None),
+            "expense_ratio": info.get("annualReportExpenseRatio"),
+            "dividend_yield": info.get("yield"),
+            "total_assets": info.get("totalAssets"),
+            "ytd_return_pct": round(ytd_return, 2),
+            "one_year_return_pct": round(one_year_return, 2),
+            "52_week_high": info.get("fiftyTwoWeekHigh"),
+            "52_week_low": info.get("fiftyTwoWeekLow"),
+            "category": info.get("category", ""),
+            "exchange": info.get("exchange", ""),
+        }
+        cache_set(ck, result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"ETF {ticker} not found: {e}")
+
+
+class ETFCompareRequest(BaseModel):
+    tickers: List[str]
+
+@app.post("/api/etf/compare")
+async def etf_compare(payload: ETFCompareRequest, current_user: dict = Depends(get_current_user)):
+    """Side-by-side comparison of 2-4 ETFs."""
+    del current_user
+    tickers = payload.tickers[:4]
+    if len(tickers) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least 2 ETF tickers to compare")
+
+    comparison = []
+    chart_data = {}
+    for ticker in tickers:
+        try:
+            tk = yf.Ticker(ticker)
+            info = tk.info
+            hist = tk.history(period="1y")
+            if len(hist) > 0:
+                # Normalize to 100 for comparison chart
+                normalized = (hist["Close"] / float(hist["Close"].iloc[0])) * 100
+                chart_data[ticker] = [{"date": d.strftime("%Y-%m-%d"), "value": round(float(v), 2)}
+                                       for d, v in normalized.items()]
+            comparison.append({
+                "ticker": ticker,
+                "name": info.get("longName") or info.get("shortName", ticker),
+                "current_price": info.get("regularMarketPrice") or (float(hist["Close"].iloc[-1]) if len(hist) > 0 else None),
+                "expense_ratio": info.get("annualReportExpenseRatio"),
+                "dividend_yield": info.get("yield"),
+                "total_assets": info.get("totalAssets"),
+            })
+        except Exception:
+            comparison.append({"ticker": ticker, "error": "Data unavailable"})
+
+    return {"comparison": comparison, "chart_data": chart_data}
+
+
+class ETFSuggestRequest(BaseModel):
+    risk_profile: str = "balanced"
+    themes: List[str] = []
+    market: str = "AU"
+
+@app.post("/api/etf/suggest")
+async def etf_suggest(payload: ETFSuggestRequest, current_user: dict = Depends(get_current_user)):
+    """AI-powered ETF recommendation."""
+    del current_user
+    m = payload.market.upper()
+
+    # Gather relevant ETFs
+    relevant = {}
+    for cat_key, etfs in ETF_UNIVERSE.items():
+        if cat_key.startswith(m + "_") or cat_key.startswith("US_"):
+            relevant.update(etfs)
+
+    etf_list_text = "\n".join(f"  {t}: {n}" for t, n in list(relevant.items())[:30])
+    themes_text = f"Focus themes: {', '.join(payload.themes)}. " if payload.themes else ""
+
+    prompt = (
+        f"You are an ETF analyst. Do not give buy/sell advice.\n"
+        f"Risk profile: {payload.risk_profile}\n"
+        f"{themes_text}\n"
+        f"Available ETFs:\n{etf_list_text}\n\n"
+        f"Recommend 3-5 ETFs for this risk profile. For each, give ticker and 1 sentence rationale.\n"
+        f"Return JSON: {{\"recommendations\": [{{\"ticker\": \"...\", \"name\": \"...\", \"rationale\": \"...\"}}]}}"
+    )
+
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Output strict JSON only."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 800, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    content = strip_think_tags(r.json()["choices"][0]["message"]["content"])
+                    s = content.find("{"); e = content.rfind("}") + 1
+                    if s >= 0:
+                        return json.loads(content[s:e])
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Output strict JSON only."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=300, temperature=0.3,
+                )
+                content = r.choices[0].message.content or "{}"
+                s = content.find("{"); e = content.rfind("}") + 1
+                if s >= 0:
+                    return json.loads(content[s:e])
+        except Exception:
+            continue
+
+    # Fallback
+    return {"recommendations": [{"ticker": t, "name": n, "rationale": "Suggested based on category match."}
+                                for t, n in list(relevant.items())[:3]]}
+
+
+@app.get("/api/etf/spotlight")
+async def etf_spotlight(current_user: dict = Depends(get_current_user)):
+    """Weekly AI thematic spotlight."""
+    del current_user
+    ck = "etf_spotlight"
+    cached = cache_get(ck, ttl_seconds=3600)
+    if cached:
+        return cached
+
+    snapshot = compute_regime_snapshot()
+    macro = get_macro_indicators()
+
+    prompt = (
+        f"You are an ETF analyst. Do not give buy/sell advice.\n"
+        f"Market Regime: {snapshot['regime']}\n"
+        f"ASX200: {snapshot['asx200_ret']}% | S&P500: {snapshot['sp500_ret']}% | "
+        f"NIFTY: {snapshot['nifty_ret']}% | Gold: {snapshot['gold_ret']}%\n"
+        f"Macro: {json.dumps(macro)}\n\n"
+        f"Pick ONE ETF theme for this week (e.g., semiconductors, gold, energy, bonds).\n"
+        f"In 3-4 sentences explain why. Name 1 AU ETF and 1 US ETF for the theme.\n"
+        f"Return JSON: {{\"theme\": \"...\", \"commentary\": \"...\", \"au_etf\": \"...\", \"us_etf\": \"...\"}}"
+    )
+
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Output strict JSON only."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 800, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    content = strip_think_tags(r.json()["choices"][0]["message"]["content"])
+                    s = content.find("{"); e = content.rfind("}") + 1
+                    if s >= 0:
+                        result = json.loads(content[s:e])
+                        cache_set(ck, result)
+                        return result
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Output strict JSON only."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=250, temperature=0.3,
+                )
+                content = r.choices[0].message.content or "{}"
+                s = content.find("{"); e = content.rfind("}") + 1
+                if s >= 0:
+                    result = json.loads(content[s:e])
+                    cache_set(ck, result)
+                    return result
+        except Exception:
+            continue
+
+    return {"theme": "Broad Market", "commentary": "ETF spotlight unavailable — LLM offline.",
+            "au_etf": "VAS.AX", "us_etf": "SPY"}
+
+
+class IncomeCalcRequest(BaseModel):
+    ticker: str
+    amount: float
+
+@app.post("/api/etf/income-calc")
+async def etf_income_calc(payload: IncomeCalcRequest, current_user: dict = Depends(get_current_user)):
+    """Estimate annual income from dividend ETF."""
+    del current_user
+    try:
+        tk = yf.Ticker(payload.ticker)
+        info = tk.info
+        div_yield = info.get("yield") or 0
+        annual_income = payload.amount * div_yield
+        return {
+            "ticker": payload.ticker,
+            "investment": payload.amount,
+            "dividend_yield_pct": round(div_yield * 100, 2),
+            "estimated_annual_income": round(annual_income, 2),
+            "estimated_monthly_income": round(annual_income / 12, 2),
+        }
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"ETF {payload.ticker} not found")
+
+
+# ── AI Suggestion Engine ──────────────────────────────────────────────────────
+
+@app.get("/api/ai/weekly-summary")
+async def ai_weekly_summary(current_user: dict = Depends(get_current_user)):
+    """Cross-asset weekly AI summary."""
+    del current_user
+    ck = "ai_weekly_summary"
+    cached = cache_get(ck, ttl_seconds=3600)
+    if cached:
+        return cached
+
+    snapshot = compute_regime_snapshot()
+    macro = get_macro_indicators()
+
+    # Get fear & greed
+    fng_val = ""
+    try:
+        fng_resp = requests.get(os.getenv("FEAR_GREED_API_URL", "https://api.alternative.me/fng/"), timeout=5)
+        if fng_resp.status_code == 200:
+            fng_data = fng_resp.json().get("data", [{}])[0]
+            fng_val = f"Crypto Fear & Greed: {fng_data.get('value', '?')} ({fng_data.get('value_classification', '')})"
+    except Exception:
+        pass
+
+    prompt = (
+        f"You are a macro strategist. Do not give buy/sell advice.\n\n"
+        f"Market Regime: {snapshot['regime']}\n"
+        f"ASX200: {snapshot['asx200_ret']}% | S&P500: {snapshot['sp500_ret']}% | "
+        f"NIFTY50: {snapshot['nifty_ret']}% | SENSEX: {snapshot['sensex_ret']}%\n"
+        f"Gold: {snapshot['gold_ret']}% | USD Index: {snapshot['dxy_ret']}%\n"
+        f"Macro: {json.dumps(macro)}\n"
+        f"{fng_val}\n\n"
+        f"Provide a 4-5 sentence weekly market summary covering:\n"
+        f"1. Overall market tone and regime\n"
+        f"2. Key theme driving returns\n"
+        f"3. Which asset classes / sectors look strong\n"
+        f"4. Primary risk to watch this week"
+    )
+
+    summary = ""
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Macro strategist. Brief factual output."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 800, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    summary = strip_think_tags(r.json()["choices"][0]["message"]["content"]).strip()
+                    break
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Macro strategist. Brief factual output."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=300, temperature=0.3,
+                )
+                summary = (r.choices[0].message.content or "").strip()
+                break
+        except Exception:
+            continue
+
+    result = {
+        "week": get_current_iso_week(),
+        "regime": snapshot["regime"],
+        "regime_confidence": snapshot["confidence"],
+        "metrics": {
+            "asx200": snapshot["asx200_ret"],
+            "sp500": snapshot["sp500_ret"],
+            "nifty50": snapshot["nifty_ret"],
+            "sensex": snapshot["sensex_ret"],
+            "gold": snapshot["gold_ret"],
+            "dxy": snapshot["dxy_ret"],
+        },
+        "macro": macro,
+        "summary": summary or "Weekly summary unavailable — LLM providers are offline.",
+    }
+    cache_set(ck, result)
+    return result
+
+
+class AIAskRequest(BaseModel):
+    question: str
+
+
+class HedgeAdviceRequest(BaseModel):
+    symbols: List[str] = []
+    market: str = "AU"
+    send_telegram: bool = False
+    limit: int = 5
+
+
+class DigestRequest(BaseModel):
+    market: str = "AU"
+    send_telegram: bool = False
+    limit: int = 5
+
+
+class TelegramRecipientCreate(BaseModel):
+    chat_id: str
+    label: Optional[str] = None
+
+
+class PaperTradeCreate(BaseModel):
+    symbol: str
+    market: str = "AU"
+    side: str = "LONG"
+    quantity: float = 100
+    notes: Optional[str] = None
+
+
+class PaperTradeClose(BaseModel):
+    notes: Optional[str] = None
+
+
+class PaperTradeUpdate(BaseModel):
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    trailing_stop_pct: Optional[float] = None
+    review_date: Optional[datetime] = None
+    position_stage: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class AdviceActionCreate(BaseModel):
+    symbol: str
+    market: str = "AU"
+    action_type: str = "BUY"
+    quantity: float
+    execution_price: float
+    commission: Optional[float] = None
+    advice_cache_key: Optional[str] = None
+    source_message_type: Optional[str] = "hedge_advice"
+    notes: Optional[str] = None
+
+
+class TelegramActionIngest(BaseModel):
+    chat_id: str
+    symbol: str
+    market: str = "AU"
+    action_type: str = "BUY"
+    quantity: float
+    execution_price: float
+    commission: Optional[float] = None
+    advice_cache_key: Optional[str] = None
+    source_message_type: Optional[str] = "hedge_advice"
+    notes: Optional[str] = None
+    raw_text: Optional[str] = None
+
+
+def _resolve_user_for_chat(chat_id: str) -> tuple[Optional[str], bool]:
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT user_id, updated_at, created_at
+                    FROM user_telegram_recipients
+                    WHERE chat_id = :chat_id AND is_active = 1
+                    ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC
+                    """
+                ),
+                {"chat_id": chat_id},
+            ).fetchall()
+    except Exception:
+        return None, False
+
+    if not rows:
+        return None, False
+    return rows[0][0], len(rows) > 1
+
+
+def _create_advice_action_for_user(
+    *,
+    user_id: str,
+    symbol: str,
+    market: str,
+    action_type: str,
+    quantity: float,
+    execution_price: float,
+    commission: Optional[float],
+    advice_cache_key: Optional[str],
+    source_message_type: Optional[str],
+    notes: Optional[str],
+) -> dict:
+    gross_amount = quantity * execution_price
+    fee = commission
+    if fee is None:
+        fee = _estimate_commission(gross_amount)
+    fee = max(float(fee or 0), 0.0)
+
+    net_amount = gross_amount + fee if action_type in {"BUY", "ADD", "HOLD"} else max(gross_amount - fee, 0.0)
+    row_id = str(uuid4())
+    now = datetime.utcnow()
+
+    with db_conn() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO advice_execution_actions (
+                    id, user_id, symbol, market, action_type, quantity, execution_price,
+                    gross_amount, commission, net_amount, advice_cache_key,
+                    source_message_type, notes, created_at
+                ) VALUES (
+                    :id, :user_id, :symbol, :market, :action_type, :quantity, :execution_price,
+                    :gross_amount, :commission, :net_amount, :advice_cache_key,
+                    :source_message_type, :notes, :created_at
+                )
+                """
+            ),
+            {
+                "id": row_id,
+                "user_id": user_id,
+                "symbol": symbol,
+                "market": market,
+                "action_type": action_type,
+                "quantity": quantity,
+                "execution_price": execution_price,
+                "gross_amount": gross_amount,
+                "commission": fee,
+                "net_amount": net_amount,
+                "advice_cache_key": (advice_cache_key or "").strip() or None,
+                "source_message_type": (source_message_type or "").strip() or None,
+                "notes": (notes or "").strip() or None,
+                "created_at": now,
+            },
+        )
+
+        existing_share = conn.execute(
+            text("SELECT symbol FROM user_shares WHERE user_id = :user_id AND symbol = :symbol"),
+            {"user_id": user_id, "symbol": symbol},
+        ).fetchone()
+        if not existing_share and action_type in {"BUY", "ADD", "HOLD"}:
+            conn.execute(
+                text("INSERT INTO user_shares (user_id, symbol, name) VALUES (:user_id, :symbol, :name)"),
+                {"user_id": user_id, "symbol": symbol, "name": symbol},
+            )
+
+    return {
+        "id": row_id,
+        "symbol": symbol,
+        "action_type": action_type,
+        "quantity": quantity,
+        "execution_price": execution_price,
+        "gross_amount": round(gross_amount, 2),
+        "commission": round(fee, 2),
+        "net_amount": round(net_amount, 2),
+        "holdings": get_user_execution_holdings(user_id),
+    }
+
+@app.post("/api/ai/ask")
+async def ai_ask(payload: AIAskRequest, current_user: dict = Depends(get_current_user)):
+    """General AI Q&A about markets."""
+    del current_user
+    snapshot = compute_regime_snapshot()
+    macro = get_macro_indicators()
+
+    prompt = (
+        f"You are a financial data analyst. Do not give buy/sell advice. "
+        f"Provide factual analysis only.\n\n"
+        f"Current Context:\n"
+        f"Regime: {snapshot['regime']} | ASX200: {snapshot['asx200_ret']}% | "
+        f"S&P500: {snapshot['sp500_ret']}% | NIFTY50: {snapshot['nifty_ret']}% | "
+        f"Gold: {snapshot['gold_ret']}%\n"
+        f"Macro: {json.dumps(macro)}\n\n"
+        f"User Question: {payload.question}"
+    )
+
+    answer = ""
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={"model": LOCAL_LLM_MODEL,
+                          "messages": [{"role": "system", "content": "Financial analyst. Factual, no advice."},
+                                       {"role": "user", "content": prompt}],
+                          "max_tokens": 1000, "temperature": 0.3},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    answer = strip_think_tags(r.json()["choices"][0]["message"]["content"]).strip()
+                    break
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "system", "content": "Financial analyst. Factual, no advice."},
+                               {"role": "user", "content": prompt}],
+                    max_tokens=400, temperature=0.3,
+                )
+                answer = (r.choices[0].message.content or "").strip()
+                break
+        except Exception:
+            continue
+
+    return {"question": payload.question, "answer": answer or "Unable to generate answer — LLM providers offline."}
+
+
+@app.get("/api/telegram/recipients")
+async def telegram_recipients(current_user: dict = Depends(get_current_user)):
+    recipients = get_user_telegram_recipients(current_user["id"])
+    return {
+        "count": len(recipients),
+        "recipients": recipients,
+        "broker_filter": None,
+        "source": "user_scoped",
+        "admin_managed": True,
+    }
+
+
+@app.get("/api/telegram/history")
+async def telegram_history(current_user: dict = Depends(get_current_user)):
+    history = list_recent_telegram_send_log(current_user["id"])
+    return {"items": history}
+
+
+@app.post("/api/telegram/recipients", status_code=201)
+async def create_telegram_recipient(payload: TelegramRecipientCreate, current_user: dict = Depends(get_current_user)):
+    chat_id = str(payload.chat_id or "").strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id is required")
+
+    with db_conn() as conn:
+        existing = conn.execute(
+            text("SELECT id FROM user_telegram_recipients WHERE user_id = :user_id AND chat_id = :chat_id"),
+            {"user_id": current_user["id"], "chat_id": chat_id},
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="This Telegram chat is already linked to your account")
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO user_telegram_recipients (id, user_id, chat_id, label, is_active, created_at, updated_at)
+                VALUES (:id, :user_id, :chat_id, :label, 1, :created_at, :updated_at)
+                """
+            ),
+            {
+                "id": str(uuid4()),
+                "user_id": current_user["id"],
+                "chat_id": chat_id,
+                "label": (payload.label or "").strip() or None,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            },
+        )
+
+    return {"ok": True, "recipients": get_user_telegram_recipients(current_user["id"])}
+
+
+@app.delete("/api/telegram/recipients/{recipient_id}")
+async def delete_telegram_recipient(recipient_id: str, current_user: dict = Depends(get_current_user)):
+    with db_conn() as conn:
+        result = conn.execute(
+            text("DELETE FROM user_telegram_recipients WHERE id = :id AND user_id = :user_id"),
+            {"id": recipient_id, "user_id": current_user["id"]},
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Telegram recipient not found")
+    return {"ok": True}
+
+
+@app.get("/api/positions/history")
+async def position_history(current_user: dict = Depends(get_current_user)):
+    return {"items": list_position_events(current_user["id"])}
+
+
+@app.get("/api/advice/actions")
+async def advice_actions(current_user: dict = Depends(get_current_user)):
+    items = list_advice_execution_actions(current_user["id"], limit=100)
+    holdings = get_user_execution_holdings(current_user["id"])
+    return {
+        "items": items,
+        "holdings": holdings,
+    }
+
+
+@app.post("/api/advice/actions", status_code=201)
+async def record_advice_action(payload: AdviceActionCreate, current_user: dict = Depends(get_current_user)):
+    symbol = str(payload.symbol or "").upper().strip()
+    market = str(payload.market or "AU").upper().strip()
+    action_type = str(payload.action_type or "BUY").upper().strip()
+    quantity = float(payload.quantity or 0)
+    execution_price = float(payload.execution_price or 0)
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    if action_type not in {"BUY", "ADD", "SELL", "REDUCE", "HOLD"}:
+        raise HTTPException(status_code=400, detail="action_type must be BUY, ADD, SELL, REDUCE, or HOLD")
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be greater than zero")
+    if execution_price <= 0:
+        raise HTTPException(status_code=400, detail="execution_price must be greater than zero")
+
+    result = _create_advice_action_for_user(
+        user_id=current_user["id"],
+        symbol=symbol,
+        market=market,
+        action_type=action_type,
+        quantity=quantity,
+        execution_price=execution_price,
+        commission=payload.commission,
+        advice_cache_key=payload.advice_cache_key,
+        source_message_type=payload.source_message_type,
+        notes=payload.notes,
+    )
+
+    return {
+        "ok": True,
+        **result,
+    }
+
+
+@app.post("/api/telegram/action-ingest")
+async def telegram_action_ingest(payload: TelegramActionIngest, request: Request):
+    secret_header = request.headers.get("x-telegram-action-secret", "")
+    if TELEGRAM_ACTION_INGEST_SECRET and not hmac.compare_digest(secret_header, TELEGRAM_ACTION_INGEST_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid ingest secret")
+
+    chat_id = str(payload.chat_id or "").strip()
+    symbol = str(payload.symbol or "").upper().strip()
+    market = str(payload.market or "AU").upper().strip()
+    action_type = str(payload.action_type or "BUY").upper().strip()
+    quantity = float(payload.quantity or 0)
+    execution_price = float(payload.execution_price or 0)
+
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    if action_type not in {"BUY", "ADD", "SELL", "REDUCE", "HOLD"}:
+        raise HTTPException(status_code=400, detail="action_type must be BUY, ADD, SELL, REDUCE, or HOLD")
+    if quantity <= 0 or execution_price <= 0:
+        raise HTTPException(status_code=400, detail="quantity and execution_price must be greater than zero")
+
+    resolved_user_id, ambiguous_chat_mapping = _resolve_user_for_chat(chat_id)
+    if resolved_user_id is None:
+        raise HTTPException(status_code=404, detail="No active user mapping for this Telegram chat")
+
+    notes = (payload.notes or "").strip()
+    if payload.raw_text:
+        notes = (f"{notes} | raw: {payload.raw_text}" if notes else f"raw: {payload.raw_text}")[:500]
+
+    result = _create_advice_action_for_user(
+        user_id=resolved_user_id,
+        symbol=symbol,
+        market=market,
+        action_type=action_type,
+        quantity=quantity,
+        execution_price=execution_price,
+        commission=payload.commission,
+        advice_cache_key=payload.advice_cache_key,
+        source_message_type=payload.source_message_type,
+        notes=notes,
+    )
+    return {
+        "ok": True,
+        "chat_id": chat_id,
+        "user_id": resolved_user_id,
+        "ambiguous_chat_mapping": ambiguous_chat_mapping,
+        **result,
+    }
+
+
+@app.post("/api/ai/hedge-advice")
+async def ai_hedge_advice(payload: HedgeAdviceRequest, current_user: dict = Depends(get_current_user)):
+    advice = get_hedge_advice_cache(current_user["id"], payload.symbols, payload.market, payload.limit)
+    recipients = get_user_telegram_recipients(current_user["id"])
+
+    delivery = {
+        "sent": False,
+        "success_count": 0,
+        "failure_count": 0,
+        "results": [],
+        "error": None,
+    }
+    if payload.send_telegram:
+        delivery = _send_telegram_payload(
+            advice["summary"],
+            recipients,
+            user_id=current_user["id"],
+            message_type="hedge_advice",
+            market=advice["market"],
+            delivery_mode="manual",
+            strategy_dashboard=advice.get("strategy_dashboard"),
+        )
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "market": advice["market"],
+        "summary": advice["summary"],
+        "items": advice["items"],
+        "min_score": advice.get("min_score"),
+        "candidate_count": advice.get("candidate_count"),
+        "analyzed_count": advice.get("analyzed_count"),
+        "qualified_count": advice.get("qualified_count"),
+        "strategy_dashboard": advice.get("strategy_dashboard"),
+        "under_one_selected": advice.get("under_one_selected"),
+        "recipients": recipients,
+        "telegram_sent": delivery["sent"],
+        "telegram_enabled": bool(recipients),
+        "delivery": delivery,
+        "history": list_recent_telegram_send_log(current_user["id"], limit=10),
+        "cache_hit": bool(advice.get("cache_hit")),
+        "holdings_context": advice.get("holdings_context") or get_user_execution_holdings(current_user["id"]),
+    }
+
+
+@app.post("/api/ai/daily-digest")
+async def ai_daily_digest(payload: DigestRequest, current_user: dict = Depends(get_current_user)):
+    digest = get_daily_digest_cache(payload.market, limit=payload.limit)
+    recipients = get_user_telegram_recipients(current_user["id"])
+    digest_key = digest.get("cache_key") or datetime.utcnow().strftime("%Y-%m-%d")
+
+    delivery = {
+        "sent": False,
+        "success_count": 0,
+        "failure_count": 0,
+        "results": [],
+        "error": None,
+    }
+    if payload.send_telegram:
+        if has_digest_been_sent(current_user["id"], digest["market"], digest_key):
+            delivery = {
+                "sent": False,
+                "success_count": 0,
+                "failure_count": 0,
+                "results": [],
+                "error": "Daily digest already auto-sent for this user today. Use history to confirm delivery.",
+            }
+        else:
+            delivery = _send_telegram_payload(
+                digest["summary"],
+                recipients,
+                user_id=current_user["id"],
+                message_type="daily_digest",
+                market=digest["market"],
+                delivery_mode="manual",
+                digest_key=digest_key,
+                strategy_dashboard=digest.get("strategy_dashboard"),
+            )
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "market": digest["market"],
+        "summary": digest["summary"],
+        "items": digest["items"],
+        "breakdown": digest["breakdown"],
+        "strategy_dashboard": digest.get("strategy_dashboard"),
+        "recipients": recipients,
+        "telegram_sent": delivery["sent"],
+        "telegram_enabled": bool(recipients),
+        "delivery": delivery,
+        "history": list_recent_telegram_send_log(current_user["id"], limit=10),
+        "digest_key": digest_key,
+        "cache_hit": bool(digest.get("cache_hit")),
+    }
+
+
+@app.get("/api/paper-trades")
+async def get_paper_trades(current_user: dict = Depends(get_current_user)):
+    return {"items": list_paper_trades(current_user["id"])}
+
+
+@app.post("/api/paper-trades")
+async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Depends(get_current_user)):
+    symbol = payload.symbol.upper().strip()
+    market = (payload.market or "AU").upper().strip()
+    side = (payload.side or "LONG").upper().strip()
+    if side not in {"LONG", "SHORT"}:
+        raise HTTPException(status_code=400, detail="side must be LONG or SHORT")
+
+    stock_data = get_stock_data(symbol, market)
+    current_price = float(stock_data.get("current_price") or 0)
+    if current_price <= 0:
+        raise HTTPException(status_code=404, detail=f"Unable to fetch market price for {symbol}")
+
+    signal = get_probability_and_score(symbol)
+    target_price = float(signal.get("predicted_price_3m") or current_price)
+    stop_loss_price = current_price * (1.03 if side == "SHORT" else 0.97)
+    trade_id = str(uuid4())
+
+    with db_conn() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO paper_trades
+                    (id, user_id, symbol, market, side, quantity, entry_price, current_price,
+                     target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
+                     stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
+                     position_stage, recommendation_action, source_reason, updated_at)
+                VALUES
+                    (:id, :user_id, :symbol, :market, :side, :quantity, :entry_price, :current_price,
+                     :target_price, 'open', :signal_score, :signal_trend, :signal_warning, :notes, :current_price,
+                     :stop_loss_price, :take_profit_price, :trailing_stop_pct, :review_date,
+                     :position_stage, :recommendation_action, :source_reason, :updated_at)
+            """),
+            {
+                "id": trade_id,
+                "user_id": current_user["id"],
+                "symbol": symbol,
+                "market": market,
+                "side": side,
+                "quantity": float(payload.quantity or 1),
+                "entry_price": current_price,
+                "current_price": current_price,
+                "target_price": target_price,
+                "signal_score": signal.get("score"),
+                "signal_trend": signal.get("trend"),
+                "signal_warning": signal.get("warning_message"),
+                "notes": payload.notes,
+                "peak_price": current_price,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": target_price,
+                "trailing_stop_pct": 3.0,
+                "review_date": datetime.utcnow() + timedelta(days=1),
+                "position_stage": "entered",
+                "recommendation_action": "SHORT" if side == "SHORT" else "BUY",
+                "source_reason": signal.get("warning_message") or signal.get("quality_reason") or signal.get("streak_label"),
+                "updated_at": datetime.utcnow(),
+            },
+        )
+
+    log_position_event(trade_id, current_user["id"], "opened", f"Opened {side} tracking position for {symbol}", {
+        "symbol": symbol,
+        "market": market,
+        "entry_price": current_price,
+        "target_price": target_price,
+        "stop_loss_price": stop_loss_price,
+    })
+
+    return {
+        "id": trade_id,
+        "symbol": symbol,
+        "market": market,
+        "side": side,
+        "entry_price": current_price,
+        "target_price": target_price,
+        "signal": signal,
+    }
+
+
+@app.patch("/api/paper-trades/{trade_id}")
+async def update_paper_trade(trade_id: str, payload: PaperTradeUpdate, current_user: dict = Depends(get_current_user)):
+    updates = []
+    params = {"trade_id": trade_id, "user_id": current_user["id"], "updated_at": datetime.utcnow()}
+
+    if payload.stop_loss_price is not None:
+        updates.append("stop_loss_price = :stop_loss_price")
+        params["stop_loss_price"] = float(payload.stop_loss_price)
+    if payload.take_profit_price is not None:
+        updates.append("take_profit_price = :take_profit_price")
+        params["take_profit_price"] = float(payload.take_profit_price)
+    if payload.trailing_stop_pct is not None:
+        updates.append("trailing_stop_pct = :trailing_stop_pct")
+        params["trailing_stop_pct"] = float(payload.trailing_stop_pct)
+    if payload.review_date is not None:
+        updates.append("review_date = :review_date")
+        params["review_date"] = payload.review_date
+    if payload.position_stage is not None:
+        updates.append("position_stage = :position_stage")
+        params["position_stage"] = payload.position_stage
+    if payload.notes is not None:
+        updates.append("notes = :notes")
+        params["notes"] = payload.notes
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    updates.append("updated_at = :updated_at")
+    with db_conn() as conn:
+        result = conn.execute(
+            text(f"UPDATE paper_trades SET {', '.join(updates)} WHERE id = :trade_id AND user_id = :user_id"),
+            params,
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Paper trade not found")
+
+    log_position_event(trade_id, current_user["id"], "updated", "Updated trade plan", {
+        key: value for key, value in params.items() if key not in {"trade_id", "user_id", "updated_at"}
+    })
+    return {"ok": True}
+
+
+@app.post("/api/paper-trades/{trade_id}/close")
+async def close_paper_trade(trade_id: str, payload: PaperTradeClose, current_user: dict = Depends(get_current_user)):
+    with db_conn() as conn:
+        row = conn.execute(
+            text("""
+                SELECT id, symbol, market, side, quantity, entry_price, target_price, status,
+                       signal_score, signal_trend, signal_warning, notes, created_at, closed_at,
+                       peak_price, stop_loss_price, take_profit_price, trailing_stop_pct,
+                       review_date, last_alert_at, position_stage, recommendation_action, source_reason
+                FROM paper_trades
+                WHERE id = :trade_id AND user_id = :user_id
+            """),
+            {"trade_id": trade_id, "user_id": current_user["id"]},
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Paper trade not found")
+
+        current_price = float(get_stock_data(row[1], row[2]).get("current_price") or row[5])
+        conn.execute(
+            text("""
+                UPDATE paper_trades
+                SET status = 'closed', current_price = :current_price, closed_at = :closed_at,
+                    notes = COALESCE(:notes, notes), position_stage = 'closed', updated_at = :closed_at
+                WHERE id = :trade_id AND user_id = :user_id
+            """),
+            {
+                "trade_id": trade_id,
+                "user_id": current_user["id"],
+                "current_price": current_price,
+                "closed_at": datetime.utcnow(),
+                "notes": payload.notes,
+            },
+        )
+
+    log_position_event(trade_id, current_user["id"], "closed", f"Closed tracking position for {row[1]}", {
+        "current_price": current_price,
+    })
+
+    return {"status": "closed", "trade_id": trade_id, "current_price": round(current_price, 2)}
+
+
+# ── Scheduler (generate weekly on Mondays) ────────────────────────────────────
+def _scheduled_weekly_generation():
+    for m in ["AU", "US", "IN"]:
+        try:
+            generate_weekly_digest_for_market(m)
+        except Exception:
+            pass
+
+
+def _scheduled_daily_digest():
+    try:
+        market = os.getenv("DAILY_DIGEST_MARKET", "AU").upper()
+        local_digest_key = _daily_digest_cache_key()
+        digest = get_daily_digest_cache(
+            market,
+            limit=int(os.getenv("DAILY_DIGEST_LIMIT", "5")),
+            cache_key=local_digest_key,
+        )
+        digest_key = digest.get("cache_key") or local_digest_key
+        with db_conn() as conn:
+            users = conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT u.id
+                    FROM users u
+                    JOIN user_telegram_recipients r ON r.user_id = u.id
+                    WHERE r.is_active = 1
+                    """
+                )
+            ).fetchall()
+        for row in users:
+            user_id = row[0]
+            if has_digest_been_sent(user_id, digest["market"], digest_key):
+                continue
+            recipients = get_user_telegram_recipients(user_id)
+            if not recipients:
+                continue
+            _send_telegram_payload(
+                digest["summary"],
+                recipients,
+                user_id=user_id,
+                message_type="daily_digest",
+                market=digest["market"],
+                delivery_mode="auto",
+                digest_key=digest_key,
+            )
+    except Exception as exc:
+        print(f"daily digest scheduler failed: {exc}")
+
+
+def _scheduled_broad_scan_precompute():
+    """Pre-compute broad ASX 200+ wealth scan at 5AM and cache to DB.
+
+    This runs in a background thread so the main API isn't blocked.
+    The broad scan hits 200+ tickers sequentially to avoid overwhelming yfinance.
+    """
+    import time as _sleep_time
+    start = datetime.utcnow()
+    market = "AU"
+    symbol_pool = list(ASX_COMPANIES.keys())
+    scanned = 0
+    candidates = []
+
+    print(f"[BroadScan] Starting pre-compute for {len(symbol_pool)} ASX tickers at {start.isoformat()}")
+
+    for sym in symbol_pool:
+        try:
+            result = _score_wealth_candidate(sym, market)
+            scanned += 1
+            if result and (result.get("score") or 0) >= 0.35:
+                candidates.append(result)
+            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits
+            _sleep_time.sleep(0.3)
+        except Exception:
+            pass
+
+    # Sort by wealth_rank descending
+    candidates.sort(key=lambda x: x.get("wealth_rank", 0), reverse=True)
+
+    try:
+        with db_conn() as conn:
+            did = str(uuid4())
+            conn.execute(text("""
+                INSERT INTO wealth_scan_cache (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
+                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
+                ON CONFLICT (market, scan_mode) DO UPDATE
+                SET scanned_count = :scanned, candidates_found = :found, picks = :picks, generated_at = CURRENT_TIMESTAMP
+            """), {
+                "id": did,
+                "market": market,
+                "mode": "broad",
+                "scanned": scanned,
+                "found": len(candidates),
+                "picks": json.dumps(candidates),
+            })
+    except Exception as e:
+        print(f"[BroadScan] DB write failed: {e}")
+
+    duration = (datetime.utcnow() - start).total_seconds()
+    print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s")
+
+
+def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
+    try:
+        now = datetime.utcnow()
+        min_interval_minutes = max(1, int(os.getenv("PAPER_MONITOR_MIN_INTERVAL_MIN", "10")))
+        configured_max = max(10, int(os.getenv("PAPER_MONITOR_MAX_TRADES", "250")))
+        if max_trades_override is not None:
+            max_trades_per_cycle = max(10, min(int(max_trades_override), configured_max))
+        else:
+            max_trades_per_cycle = configured_max
+        check_before = now - timedelta(minutes=min_interval_minutes)
+        price_cache: dict[tuple[str, str], float] = {}
+        recipients_cache: dict[str, list[dict]] = {}
+        valuation_cache: dict[str, dict] = {}
+
+        with db_conn() as conn:
+            trades = conn.execute(text("""
+                SELECT id, user_id, symbol, market, side, quantity, entry_price, current_price, target_price,
+                       peak_price, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
+                       last_alert_at, last_checked_at, created_at, notes
+                FROM paper_trades 
+                WHERE status = 'open'
+                  AND (last_checked_at IS NULL OR last_checked_at <= :check_before)
+                ORDER BY COALESCE(last_checked_at, created_at) ASC
+                LIMIT :max_trades
+            """), {"check_before": check_before, "max_trades": max_trades_per_cycle}).fetchall()
+
+            if not trades:
+                return
+            
+            for t in trades:
+                (trade_id, user_id, symbol, market, side, qty, entry, last_cp, target,
+                 peak, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
+                 last_alert_at, last_checked_at, created_at, notes) = t
+
+                cache_key = (symbol, market or "AU")
+                if cache_key in price_cache:
+                    cp = price_cache[cache_key]
+                else:
+                    stock_data = get_stock_data(symbol, market)
+                    cp = float(stock_data.get("current_price") or last_cp or 0)
+                    price_cache[cache_key] = cp
+
+                recipients = recipients_cache.get(user_id)
+                if recipients is None:
+                    recipients = get_user_telegram_recipients(user_id)
+                    recipients_cache[user_id] = recipients
+                
+                if cp <= 0:
+                    conn.execute(text("UPDATE paper_trades SET last_checked_at = :now WHERE id = :tid"), {"now": now, "tid": trade_id})
+                    continue
+
+                in_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=6))
+                stage_update = None
+                alert = None
+
+                # ── P&L context helpers ────────────────────────────────────────
+                direction = -1.0 if (side or "LONG") == "SHORT" else 1.0
+                entry_f = float(entry or 0)
+                qty_f = float(qty or 1)
+                gross_pnl = (cp - entry_f) * qty_f * direction
+                pnl_pct = ((cp - entry_f) / entry_f * 100 * direction) if entry_f > 0 else 0
+                pnl_emoji = "🟢" if gross_pnl >= 0 else "🔴"
+                days_held = (now - created_at).days if created_at else 0
+
+                # ── Valuation / analyst target context ────────────────────────
+                val = valuation_cache.get(symbol)
+                if val is None:
+                    try:
+                        val = get_valuation_metrics(symbol)
+                        valuation_cache[symbol] = val
+                    except Exception:
+                        val = {}
+
+                target_mean_str = f"${val.get('analyst_target_mean'):.2f}" if val.get('analyst_target_mean') else "N/A"
+                upside_str = f"{val.get('analyst_upside_pct'):+.1f}%" if val.get('analyst_upside_pct') is not None else "N/A"
+                days_to_e = val.get('days_to_earnings')
+
+                def _rich_alert(headline: str, action_hint: str) -> str:
+                    """Build a detailed Telegram HTML alert string."""
+                    return (
+                        f"<b>{headline}</b>\n\n"
+                        f"📌 <b>{symbol}</b> ({market or 'AU'}) | {side or 'LONG'}\n"
+                        f"  Entry: <b>${entry_f:.2f}</b> → Now: <b>${cp:.2f}</b>\n"
+                        f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n"
+                        f"  Analyst target: {target_mean_str} | Upside: {upside_str}\n"
+                        + (f"  📅 Earnings in: {days_to_e}d\n" if days_to_e is not None and days_to_e >= 0 else "")
+                        + f"\n💡 <b>Action hint:</b> {action_hint}"
+                    )
+
+                if side == 'LONG':
+                    new_peak = max(peak or entry, cp)
+                    drop_from_peak = (new_peak - cp) / new_peak if new_peak > 0 else 0
+                    trailing_pct = float(trailing_stop_pct or 3.0) / 100.0
+
+                    if take_profit_price and cp >= float(take_profit_price) and position_stage != 'trim_signal':
+                        stage_update = 'trim_signal'
+                        alert = _rich_alert(
+                            "🎯 TAKE PROFIT TRIGGER",
+                            f"Price {cp:.2f} ≥ target {float(take_profit_price):.2f}. "
+                            f"Consider trimming 50% and raising trailing stop to lock gains."
+                        )
+                    elif stop_loss_price and cp <= float(stop_loss_price) and position_stage != 'exit_signal':
+                        stage_update = 'exit_signal'
+                        alert = _rich_alert(
+                            "🛑 STOP LOSS TRIGGER",
+                            f"Price {cp:.2f} ≤ stop {float(stop_loss_price):.2f}. "
+                            f"Thesis may be broken. Review for exit to protect capital."
+                        )
+                    elif drop_from_peak >= trailing_pct and position_stage != 'exit_signal':
+                        stage_update = 'exit_signal'
+                        alert = _rich_alert(
+                            "⚠️ TRAILING STOP TRIGGER",
+                            f"Down {drop_from_peak*100:.1f}% from peak ${new_peak:.2f}. "
+                            f"Momentum reversing. Consider closing to preserve gains."
+                        )
+                    # Time stop: position flat > 30 days with < 2% gain
+                    elif days_held >= 30 and abs(pnl_pct) < 2.0 and position_stage not in ('exit_signal', 'trim_signal'):
+                        stage_update = 'review'
+                        alert = _rich_alert(
+                            "⏱️ TIME STOP — 30-DAY REVIEW",
+                            f"Position is flat after {days_held}d ({pnl_pct:+.1f}%). "
+                            f"Signal may have failed. Consider freeing capital for higher-conviction ideas."
+                        )
+
+                    conn.execute(text("""
+                        UPDATE paper_trades
+                        SET current_price = :cp,
+                            peak_price = :np,
+                            position_stage = COALESCE(:stage_update, position_stage),
+                            last_alert_at = CASE WHEN :stage_update IS NOT NULL THEN :now ELSE last_alert_at END,
+                            last_checked_at = :now,
+                            updated_at = :now
+                        WHERE id = :tid
+                    """), {"cp": cp, "np": new_peak, "stage_update": stage_update, "now": now, "tid": trade_id})
+
+                elif side == 'SHORT':
+                    new_trough = min(peak or entry, cp)
+                    jump_from_trough = (cp - new_trough) / new_trough if new_trough > 0 else 0
+                    trailing_pct = float(trailing_stop_pct or 3.0) / 100.0
+
+                    if take_profit_price and cp <= float(take_profit_price) and position_stage != 'trim_signal':
+                        stage_update = 'trim_signal'
+                        alert = _rich_alert(
+                            "🎯 SHORT TAKE PROFIT TRIGGER",
+                            f"Price {cp:.2f} ≤ short target {float(take_profit_price):.2f}. "
+                            f"Consider covering 50% and tightening buy-stop."
+                        )
+                    elif stop_loss_price and cp >= float(stop_loss_price) and position_stage != 'exit_signal':
+                        stage_update = 'exit_signal'
+                        alert = _rich_alert(
+                            "🛑 SHORT STOP LOSS TRIGGER",
+                            f"Price {cp:.2f} ≥ stop {float(stop_loss_price):.2f}. "
+                            f"Cover position to limit further loss."
+                        )
+                    elif jump_from_trough >= trailing_pct and position_stage != 'exit_signal':
+                        stage_update = 'exit_signal'
+                        alert = _rich_alert(
+                            "⚠️ SHORT TRAILING STOP TRIGGER",
+                            f"Rebounded {jump_from_trough*100:.1f}% from trough ${new_trough:.2f}. "
+                            f"Momentum turning against short. Review for exit."
+                        )
+                    conn.execute(text("""
+                        UPDATE paper_trades
+                        SET current_price = :cp,
+                            peak_price = :nt,
+                            position_stage = COALESCE(:stage_update, position_stage),
+                            last_alert_at = CASE WHEN :stage_update IS NOT NULL THEN :now ELSE last_alert_at END,
+                            last_checked_at = :now,
+                            updated_at = :now
+                        WHERE id = :tid
+                    """), {"cp": cp, "nt": new_trough, "stage_update": stage_update, "now": now, "tid": trade_id})
+
+                # ── Earnings proximity alert for open positions (daily max) ──
+                if (not alert and recipients and not in_cooldown
+                        and days_to_e is not None and 0 <= days_to_e <= 7):
+                    earnings_alert = (
+                        f"<b>📅 EARNINGS IN {days_to_e} DAYS — {symbol}</b>\n\n"
+                        f"📌 <b>{symbol}</b> | {side or 'LONG'} | Entry ${entry_f:.2f}\n"
+                        f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n\n"
+                        f"<b>Pre-earnings checklist:</b>\n"
+                        f"  • Confirm stop-loss is set (current: "
+                        + (f"${float(stop_loss_price):.2f}" if stop_loss_price else "<b>⚠️ NOT SET</b>")
+                        + f")\n"
+                        f"  • Consider reducing to half position to manage binary event risk\n"
+                        f"  • Analyst consensus: {(val.get('analyst_recommendation') or 'N/A').upper()} | Target: {target_mean_str}\n"
+                    )
+                    _send_telegram_payload(
+                        earnings_alert,
+                        recipients,
+                        user_id=user_id,
+                        message_type="earnings_proximity",
+                        market=market,
+                        delivery_mode="auto",
+                        source="position_monitor",
+                    )
+                    conn.execute(text(
+                        "UPDATE paper_trades SET last_alert_at = :now, last_checked_at = :now WHERE id = :tid"
+                    ), {"now": now, "tid": trade_id})
+                    log_position_event(trade_id, user_id, "earnings_alert",
+                                       f"Earnings proximity alert sent for {symbol} ({days_to_e}d away)",
+                                       {"days_to_earnings": days_to_e})
+                    continue
+
+                if alert and recipients and not in_cooldown:
+                    _send_telegram_payload(
+                        alert,
+                        recipients,
+                        user_id=user_id,
+                        message_type="position_trigger",
+                        market=market,
+                        delivery_mode="auto",
+                        source="position_monitor",
+                    )
+                    log_position_event(trade_id, user_id, "trigger",
+                                       alert.replace("<b>", "").replace("</b>", "").replace("<br/>", " | ")[:300], {
+                                           "symbol": symbol,
+                                           "market": market,
+                                           "current_price": cp,
+                                           "pnl_pct": round(pnl_pct, 2),
+                                           "position_stage": stage_update,
+                                       })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEALTH BUILDER — multi-factor screener endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WealthBuilderRequest(BaseModel):
+    market: str = "AU"
+    min_analyst_upside: float = 5.0       # % upside to analyst consensus target
+    min_score: float = 0.45               # composite score threshold
+    min_prob_5pct: float = 40.0           # probability ≥5% 3-month return
+    max_symbols: int = 20                 # candidates to scan (capped at 100)
+    send_telegram: bool = False
+    scan_mode: str = "top"                # "top" = top 40, "broad" = full ASX_COMPANIES pool
+
+
+def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
+    """Score a single symbol as a wealth-builder candidate.  Returns None on failure."""
+    index_ticker = "^AXJO" if market == "AU" else "^IXIC" if market == "US" else None
+    try:
+        sd = get_stock_data(symbol, market)
+        if not sd or sd.get("current_price", 0) <= 0:
+            return None
+        cp = float(sd["current_price"])
+        volume = sd.get("volume", 0)
+        avg_vol = sd.get("avg_volume_5d", 0)
+        vol_spike = sd.get("volume_spike", None)
+
+        hist = get_historical_data(symbol, period="1y")
+        if len(hist) < 120:
+            return None
+
+        # ── Volume/Liquidity quality ──────────────────────────────────────────
+        liquidity_ok = True
+        liquidity_penalty = 1.0
+        liquidity_flags = []
+        if avg_vol and avg_vol < 50000:
+            liquidity_ok = False
+            liquidity_penalty = 0.4
+            liquidity_flags.append("LOW_VOL")
+        elif avg_vol and avg_vol < 200000:
+            liquidity_penalty = 0.7
+            liquidity_flags.append("LOW_VOL")
+        if vol_spike and vol_spike > 3:
+            liquidity_flags.append("VOL_SPIKE")
+
+        indicators = calculate_technical_indicators(hist)
+        valuation = get_valuation_metrics(symbol)
+        prediction = generate_statistical_prediction(
+            hist, cp, sector=valuation.get("sector", ""), symbol=symbol
+        )
+        entry_timing = _entry_timing_assessment(valuation, indicators, {**prediction, "current_price": cp})
+
+        # Basic signal score (reuse existing helper)
+        signal = get_probability_and_score(symbol)
+
+        # ── Bear market / regime penalty ──────────────────────────────────────
+        try:
+            regime_snap = compute_regime_snapshot()
+            bear_market = regime_snap.get("bear_market", False)
+            vix_level = regime_snap.get("vix_level", 20)
+        except Exception:
+            bear_market = False
+            vix_level = 20
+
+        # ── Relative strength vs sector ───────────────────────────────────────
+        sector = valuation.get("sector", "")
+        rel_strength_3m = None
+        if sector and len(hist) >= 60:
+            try:
+                my_ret = round((cp / float(hist["Close"].iloc[-60])) - 1, 4)
+                # Use lightweight own-return-based relative strength (avoid N additional yfinance calls)
+                rel_strength_3m = round(my_ret * 100, 1)
+            except Exception:
+                pass
+
+        # ── Earnings quality check ─────────────────────────────────────────────
+        eps_diluted = valuation.get("trailing_eps")
+        eps_growth = valuation.get("eps_growth_fwd_pct")
+        revenue_growth = valuation.get("revenue_growth")
+        earnings_quality_flags = []
+        if eps_diluted is not None and eps_diluted < 0:
+            earnings_quality_flags.append("NEG_EPS")
+        if eps_growth is not None and eps_growth < -10:
+            earnings_quality_flags.append("EPS_DECLINING")
+        if revenue_growth is not None and revenue_growth < -0.05:
+            earnings_quality_flags.append("REV_DECLINING")
+
+        # ── Sector rotation context ────────────────────────────────────────────
+        sector_perf = None
+        if sector:
+            try:
+                xjo_hist = get_historical_data(index_ticker, period="1mo", market=None)
+                if xjo_hist is not None and not xjo_hist.empty and len(xjo_hist) >= 5:
+                    sector_perf = round((float(xjo_hist["Close"].iloc[-1]) / float(xjo_hist["Close"].iloc[0])) - 1, 4) * 100
+            except Exception:
+                pass
+
+        result = {
+            "symbol": symbol,
+            "name": sd.get("name", symbol),
+            "market": market,
+            "current_price": round(cp, 2),
+            "change_percent": round(sd.get("change_percent", 0), 2),
+            "score": signal.get("score", 0),
+            "prob_ge_5pct": signal.get("prob_ge_5pct", 0),
+            "trend": prediction.get("trend", "neutral"),
+            "predicted_change_pct": round(prediction.get("change_from_current", 0), 2),
+            "analyst_target_mean": valuation.get("analyst_target_mean"),
+            "analyst_upside_pct": valuation.get("analyst_upside_pct"),
+            "analyst_recommendation": valuation.get("analyst_recommendation"),
+            "num_analyst_opinions": valuation.get("num_analyst_opinions"),
+            "next_earnings_date": valuation.get("next_earnings_date"),
+            "days_to_earnings": valuation.get("days_to_earnings"),
+            "short_pct_float": valuation.get("short_pct_float"),
+            "pct_from_52w_high": valuation.get("pct_from_52w_high"),
+            "pe": valuation.get("pe"),
+            "forward_pe": valuation.get("forward_pe"),
+            "eps_growth_fwd_pct": valuation.get("eps_growth_fwd_pct"),
+            # New dimensions
+            "avg_volume": avg_vol,
+            "liquidity_ok": liquidity_ok,
+            "liquidity_flags": liquidity_flags,
+            "rel_strength_3m": rel_strength_3m,
+            "earnings_quality_flags": earnings_quality_flags,
+            "sector": sector,
+            "sector_perf_1mo": sector_perf,
+            "trailing_eps": eps_diluted,
+            "revenue_growth": revenue_growth,
+             "entry_timing": entry_timing,
+            # Composite wealth rank with multi-dimensional risk penalties
+            "wealth_rank": round(
+                (signal.get("score", 0) or 0)
+                * (1 + max(0, (valuation.get("analyst_upside_pct") or 0)) / 100)
+                * (1.15 if entry_timing["entry_ok"] else 0.0)
+                * liquidity_penalty
+                * (0.85 - 0.05 * len(earnings_quality_flags) if earnings_quality_flags else 1.0)
+                * (0.5 if (valuation.get("short_pct_float") or 0) > 15 else 0.75 if (valuation.get("short_pct_float") or 0) > 8 else 1.0)
+                * (0.7 if (valuation.get("pe") or 0) > 80 or (valuation.get("pe") or 0) < 0 else 0.85 if (valuation.get("pe") or 0) > 40 else 1.0)
+                * (0.8 if (valuation.get("num_analyst_opinions") or 0) < 2 else 1.0)
+                * (0.85 if (valuation.get("pct_from_52w_high") or 0) < -40 else 1.0)
+                * (0.75 if vix_level > 30 else 0.88 if vix_level > 22 else 1.0)
+                * (0.80 if bear_market else 1.0),
+                4
+            ),
+            "valuation": valuation,
+            "prediction": prediction,
+        }
+        return result
+    except Exception:
+        return None
+
+
+_WEALTH_SCAN_SEMAPHORE = threading.Semaphore(6)  # max 6 concurrent yfinance calls
+_MACRO_CACHE = None
+_MACRO_CACHE_TIME = 0
+_MACRO_CACHE_TTL = 300  # 5 min TTL for macro data
+
+def _get_macro_data_cached():
+    global _MACRO_CACHE, _MACRO_CACHE_TIME
+    now = time.time()
+    if _MACRO_CACHE is not None and (now - _MACRO_CACHE_TIME) < _MACRO_CACHE_TTL:
+        return _MACRO_CACHE
+    _MACRO_CACHE = macro_model.get_macro_data()
+    _MACRO_CACHE_TIME = now
+    return _MACRO_CACHE
+
+def _score_wealth_candidate_safe(symbol: str, market: str, timeout: float = 25.0) -> Optional[dict]:
+    """Score a candidate with a semaphore for rate limiting and per-stock timeout."""
+    acquired = _WEALTH_SCAN_SEMAPHORE.acquire(timeout=timeout)
+    if not acquired:
+        return None
+    try:
+        future = ThreadPoolExecutor(max_workers=1).submit(_score_wealth_candidate, symbol, market)
+        return future.result(timeout=timeout)
+    except Exception:
+        return None
+    finally:
+        _WEALTH_SCAN_SEMAPHORE.release()
+
+
+@app.post("/api/signals/wealth-builder")
+async def wealth_builder_signals(
+    payload: WealthBuilderRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Multi-factor wealth-builder screener combining technical score,
+    analyst consensus upside, and catalyst-aware entry timing."""
+    t0 = time.time()
+    market = (payload.market or "AU").upper()
+    max_scan = max(5, min(int(payload.max_symbols or 20), 100))
+    scan_mode = (payload.scan_mode or "top").lower()
+
+    if scan_mode == "broad" and market == "AU":
+        symbol_pool = list(ASX_COMPANIES.keys())[:max_scan]
+    elif scan_mode == "broad" and market == "US":
+        symbol_pool = TOP_SYMBOLS_BY_MARKET.get("US", [])[:max_scan]
+    elif scan_mode == "broad" and market == "IN":
+        symbol_pool = TOP_SYMBOLS_BY_MARKET.get("IN", [])[:max_scan]
+    else:
+        symbol_pool = TOP_SYMBOLS_BY_MARKET.get(market, TOP_SYMBOLS_BY_MARKET["AU"])[:max_scan]
+
+    # Run scoring with rate-limited thread pool (max 6 concurrent yfinance calls)
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.run_in_executor(None, _score_wealth_candidate_safe, sym, market)
+        for sym in symbol_pool
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    elapsed_s = round(time.time() - t0, 1)
+
+    candidates = []
+    for r in raw_results:
+        if r is None or isinstance(r, Exception):
+            continue
+        # Hard exclude: entry_timing "avoid" zone (e.g. earnings within 7 days)
+        entry_zone = (r.get("entry_timing") or {}).get("entry_zone", "")
+        if entry_zone == "avoid":
+            continue
+        # Hard exclude: wealth_rank = 0 (zeroed out by entry_ok=False penalty)
+        if (r.get("wealth_rank") or 0) <= 0:
+            continue
+        # Apply filters
+        if (r.get("score") or 0) < payload.min_score:
+            continue
+        if (r.get("prob_ge_5pct") or 0) < payload.min_prob_5pct:
+            continue
+        analyst_upside = r.get("analyst_upside_pct")
+        if analyst_upside is not None and analyst_upside < payload.min_analyst_upside:
+            continue
+        candidates.append(r)
+
+    # Sort by composite wealth_rank descending
+    candidates.sort(key=lambda x: x.get("wealth_rank", 0), reverse=True)
+
+    # Sector concentration cap: max 40% of candidates from any single sector
+    sector_counts = {}
+    diversified = []
+    max_per_sector = max(2, int(len(candidates) * 0.4)) if candidates else len(candidates)
+    for c in candidates:
+        sec = c.get("sector") or "Unknown"
+        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        if sector_counts[sec] <= max_per_sector:
+            diversified.append(c)
+    candidates = diversified
+
+    # ── Telegram dispatch ─────────────────────────────────────────────────────
+    telegram_delivery = {"sent": False, "success_count": 0, "error": None}
+    if payload.send_telegram and candidates:
+        recipients = get_user_telegram_recipients(current_user["id"])
+        top3 = candidates[:3]
+        lines = [
+            f"<b>🏦 WEALTH BUILDER SIGNALS — {market}</b>",
+            f"<i>{len(candidates)} candidates found from {max_scan} screened</i>\n",
+        ]
+        for i, c in enumerate(top3, 1):
+            zone_e = {"clear": "🟢", "caution": "🟡", "avoid": "🔴"}.get(
+                (c.get("entry_timing") or {}).get("entry_zone", ""), "⚪"
+            )
+            upside = c.get("analyst_upside_pct")
+            upside_str = f"{upside:+.1f}%" if upside is not None else "N/A"
+            rec = (c.get("analyst_recommendation") or "N/A").upper()
+            n_e = c.get("days_to_earnings")
+            dte_str = f"{n_e}d" if n_e is not None else "N/A"
+            lines.append(
+                f"<b>#{i} {c['symbol']}</b> — {c['name']}\n"
+                f"  Score: {c.get('score', 0):.2f} | P(≥5%): {c.get('prob_ge_5pct', 0):.1f}%\n"
+                f"  Analyst: {rec} | Upside: {upside_str}\n"
+                f"  Earnings: {c.get('next_earnings_date', 'N/A')} ({dte_str})\n"
+                f"  Entry: {zone_e} {(c.get('entry_timing') or {}).get('entry_zone', 'N/A').upper()}\n"
+            )
+        lines.append(f"\n<i>Use /api/shares/SYMBOL/analyze for full deep-dive analysis.</i>")
+        message = "\n".join(lines)
+        telegram_delivery = _send_telegram_payload(
+            message,
+            recipients,
+            user_id=current_user["id"],
+            message_type="wealth_builder",
+            market=market,
+            delivery_mode="manual",
+            source="wealth_builder",
+        )
+
+    # ── Persist candidates for backtesting ──────────────────────────────────────
+    try:
+        now_ts = datetime.utcnow()
+        with engine.connect() as conn:
+            for c in candidates:
+                conn.execute(text("""
+                    INSERT INTO wealth_builder_evaluations
+                        (symbol, market, wealth_rank, score, prob_ge_5pct,
+                         predicted_change_pct, price_at_screen,
+                         entry_zone, screened_at)
+                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :at)
+                    ON CONFLICT (symbol, screened_at) DO NOTHING
+                """), {
+                    "symbol": c["symbol"],
+                    "market": market,
+                    "wr": c.get("wealth_rank"),
+                    "sc": c.get("score"),
+                    "p5": c.get("prob_ge_5pct"),
+                    "pc": c.get("predicted_change_pct"),
+                    "pas": c.get("current_price"),
+                    "ez": (c.get("entry_timing") or {}).get("entry_zone", ""),
+                    "at": now_ts,
+                })
+            conn.commit()
+    except Exception:
+        pass
+
+    return {
+        "market": market,
+        "screened": len(symbol_pool),
+        "candidates_found": len(candidates),
+        "filters": {
+            "min_score": payload.min_score,
+            "min_prob_5pct": payload.min_prob_5pct,
+            "min_analyst_upside": payload.min_analyst_upside,
+        },
+        "candidates": candidates,
+        "telegram": telegram_delivery,
+        "generated_at": datetime.utcnow().isoformat(),
+        "elapsed_s": elapsed_s,
+    }
+
+
+@app.get("/api/signals/wealth-builder/cached-broad")
+async def wealth_builder_cached_broad(
+    market: str = "AU",
+    min_score: float = 0.35,
+    min_prob_5pct: float = 30,
+    min_analyst_upside: float = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the 5AM pre-computed broad scan from DB cache."""
+    del current_user
+    m = market.upper()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT picks, scanned_count, candidates_found, generated_at
+            FROM wealth_scan_cache
+            WHERE market = :market AND scan_mode = 'broad'
+            ORDER BY generated_at DESC LIMIT 1
+        """), {"market": m}).fetchone()
+
+    if not row:
+        return {"market": m, "candidates": [], "message": "No cached scan yet. Broad scan runs daily at 5AM.", "generated_at": None}
+
+    candidates = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    # Apply optional filters on the cached data
+    filtered = [c for c in candidates
+                if (c.get("score") or 0) >= min_score
+                and (c.get("prob_ge_5pct") or 0) >= min_prob_5pct
+                and (c.get("analyst_upside_pct") or 0) >= min_analyst_upside]
+
+    return {
+        "market": m,
+        "screened": int(row[1]),
+        "candidates_found": len(filtered),
+        "candidates": filtered,
+        "generated_at": str(row[3]) if row[3] else None,
+        "scan_mode": "broad",
+    }
+
+
+@app.get("/api/signals/wealth-builder/backtest")
+async def wealth_builder_backtest(
+    market: str = "AU",
+    days_ago: int = 14,
+    min_rank: float = 0,
+    current_user: dict = Depends(get_current_user),
+):
+    """Evaluate historical wealth builder predictions vs actual returns."""
+    del current_user
+    m = market.upper()
+    cutoff = datetime.utcnow() - timedelta(days=days_ago)
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT symbol, wealth_rank, score, prob_ge_5pct,
+                   predicted_change_pct, price_at_screen,
+                   actual_return_14d, actual_return_30d, actual_return_90d,
+                   actual_peak_return_90d, actual_max_drawdown_90d,
+                   entry_zone, screened_at, evaluated
+            FROM wealth_builder_evaluations
+            WHERE market = :market
+              AND screened_at <= :cutoff
+              AND wealth_rank >= :min_rank
+            ORDER BY screened_at DESC, wealth_rank DESC
+            LIMIT 100
+        """), {"market": m, "cutoff": cutoff, "min_rank": min_rank}).fetchall()
+
+    total = len(rows)
+    if total == 0:
+        return {"market": m, "count": 0, "evaluations": [], "message": f"No evaluations older than {days_ago} days yet."}
+
+    evals = []
+    hit_count = 0
+    dir_correct = 0
+    ranked_pairs = []
+    for r in rows:
+        pred = r[3] or 0  # predicted_change_pct
+        actual_14d = r[6]
+        actual_30d = r[7]
+        actual_90d = r[8]
+        peak = r[9]
+        dd = r[10]
+        rank = r[1] or 0
+
+        if actual_14d is not None and actual_14d > 0:
+            dir_correct += 1 if pred > 0 else 0
+        elif actual_14d is not None and actual_14d < 0:
+            dir_correct += 1 if pred < 0 else 0
+
+        if actual_90d is not None and actual_90d >= 5:
+            hit_count += 1
+
+        ranked_pairs.append((rank, actual_90d or 0))
+
+        evals.append({
+            "symbol": r[0],
+            "wealth_rank": rank,
+            "score": r[2],
+            "prob_ge_5pct": r[3],
+            "predicted_change_pct": pred,
+            "price_at_screen": r[5],
+            "actual_return_14d": actual_14d,
+            "actual_return_30d": actual_30d,
+            "actual_return_90d": actual_90d,
+            "actual_peak_return_90d": peak,
+            "actual_max_drawdown_90d": dd,
+            "entry_zone": r[11],
+            "screened_at": str(r[12]) if r[12] else None,
+            "evaluated": bool(r[13]),
+        })
+
+    # Rank correlation: does higher wealth_rank correlate with higher returns?
+    if len(ranked_pairs) >= 5:
+        rs = pd.Series([p[0] for p in ranked_pairs])
+        rets = pd.Series([p[1] for p in ranked_pairs])
+        spearman = float(rs.corr(rets, method="spearman")) if rs.std() > 0 and rets.std() > 0 else 0
+    else:
+        spearman = 0
+
+    return {
+        "market": m,
+        "count": total,
+        "hit_rate_5pct_90d": round(hit_count / total * 100, 1) if total > 0 else 0,
+        "dir_accuracy_14d": round(dir_correct / total * 100, 1) if total > 0 else 0,
+        "rank_90d_spearman": round(spearman, 2),
+        "evaluations": evals,
+    }
+
+
+@app.post("/api/signals/wealth-builder/evaluate")
+async def wealth_builder_evaluate_historical(
+    current_user: dict = Depends(get_current_user),
+):
+    """Background job: evaluate past wealth builder candidates against actual returns.
+    Only evaluates rows that have not been evaluated yet and are at least 14 days old."""
+    del current_user
+    cutoff = datetime.utcnow() - timedelta(days=14)
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id, symbol, market, price_at_screen, screened_at
+            FROM wealth_builder_evaluations
+            WHERE evaluated = FALSE AND screened_at <= :cutoff
+            LIMIT 50
+        """), {"cutoff": cutoff}).fetchall()
+
+    updated = 0
+    for row in rows:
+        eid, sym, mkt, price, at_str = row[0], row[1], row[2], row[4], row[5]
+        try:
+            at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
+            hist = get_historical_data(sym, period="6mo")
+            if hist.empty or len(hist) < 14:
+                continue
+            prices_after = hist[hist.index > pd.Timestamp(at_date)]
+            if prices_after.empty:
+                continue
+            current_p = price
+            actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
+            actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
+            actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
+            peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
+            max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
+
+            conn.execute(text("""
+                UPDATE wealth_builder_evaluations
+                SET actual_return_14d = :r14, actual_return_30d = :r30,
+                    actual_return_90d = :r90, actual_peak_return_90d = :pk,
+                    actual_max_drawdown_90d = :dd, evaluated = TRUE
+                WHERE id = :eid
+            """), {"r14": actual_14d, "r30": actual_30d, "r90": actual_90d,
+                   "pk": peak_ret, "dd": max_dd, "eid": eid})
+            updated += 1
+        except Exception:
+            pass
+    conn.commit()
+
+    return {"evaluated": updated}
+
+
+def _scheduled_wealth_builder_evaluate():
+    """Scheduled job: evaluate past wealth builder candidates."""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=14)
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, symbol, market, price_at_screen, screened_at
+                FROM wealth_builder_evaluations
+                WHERE evaluated = FALSE AND screened_at <= :cutoff
+                LIMIT 50
+            """), {"cutoff": cutoff}).fetchall()
+
+        for row in rows:
+            eid, sym, mkt, price, at_str = row[0], row[1], row[2], row[4], row[5]
+            try:
+                at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
+                hist = get_historical_data(sym, period="6mo")
+                if hist.empty or len(hist) < 14:
+                    continue
+                prices_after = hist[hist.index > pd.Timestamp(at_date)]
+                if prices_after.empty:
+                    continue
+                current_p = price
+                actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
+                actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
+                actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
+                peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
+                max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
+
+                conn.execute(text("""
+                    UPDATE wealth_builder_evaluations
+                    SET actual_return_14d = :r14, actual_return_30d = :r30,
+                        actual_return_90d = :r90, actual_peak_return_90d = :pk,
+                        actual_max_drawdown_90d = :dd, evaluated = TRUE
+                    WHERE id = :eid
+                """), {"r14": actual_14d, "r30": actual_30d, "r90": actual_90d,
+                       "pk": peak_ret, "dd": max_dd, "eid": eid})
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        pass
+
+@app.get("/api/weekly/backtest")
+async def weekly_backtest(market: str = "AU", weeks: int = 8, current_user: dict = Depends(get_current_user)):
+    """Enhanced backtest: past weekly picks vs ASX200 benchmark.
+
+    Returns per-week accuracy, cumulative returns, and index comparison.
+    """
+    del current_user
+    m = (market or "AU").upper()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT e.symbol, e.predicted_change_pct, e.actual_change_7d_pct, e.direction_correct,
+                   d.week_iso, d.generated_at
+            FROM weekly_pick_evaluations e
+            JOIN weekly_digests d ON d.id = e.digest_id
+            WHERE d.market = :market AND e.actual_change_7d_pct IS NOT NULL
+            ORDER BY d.week_iso DESC, e.symbol
+            LIMIT :lim
+        """), {"market": m, "lim": weeks * 20}).fetchall()
+
+    if not rows:
+        return {"market": m, "weeks": [], "summary": {"direction_accuracy_pct": 0, "avg_predicted": 0, "avg_actual": 0}}
+
+    by_week = {}
+    all_evals = []
+    for r in rows:
+        sym, pred, actual, dir_correct, week, gen_at = r
+        ev = {"symbol": sym, "predicted": pred or 0, "actual": actual or 0, "direction_correct": bool(dir_correct)}
+        all_evals.append(ev)
+        if week not in by_week:
+            by_week[week] = {"picks": [], "generated_at": str(gen_at) if gen_at else None}
+        by_week[week]["picks"].append(ev)
+
+    weeks_list = []
+    for wk, data in sorted(by_week.items(), reverse=True):
+        picks = data["picks"]
+        if picks:
+            avg_pred = sum(p["predicted"] for p in picks) / len(picks)
+            avg_actual = sum(p["actual"] for p in picks) / len(picks)
+            dir_acc = sum(1 for p in picks if p["direction_correct"]) / len(picks) * 100
+            weeks_list.append({
+                "week": wk,
+                "picks_count": len(picks),
+                "avg_predicted_pct": round(avg_pred, 2),
+                "avg_actual_pct": round(avg_actual, 2),
+                "direction_accuracy": round(dir_acc, 1),
+                "generated_at": data["generated_at"],
+            })
+
+    # Try to get XJO/AXJO benchmark for AU
+    benchmark_return = None
+    if m == "AU":
+        try:
+            xjo = get_historical_data("^AXJO", period="6mo")
+            if len(xjo) >= 126:
+                benchmark_return = round((float(xjo["Close"].iloc[-1]) / float(xjo["Close"].iloc[-126])) - 1, 4) * 100
+        except Exception:
+            pass
+
+    dir_acc = sum(1 for r in rows if r[3]) / len(rows) * 100 if rows else 0
+    return {
+        "market": m,
+        "weeks": weeks_list[:weeks],
+        "summary": {
+            "total_picks_evaluated": len(all_evals),
+            "direction_accuracy_pct": round(dir_acc, 2),
+            "avg_predicted_pct": round(sum(e["predicted"] for e in all_evals) / len(all_evals), 2) if all_evals else 0,
+            "avg_actual_pct": round(sum(e["actual"] for e in all_evals) / len(all_evals), 2) if all_evals else 0,
+            "benchmark_6mo_pct": benchmark_return,
+            "outperform": all_evals and benchmark_return is not None and
+                (sum(e["actual"] for e in all_evals) / len(all_evals)) > benchmark_return,
+        },
+        "evaluations": all_evals[:50],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TELEGRAM BOT WEBHOOK — receives messages directly from the Telegram bot
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_trade_command(text: str) -> Optional[dict]:
+    """Parse a natural-language trade command from Telegram.
+
+    Supported formats:
+      BUY BHP 100 45.50
+      BUY BHP 100 @ 45.50
+      SELL CBA 50 123
+      ADD FMG 200 18.50
+      REDUCE WOW 100 @ 30.00
+    Returns dict with keys: action, symbol, quantity, price  OR  None.
+    """
+    import re as _re
+    t = text.strip().upper()
+    # BUY|SELL|ADD|REDUCE  SYMBOL  QTY  [@]  PRICE
+    m = _re.match(
+        r'^(BUY|SELL|ADD|REDUCE)\s+([A-Z0-9\-\.]+)\s+([\d.]+)\s*@?\s*([\d.]+)',
+        t
+    )
+    if m:
+        return {
+            "action": m.group(1),
+            "symbol": m.group(2),
+            "quantity": float(m.group(3)),
+            "price": float(m.group(4)),
+        }
+    return None
+
+
+def _send_telegram_reply(chat_id: str, text: str) -> None:
+    """Send a plain-text reply back to a Telegram chat."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except Exception:
+        pass
+
+
+def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: float, entry_price: float) -> Optional[str]:
+    """Create a paper trade with sensible defaults for auto-monitoring.
+    Returns the trade_id or None on failure.
+    """
+    try:
+        signal = get_probability_and_score(symbol)
+        target_price = float(signal.get("predicted_price_3m") or entry_price * 1.12)
+        stop_loss_price = round(entry_price * 0.92, 3)   # 8% stop
+        take_profit_price = round(target_price, 3)
+        trade_id = str(uuid4())
+        now = datetime.utcnow()
+        with db_conn() as conn:
+            conn.execute(text("""
+                INSERT INTO paper_trades
+                    (id, user_id, symbol, market, side, quantity, entry_price, current_price,
+                     target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
+                     stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
+                     position_stage, recommendation_action, source_reason, updated_at)
+                VALUES
+                    (:id, :user_id, :symbol, :market, 'LONG', :quantity, :entry_price, :entry_price,
+                     :target_price, 'open', :signal_score, :signal_trend, NULL,
+                     'Auto-created from Telegram BUY command', :entry_price,
+                     :stop_loss, :take_profit, 3.0, :review_date,
+                     'entered', 'BUY', 'telegram_buy', :now)
+            """), {
+                "id": trade_id, "user_id": user_id, "symbol": symbol, "market": market,
+                "quantity": quantity, "entry_price": entry_price,
+                "target_price": take_profit_price,
+                "signal_score": signal.get("score"),
+                "signal_trend": signal.get("trend"),
+                "stop_loss": stop_loss_price, "take_profit": take_profit_price,
+                "review_date": now + timedelta(days=14),
+                "now": now,
+            })
+        log_position_event(trade_id, user_id, "opened",
+                           f"Auto-opened from Telegram BUY {symbol}",
+                           {"entry_price": entry_price, "stop_loss": stop_loss_price,
+                            "take_profit": take_profit_price})
+        return trade_id
+    except Exception:
+        return None
+
+
+def _auto_close_paper_trade(user_id: str, symbol: str, market: str, close_price: float) -> Optional[str]:
+    """Close the most recent open paper trade for a symbol. Returns trade_id or None."""
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text("""
+                SELECT id FROM paper_trades
+                WHERE user_id = :uid AND symbol = :sym AND market = :mkt AND status = 'open'
+                ORDER BY created_at DESC LIMIT 1
+            """), {"uid": user_id, "sym": symbol, "mkt": market}).fetchone()
+            if not row:
+                return None
+            trade_id = row[0]
+            conn.execute(text("""
+                UPDATE paper_trades
+                SET status = 'closed', current_price = :cp, closed_at = :now,
+                    position_stage = 'closed', updated_at = :now,
+                    notes = COALESCE(notes, '') || ' | Closed via Telegram SELL command'
+                WHERE id = :tid AND user_id = :uid
+            """), {"cp": close_price, "now": datetime.utcnow(), "tid": trade_id, "uid": user_id})
+        log_position_event(trade_id, user_id, "closed",
+                           f"Closed via Telegram SELL command at {close_price}",
+                           {"close_price": close_price})
+        return trade_id
+    except Exception:
+        return None
+
+
+_TELEGRAM_BOT_COMMANDS_HELP = """\
+<b>📱 ASX Bot Commands</b>
+
+<b>Trade Recording (updates your portfolio):</b>
+  <code>BUY BHP 100 45.50</code>  — record a buy, auto-starts monitoring
+  <code>ADD FMG 200 @ 18.50</code> — add to existing position
+  <code>SELL CBA 50 @ 123.00</code> — record a sell, closes monitoring
+  <code>REDUCE WOW 100 30.00</code> — reduce position size
+
+<b>Portfolio &amp; Status:</b>
+  <code>PORTFOLIO</code> or <code>P</code> — show your current holdings
+  <code>STATUS</code> or <code>S</code> — show open monitored positions with P&amp;L
+  <code>TRACK BHP</code> — add BHP to your watchlist
+
+<b>Other:</b>
+  <code>HELP</code> — show this guide
+
+<i>Prices are recorded at the price you specify. Monitoring uses 8% stop-loss, 3% trailing stop, and model target price. Alerts fire on Telegram automatically.</i>
+"""
+
+
+@app.post("/api/telegram/bot-webhook")
+async def telegram_bot_webhook(request: Request):
+    """Receive Telegram bot updates (messages from users).
+    Telegram calls this endpoint directly — no auth header required.
+    Supports trade commands, portfolio queries, and help.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    message = body.get("message") or body.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = str((message.get("chat") or {}).get("id") or "")
+    text = (message.get("text") or "").strip()
+    if not chat_id or not text:
+        return {"ok": True}
+
+    # Look up user by chat_id
+    user_id, ambiguous = _resolve_user_for_chat(chat_id)
+    if not user_id:
+        _send_telegram_reply(chat_id,
+            "Your Telegram chat is not linked to any account.\n"
+            "Open the app, go to Strategy > Telegram Setup and add your chat ID: " + chat_id
+        )
+        return {"ok": True}
+
+    cmd = text.strip().upper()
+
+    # ── HELP ───────────────────────────────────────────────────────────────
+    if cmd in {"HELP", "/HELP", "/START"}:
+        _send_telegram_reply(chat_id, _TELEGRAM_BOT_COMMANDS_HELP)
+        return {"ok": True}
+
+    # ── PORTFOLIO ──────────────────────────────────────────────────────────
+    if cmd in {"PORTFOLIO", "P", "/PORTFOLIO"}:
+        holdings = get_user_execution_holdings(user_id)
+        if not holdings:
+            _send_telegram_reply(chat_id, "No holdings recorded yet. Send: <code>BUY BHP 100 45.50</code> to record a trade.")
+            return {"ok": True}
+        lines = ["<b>💼 Your Portfolio</b>\n"]
+        for h in holdings:
+            lines.append(
+                f"<b>{h['symbol']}</b> — {h['quantity']} @ avg ${h['avg_cost']:.2f} "
+                f"| Invested: ${h['invested_amount']:.0f}"
+            )
+        _send_telegram_reply(chat_id, "\n".join(lines))
+        return {"ok": True}
+
+    # ── STATUS ─────────────────────────────────────────────────────────────
+    if cmd in {"STATUS", "S", "/STATUS"}:
+        trades = list_paper_trades(user_id)
+        open_trades = [t for t in trades if t.get("status") == "open"]
+        if not open_trades:
+            _send_telegram_reply(chat_id, "No open monitored positions. Send <code>BUY SYMBOL QTY PRICE</code> to start tracking.")
+            return {"ok": True}
+        lines = ["<b>📊 Open Positions</b>\n"]
+        for t in open_trades:
+            pnl = t.get("unrealized_pnl_pct", 0) or 0
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            stage = (t.get("position_stage") or "entered").upper()
+            lines.append(
+                f"{pnl_emoji} <b>{t['symbol']}</b> {t.get('quantity')} | "
+                f"Entry ${t['entry_price']:.2f} → Now ${t.get('current_price', t['entry_price']):.2f} "
+                f"({pnl:+.1f}%) | Stage: {stage}"
+            )
+        _send_telegram_reply(chat_id, "\n".join(lines))
+        return {"ok": True}
+
+    # ── TRACK SYMBOL ───────────────────────────────────────────────────────
+    if cmd.startswith("TRACK "):
+        sym = cmd.split(" ", 1)[1].strip().upper()
+        if sym:
+            try:
+                with db_conn() as conn:
+                    existing = conn.execute(
+                        text("SELECT symbol FROM user_shares WHERE user_id = :uid AND symbol = :sym"),
+                        {"uid": user_id, "sym": sym}
+                    ).fetchone()
+                    if not existing:
+                        conn.execute(
+                            text("INSERT INTO user_shares (user_id, symbol, name) VALUES (:uid, :sym, :name)"),
+                            {"uid": user_id, "sym": sym, "name": sym}
+                        )
+                _send_telegram_reply(chat_id, f"✅ <b>{sym}</b> added to your watchlist.")
+            except Exception:
+                _send_telegram_reply(chat_id, f"Could not add {sym} to watchlist.")
+        return {"ok": True}
+
+    # ── TRADE COMMANDS ─────────────────────────────────────────────────────
+    trade_cmd = _parse_trade_command(text)
+    if trade_cmd:
+        action = trade_cmd["action"]     # BUY | SELL | ADD | REDUCE
+        symbol = trade_cmd["symbol"]
+        quantity = trade_cmd["quantity"]
+        price = trade_cmd["price"]
+        market = detect_market(symbol)
+
+        # Record in advice_execution_actions (updates portfolio holdings)
+        result = _create_advice_action_for_user(
+            user_id=user_id,
+            symbol=symbol,
+            market=market,
+            action_type=action,
+            quantity=quantity,
+            execution_price=price,
+            commission=None,
+            advice_cache_key=None,
+            source_message_type="telegram_bot",
+            notes=f"Telegram: {text}",
+        )
+
+        # Auto-create paper trade monitor on BUY/ADD
+        trade_id = None
+        monitoring_msg = ""
+        if action in {"BUY", "ADD"}:
+            trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
+            if trade_id:
+                stop = round(price * 0.92, 2)
+                target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
+                monitoring_msg = (
+                    f"\n\n<b>Monitoring started</b>\n"
+                    f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
+                    f"Target: model forecast | Trailing stop: 3%\n"
+                    f"You'll get alerts if price hits stop, target, or goes flat 30 days."
+                )
+
+        # Auto-close paper trade monitor on SELL/REDUCE
+        closed_id = None
+        if action in {"SELL", "REDUCE"}:
+            closed_id = _auto_close_paper_trade(user_id, symbol, market, price)
+            if closed_id:
+                monitoring_msg = "\n\n<b>Position monitoring closed.</b>"
+
+        # Format confirmation
+        fee = result.get("commission", 0) or 0
+        gross = result.get("gross_amount", 0) or 0
+        net = result.get("net_amount", 0) or 0
+        action_emoji = {"BUY": "✅", "ADD": "✅", "SELL": "💰", "REDUCE": "💰"}.get(action, "📝")
+        reply = (
+            f"{action_emoji} <b>{action} {symbol}</b> recorded\n"
+            f"Qty: <b>{quantity}</b> @ <b>${price:.2f}</b>\n"
+            f"Gross: ${gross:.2f} | Fee: ${fee:.2f} | Net: ${net:.2f}"
+            f"{monitoring_msg}\n\n"
+            f"<i>Portfolio updated. Check Strategy &gt; Holdings in the app.</i>"
+        )
+        _send_telegram_reply(chat_id, reply)
+        return {"ok": True}
+
+    # ── Unrecognised command ────────────────────────────────────────────────
+    _send_telegram_reply(chat_id,
+        f"Hmm, I didn't understand that. Try:\n"
+        f"<code>BUY BHP 100 45.50</code>\n"
+        f"<code>SELL CBA 50 123.00</code>\n"
+        f"<code>PORTFOLIO</code> or <code>STATUS</code>\n"
+        f"Send <code>HELP</code> for all commands."
+    )
+    return {"ok": True}
+
+
+@app.post("/api/telegram/register-webhook")
+async def register_telegram_webhook(request: Request, current_user: dict = Depends(get_current_user)):
+    """Register (or refresh) the Telegram bot webhook URL with Telegram's API.
+    Call this once after deploying or changing the API URL.
+    """
+    del current_user
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not configured")
+
+    # Try to auto-detect the public URL from the request Host header
+    host = request.headers.get("host") or request.headers.get("x-forwarded-host") or ""
+    proto = request.headers.get("x-forwarded-proto") or "https"
+    if not host:
+        raise HTTPException(status_code=400, detail="Could not determine public host from request headers")
+
+    webhook_url = f"{proto}://{host}/api/telegram/bot-webhook"
+    resp = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+        json={"url": webhook_url, "allowed_updates": ["message", "edited_message"]},
+        timeout=10,
+    )
+    body = resp.json() if resp.content else {}
+    return {
+        "ok": body.get("ok"),
+        "webhook_url": webhook_url,
+        "telegram_response": body,
+    }
+
+
+if SCHEDULER_AVAILABLE:
+
+    try:
+        scheduler = BackgroundScheduler(timezone=_get_scheduler_timezone())
+        cron_expr = os.getenv("WEEKLY_GENERATION_CRON", "0 8 * * 1")  # Monday 8AM
+        parts = cron_expr.split()
+        scheduler.add_job(
+            _scheduled_weekly_generation, "cron",
+            minute=int(parts[0]) if len(parts) > 0 else 0,
+            hour=int(parts[1]) if len(parts) > 1 else 8,
+            day_of_week="mon",
+        )
+        daily_cron = os.getenv("DAILY_DIGEST_CRON", "0 8 * * *")
+        daily_parts = daily_cron.split()
+        scheduler.add_job(
+            _scheduled_daily_digest, "cron",
+            minute=int(daily_parts[0]) if len(daily_parts) > 0 else 15,
+            hour=int(daily_parts[1]) if len(daily_parts) > 1 else 8,
+        )
+        scheduler.add_job(
+            _scheduled_paper_trade_monitor, "cron",
+            minute="0,15,30,45"
+        )
+        scheduler.add_job(
+            _scheduled_broad_scan_precompute, "cron",
+            minute=0, hour=5,
+            id="broad_scan_5am",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_wealth_builder_evaluate, "cron",
+            minute=30, hour=8,
+            id="wealth_builder_evaluate",
+            max_instances=1,
+        )
+        scheduler.start()
+        # Catch up immediately after restart with a capped batch to avoid startup CPU/network spikes.
+        startup_catchup_enabled = os.getenv("PAPER_MONITOR_STARTUP_CATCHUP", "true").strip().lower() not in {"0", "false", "no"}
+        if startup_catchup_enabled:
+            startup_max_trades = max(10, int(os.getenv("PAPER_MONITOR_STARTUP_MAX_TRADES", "75")))
+            _scheduled_paper_trade_monitor(max_trades_override=startup_max_trades)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ function Meetings({ token, apiCall, setError, setSuccess }) {
   const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState(null)
+  const [countsInfo, setCountsInfo] = useState({ today: 0, next7: 0 })
   const [formData, setFormData] = useState({
     customer_id: '',
     title: '',
@@ -17,6 +18,11 @@ function Meetings({ token, apiCall, setError, setSuccess }) {
 
   useEffect(() => {
     loadData()
+    // Load today/next-7-days counts
+    apiCall('/api/broker/dashboard/metrics')
+      .then(r => r.json())
+      .then(d => setCountsInfo({ today: d.today_meetings || 0, next7: d.next_7_days_meetings || 0 }))
+      .catch(() => {})
   }, [])
 
   const loadData = async () => {
@@ -105,14 +111,40 @@ function Meetings({ token, apiCall, setError, setSuccess }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <h2>Meetings</h2>
         <button
           className="btn btn-primary"
           onClick={() => setShowForm(!showForm)}
         >
-          {showForm ? '✕ Cancel' : '+ Schedule Meeting'}
+          {showForm ? '\u2715 Cancel' : '+ Schedule Meeting'}
         </button>
+      </div>
+
+      {/* Today + Next 7 Days counts */}
+      <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
+        <div className="card" style={{ flex: 1, padding: '1rem 1.5rem', display: 'flex', alignItems: 'center', gap: '1rem', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', color: 'white' }}>
+          <span style={{ fontSize: '2.5rem', fontWeight: 700 }}>{countsInfo.today}</span>
+          <div>
+            <div style={{ fontWeight: 600 }}>Today\'s Meetings</div>
+            <div style={{ fontSize: '0.85rem', opacity: 0.85 }}>{new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'short' })}</div>
+          </div>
+        </div>
+        <div className="card" style={{ flex: 1, padding: '1rem 1.5rem', display: 'flex', alignItems: 'center', gap: '1rem', background: 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)', color: 'white' }}>
+          <span style={{ fontSize: '2.5rem', fontWeight: 700 }}>{countsInfo.next7}</span>
+          <div>
+            <div style={{ fontWeight: 600 }}>Next 7 Days</div>
+            <div style={{ fontSize: '0.85rem', opacity: 0.85 }}>Upcoming scheduled meetings</div>
+          </div>
+        </div>
+        <div className="card" style={{ flex: 1, padding: '1rem 1.5rem', display: 'flex', alignItems: 'center', gap: '1rem', background: '#f9fafb', border: '1px solid #e5e7eb' }}>
+          <span style={{ fontSize: '2rem' }}>📥</span>
+          <div>
+            <div style={{ fontWeight: 600, color: '#374151' }}>CSV Import</div>
+            <div style={{ fontSize: '0.85rem', color: '#6b7280' }}>Use Dashboard › CSV Import tab</div>
+            <div style={{ fontSize: '0.8rem', color: '#9ca3af' }}>Imports go to Customers table</div>
+          </div>
+        </div>
       </div>
 
       {showForm && (

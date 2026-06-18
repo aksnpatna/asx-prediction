@@ -11,20 +11,20 @@ const STATUS_LABELS = {
 }
 
 const STATUS_COLORS = {
-  pending:     { background: '#fff3cd', color: '#856404' },
-  in_progress: { background: '#cce5ff', color: '#004085' },
-  completed:   { background: '#d4edda', color: '#155724' },
-  closed:      { background: '#e2e3e5', color: '#383d41' },
+  pending:     { background: '#854d0e44', color: '#FDE68A', border: '1px solid #F59E0B55' },
+  in_progress: { background: '#1e3a8a44', color: '#93C5FD', border: '1px solid #3B82F655' },
+  completed:   { background: '#14532d44', color: '#86EFAC', border: '1px solid #10B98155' },
+  closed:      { background: '#33415544', color: '#94A3B8', border: '1px solid #33415588' },
 }
 
 const PRIORITY_COLORS = {
-  low:    { background: '#e2e3e5', color: '#383d41' },
-  medium: { background: '#fff3cd', color: '#856404' },
-  high:   { background: '#f8d7da', color: '#721c24' },
+  low:    { background: '#33415544', color: '#94A3B8', border: '1px solid #33415588' },
+  medium: { background: '#854d0e44', color: '#FDE68A', border: '1px solid #F59E0B55' },
+  high:   { background: '#7f1d1d44', color: '#FCA5A5', border: '1px solid #EF444455' },
 }
 
 function Badge({ text, colorMap }) {
-  const style = colorMap[text] || { background: '#eee', color: '#333' }
+  const style = colorMap[text] || { background: '#33415544', color: '#94A3B8' }
   return (
     <span style={{
       display: 'inline-block',
@@ -39,11 +39,25 @@ function Badge({ text, colorMap }) {
   )
 }
 
+// Strip legacy 'WA:' prefix; return '+phone' if purely numeric, else original name
+function cleanCustomerName(name) {
+  if (!name || name === 'Unknown') return null
+  const stripped = name.startsWith('WA:') ? name.slice(3) : name
+  if (/^\d{6,}$/.test(stripped)) return `+${stripped}`
+  return name
+}
+
+function isPhoneOnlyName(name) {
+  if (!name) return false
+  const stripped = name.startsWith('WA:') ? name.slice(3) : name
+  return /^\d{6,}$/.test(stripped)
+}
+
 function AllLeads({ apiCall, setError, setSuccess }) {
   const [leads, setLeads] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState('pending')
   const [expandedId, setExpandedId] = useState(null)
   const [updating, setUpdating] = useState(null)
 
@@ -102,7 +116,7 @@ function AllLeads({ apiCall, setError, setSuccess }) {
       {/* Page header */}
       <div style={{ marginBottom: '1.5rem' }}>
         <h2 style={{ marginBottom: '0.25rem' }}>📋 All Leads</h2>
-        <p style={{ color: '#666', fontSize: '0.95rem' }}>
+        <p style={{ color: '#94A3B8', fontSize: '0.95rem' }}>
           Manage and track all your customer interactions.
         </p>
       </div>
@@ -117,20 +131,21 @@ function AllLeads({ apiCall, setError, setSuccess }) {
             onChange={e => setSearch(e.target.value)}
             style={{
               flex: 1, minWidth: '200px', padding: '0.6rem 1rem',
-              border: '1px solid #ddd', borderRadius: '6px', fontSize: '0.95rem'
+              border: '1px solid #334155', borderRadius: '6px', fontSize: '0.95rem',
+              background: '#0F172A', color: '#F1F5F9',
             }}
           />
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
             style={{
-              padding: '0.6rem 1rem', border: '1px solid #ddd',
-              borderRadius: '6px', fontSize: '0.95rem', background: 'white'
+              padding: '0.6rem 1rem', border: '1px solid #334155',
+              borderRadius: '6px', fontSize: '0.95rem', background: '#1E293B', color: '#F1F5F9'
             }}
           >
             {STATUS_OPTIONS.map(s => (
               <option key={s} value={s}>
-                {s === 'all' ? 'All Statuses' : STATUS_LABELS[s]}
+                {s === 'all' ? 'All (incl. empty messages)' : STATUS_LABELS[s]}
               </option>
             ))}
           </select>
@@ -143,11 +158,11 @@ function AllLeads({ apiCall, setError, setSuccess }) {
       {/* Table */}
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
         {loading ? (
-          <div style={{ padding: '2rem', textAlign: 'center', color: '#666' }}>
+          <div style={{ padding: '2rem', textAlign: 'center', color: '#94A3B8' }}>
             Loading leads...
           </div>
         ) : leads.length === 0 ? (
-          <div style={{ padding: '3rem', textAlign: 'center', color: '#999' }}>
+          <div style={{ padding: '3rem', textAlign: 'center', color: '#94A3B8' }}>
             <p style={{ fontSize: '1.1rem', marginBottom: '0.5rem' }}>No leads found.</p>
             <p style={{ fontSize: '0.9rem' }}>
               Record a meeting with the Voice Recorder and the extracted data will appear here.
@@ -172,17 +187,17 @@ function AllLeads({ apiCall, setError, setSuccess }) {
                     <tr style={{ cursor: 'pointer' }}>
                       {/* Customer */}
                       <td>
-                        <div style={{ fontWeight: 600, color: '#333' }}>
-                          {lead.customer_name}
+                        <div style={{ fontWeight: 600, color: isPhoneOnlyName(lead.customer_name) ? '#94A3B8' : '#F1F5F9', fontFamily: isPhoneOnlyName(lead.customer_name) ? 'monospace' : 'inherit' }}>
+                          {cleanCustomerName(lead.customer_name) || 'Unknown'}
                         </div>
-                        <div style={{ fontSize: '0.75rem', color: '#999', marginTop: '2px' }}>
+                        <div style={{ fontSize: '0.75rem', color: '#94A3B8', marginTop: '2px' }}>
                           {formatDate(lead.created_at)}
                         </div>
                       </td>
 
                       {/* Next Action = first action item or discussion summary */}
                       <td>
-                        <div style={{ fontSize: '0.9rem', color: '#444', lineHeight: 1.4 }}>
+                        <div style={{ fontSize: '0.9rem', color: '#CBD5E1', lineHeight: 1.4 }}>
                           {lead.action_items && lead.action_items.length > 0
                             ? lead.action_items[0]
                             : lead.discussion_summary
@@ -191,7 +206,7 @@ function AllLeads({ apiCall, setError, setSuccess }) {
                           }
                         </div>
                         {lead.follow_ups && lead.follow_ups !== 'None mentioned.' && (
-                          <div style={{ fontSize: '0.8rem', color: '#888', marginTop: '4px' }}>
+                          <div style={{ fontSize: '0.8rem', color: '#94A3B8', marginTop: '4px' }}>
                             ↩ {lead.follow_ups.substring(0, 100)}{lead.follow_ups.length > 100 ? '…' : ''}
                           </div>
                         )}
@@ -199,7 +214,7 @@ function AllLeads({ apiCall, setError, setSuccess }) {
 
                       {/* Follow Up date */}
                       <td>
-                        <div style={{ fontSize: '0.9rem', color: lead.next_meeting ? '#333' : '#bbb' }}>
+                        <div style={{ fontSize: '0.9rem', color: lead.next_meeting ? '#F1F5F9' : '#475569' }}>
                           {lead.next_meeting ? (
                             <>
                               📅 <span style={{ fontWeight: 500 }}>{lead.next_meeting}</span>
@@ -216,12 +231,11 @@ function AllLeads({ apiCall, setError, setSuccess }) {
                           onChange={e => updateLead(lead.id, 'priority', e.target.value)}
                           style={{
                             padding: '0.25rem 0.5rem',
-                            border: '1px solid #ddd',
+                            border: '1px solid #334155',
                             borderRadius: '6px',
                             fontSize: '0.82rem',
-                            background: 'white',
                             cursor: 'pointer',
-                            ...(PRIORITY_COLORS[lead.priority] || {})
+                            ...(PRIORITY_COLORS[lead.priority] || { background: '#1E293B', color: '#F1F5F9' })
                           }}
                         >
                           {PRIORITY_OPTIONS.map(p => (
@@ -238,12 +252,11 @@ function AllLeads({ apiCall, setError, setSuccess }) {
                           onChange={e => updateLead(lead.id, 'status', e.target.value)}
                           style={{
                             padding: '0.25rem 0.5rem',
-                            border: '1px solid #ddd',
+                            border: '1px solid #334155',
                             borderRadius: '6px',
                             fontSize: '0.82rem',
-                            background: 'white',
                             cursor: 'pointer',
-                            ...(STATUS_COLORS[lead.status] || {})
+                            ...(STATUS_COLORS[lead.status] || { background: '#1E293B', color: '#F1F5F9' })
                           }}
                         >
                           {Object.entries(STATUS_LABELS).map(([val, label]) => (
@@ -266,57 +279,67 @@ function AllLeads({ apiCall, setError, setSuccess }) {
 
                     {/* Expanded detail row */}
                     {expandedId === lead.id && (
-                      <tr style={{ background: '#f8f9fa' }}>
+                      <tr style={{ background: '#162032' }}>
                         <td colSpan={6} style={{ padding: '1.25rem 1.5rem' }}>
                           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
                             {/* Discussion Summary */}
                             <div>
-                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#555' }}>
+                            <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94A3B8' }}>
                                 💬 Discussion Summary
                               </div>
-                              <p style={{ fontSize: '0.9rem', color: '#444', lineHeight: 1.5 }}>
+                              <p style={{ fontSize: '0.9rem', color: '#CBD5E1', lineHeight: 1.5 }}>
                                 {lead.discussion_summary || '—'}
                               </p>
                             </div>
 
                             {/* Action Items */}
                             <div>
-                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#555' }}>
+                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94A3B8' }}>
                                 ✅ Action Items
                               </div>
                               {lead.action_items && lead.action_items.length > 0 ? (
-                                <ul style={{ paddingLeft: '1.2rem', fontSize: '0.9rem', color: '#444' }}>
+                                <ul style={{ paddingLeft: '1.2rem', fontSize: '0.9rem', color: '#CBD5E1' }}>
                                   {lead.action_items.map((item, i) => (
                                     <li key={i} style={{ marginBottom: '0.25rem' }}>{item}</li>
                                   ))}
                                 </ul>
-                              ) : <p style={{ color: '#bbb', fontSize: '0.9rem' }}>None</p>}
+                              ) : <p style={{ color: '#475569', fontSize: '0.9rem' }}>None</p>}
                             </div>
 
                             {/* Key Points */}
                             <div>
-                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#555' }}>
+                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94A3B8' }}>
                                 🔑 Key Points
                               </div>
                               {lead.key_points && lead.key_points.length > 0 ? (
-                                <ul style={{ paddingLeft: '1.2rem', fontSize: '0.9rem', color: '#444' }}>
+                                <ul style={{ paddingLeft: '1.2rem', fontSize: '0.9rem', color: '#CBD5E1' }}>
                                   {lead.key_points.map((pt, i) => (
                                     <li key={i} style={{ marginBottom: '0.25rem' }}>{pt}</li>
                                   ))}
                                 </ul>
-                              ) : <p style={{ color: '#bbb', fontSize: '0.9rem' }}>None</p>}
+                              ) : <p style={{ color: '#475569', fontSize: '0.9rem' }}>None</p>}
                             </div>
 
                             {/* Follow-ups */}
                             <div>
-                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#555' }}>
+                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94A3B8' }}>
                                 ↩ Follow-ups
                               </div>
-                              <p style={{ fontSize: '0.9rem', color: '#444', lineHeight: 1.5 }}>
+                              <p style={{ fontSize: '0.9rem', color: '#CBD5E1', lineHeight: 1.5 }}>
                                 {lead.follow_ups || '—'}
                               </p>
                             </div>
                           </div>
+
+                          {/* Transcript */}
+                          {lead.transcript && (
+                            <div style={{ marginTop: '1rem', paddingTop: '1rem', borderTop: '1px solid #334155' }}>
+                              <div style={{ fontWeight: 600, marginBottom: '0.4rem', color: '#94A3B8' }}>🎙 Transcript / Message</div>
+                              <p style={{ fontSize: '0.875rem', color: '#CBD5E1', lineHeight: 1.6, background: '#0F172A', padding: '0.75rem 1rem', borderRadius: '6px', margin: 0 }}>
+                                {lead.transcript}
+                              </p>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     )}
@@ -328,7 +351,7 @@ function AllLeads({ apiCall, setError, setSuccess }) {
         )}
       </div>
 
-      <div style={{ textAlign: 'right', color: '#999', fontSize: '0.85rem', marginTop: '0.5rem' }}>
+      <div style={{ textAlign: 'right', color: '#94A3B8', fontSize: '0.85rem', marginTop: '0.5rem' }}>
         {leads.length} lead{leads.length !== 1 ? 's' : ''} found
       </div>
     </div>

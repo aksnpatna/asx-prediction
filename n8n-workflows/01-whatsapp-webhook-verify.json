@@ -1,0 +1,60 @@
+{
+  "name": "WhatsApp - Webhook Verify (GET)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000001",
+      "name": "Webhook Verify",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "whatsapp-verify-get"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Meta sends: ?hub.mode=subscribe&hub.verify_token=TOKEN&hub.challenge=CHALLENGE\nconst query = $input.first().json.query || {};\nconst verifyToken = $env.WHATSAPP_VERIFY_TOKEN || 'my_verify_token';\n\nif (query['hub.mode'] === 'subscribe' && query['hub.verify_token'] === verifyToken) {\n  return [{ json: { challenge: query['hub.challenge'] } }];\n}\nreturn [{ json: { error: 'token mismatch' } }];"
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000002",
+      "name": "Verify Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.challenge }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000003",
+      "name": "Respond with Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Verify": {
+      "main": [
+        [{ "node": "Verify Token", "type": "main", "index": 0 }]
+      ]
+    },
+    "Verify Token": {
+      "main": [
+        [{ "node": "Respond with Challenge", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "v1"
+}

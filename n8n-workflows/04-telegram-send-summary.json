@@ -1,0 +1,76 @@
+{
+  "name": "Telegram - Send Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "telegram/summary",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "t1b2c3d4-0004-0004-0004-000000000001",
+      "name": "Webhook Summary",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "telegram-summary"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json.body || $json;\n\n// Support both multi-recipient (chat_ids array) and legacy single chat_id\nconst chatIds = (data.chat_ids && data.chat_ids.length > 0)\n  ? data.chat_ids\n  : [data.chat_id || '8761969021'];\n\n// Use pre-formatted text from the Python backend (already HTML-formatted)\nconst text = data.text || 'New message received.';\n\n// Return one item per recipient so the Telegram node fans out\nreturn chatIds.map(chatId => ({ json: { text, chat_id: String(chatId) } }));"
+      },
+      "id": "t1b2c3d4-0004-0004-0004-000000000002",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parseMode": "HTML"
+        }
+      },
+      "id": "t1b2c3d4-0004-0004-0004-000000000003",
+      "name": "Send Telegram Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [680, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credential",
+          "name": "Telegram Bot (Aksnpatbot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"sent\"}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "t1b2c3d4-0004-0004-0004-000000000004",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Summary": {
+      "main": [[{ "node": "Format Message", "type": "main", "index": 0 }]]
+    },
+    "Format Message": {
+      "main": [[{ "node": "Send Telegram Message", "type": "main", "index": 0 }]]
+    },
+    "Send Telegram Message": {
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "v2"
+}

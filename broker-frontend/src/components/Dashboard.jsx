@@ -1,981 +1,453 @@
 import React, { useState, useEffect } from 'react'
 
+const PRI_COLORS = { high: '#EF4444', medium: '#F59E0B', low: '#22C55E' }
+const CAT_META = {
+  meeting:   { icon: '📅', color: '#3B82F6', label: 'Meeting' },
+  financial: { icon: '💰', color: '#10B981', label: 'Financial' },
+  planning:  { icon: '📋', color: '#F59E0B', label: 'Planning' },
+  process:   { icon: '⚙️', color: '#06B6D4', label: 'Process' },
+  inquiry:   { icon: '❓', color: '#EC4899', label: 'Inquiry' },
+  update:    { icon: '📝', color: '#64748B', label: 'Update' },
+  general:   { icon: '💬', color: '#94A3B8', label: 'General' },
+}
+const CARD = { background: '#1E293B', border: '1px solid #334155', borderRadius: 12, padding: '1.25rem' }
+
 function Dashboard({ token, apiCall, brokerId }) {
-  const [meetings, setMeetings] = useState([])
+  const [metrics, setMetrics] = useState(null)
+  const [summaries, setSummaries] = useState([])
+  const [categories, setCategories] = useState([])
   const [loading, setLoading] = useState(true)
-  const [metrics, setMetrics] = useState({
-    total_meetings: 0,
-    total_customers: 0,
-    meetings_this_month: 0,
-    avg_meeting_duration: 0,
-    busiest_day: 'N/A',
-    upcoming_meetings: 0
-  })
+  const [activeTab, setActiveTab] = useState('overview')
+  const [catFilter, setCatFilter] = useState('all')
   const [csvFile, setCsvFile] = useState(null)
   const [csvLoading, setCsvLoading] = useState(false)
   const [csvMessage, setCsvMessage] = useState('')
-  const [csvMatches, setCsvMatches] = useState(null)
-  const [calendarStatus, setCalendarStatus] = useState(null)
-  const [calendarLoading, setCalendarLoading] = useState(false)
-  const [activeTab, setActiveTab] = useState('overview') // overview, csv, transcripts, analytics, calendar
-  const [upcomingLeads, setUpcomingLeads] = useState([])
+  const [recordMode, setRecordMode] = useState(false)
 
-  useEffect(() => {
-    loadDashboardData()
-  }, [])
+  useEffect(() => { loadAll() }, [])
 
-  const loadDashboardData = async () => {
+  const loadAll = async () => {
+    setLoading(true)
     try {
-      setLoading(true)
-      
-      // Load metrics
-      const metricsRes = await apiCall('/api/broker/dashboard/metrics')
-      const metricsData = await metricsRes.json()
-      setMetrics(metricsData)
-      
-      // Load today's meetings
-      const meetingsRes = await apiCall('/api/broker/dashboard/today')
-      const meetingsData = await meetingsRes.json()
-      setMeetings(meetingsData.meetings || [])
-
-      // Load upcoming leads (next 7 days)
-      try {
-        const leadsRes = await apiCall('/api/broker/leads/upcoming?days=7')
-        const leadsData = await leadsRes.json()
-        setUpcomingLeads(Array.isArray(leadsData) ? leadsData : [])
-      } catch (e) {
-        console.warn('Could not load upcoming leads:', e.message)
-      }
-    } catch (err) {
-      console.error('Error loading dashboard:', err)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const loadCalendarStatus = async () => {
-    try {
-      setCalendarLoading(true)
-      const response = await apiCall('/api/broker/calendar/status')
-      const data = await response.json()
-      setCalendarStatus(data)
-    } catch (err) {
-      console.error('Error loading calendar status:', err)
-    } finally {
-      setCalendarLoading(false)
-    }
+      const [mR, cR] = await Promise.all([
+        apiCall('/api/broker/dashboard/metrics'),
+        apiCall('/api/broker/dashboard/categories').catch(() => ({ json: () => ({ categories: [] }) })),
+      ])
+      const md = await mR.json()
+      setMetrics(md)
+      setSummaries(md.recent_summaries || [])
+      const cd = await cR.json()
+      setCategories(cd.categories || [])
+    } catch (err) { console.error(err) }
+    finally { setLoading(false) }
   }
 
   const handleCsvUpload = async (e) => {
     const file = e.target.files[0]
     if (!file) return
-
     setCsvLoading(true)
     setCsvMessage('')
-
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-
-      const response = await fetch(
-        `/api/broker/csv/import-smart?token=${token}`,
-        {
-          method: 'POST',
-          body: formData
-        }
-      )
-
-      const data = await response.json()
-      if (response.ok) {
-        setCsvMatches(data)
-        const msg = `✅ Imported ${data.imported_records} records • ${data.matched_customers} matched • ${data.new_customers} new customers`
-        setCsvMessage(msg)
-        setCsvFile(null)
-        setTimeout(() => loadDashboardData(), 1000) // Refresh metrics
-      } else {
-        setCsvMessage(`❌ Error: ${data.detail}`)
-      }
-    } catch (err) {
-      setCsvMessage(`❌ Upload failed: ${err.message}`)
-    } finally {
-      setCsvLoading(false)
-    }
+      const fd = new FormData()
+      fd.append('file', file)
+      const r = await fetch(`/api/broker/csv/import-smart?token=${token}`, { method: 'POST', body: fd })
+      const d = await r.json()
+      if (r.ok) { setCsvMessage(`Imported ${d.imported_records} records - ${d.matched_customers} matched`); setTimeout(loadAll, 1000) }
+      else setCsvMessage(`Error: ${d.detail}`)
+    } catch (err) { setCsvMessage(`Failed: ${err.message}`) }
+    finally { setCsvLoading(false) }
   }
+
+  if (loading) return <div style={{ padding: '2rem', textAlign: 'center', color: '#94A3B8' }}>Loading...</div>
+  if (recordMode) return <VoiceRecorder apiCall={apiCall} onClose={() => { setRecordMode(false); loadAll() }} />
 
   return (
     <div>
-      <h2>Broker Dashboard</h2>
-
-      {/* Tab Navigation */}
-      <div style={{ display: 'flex', gap: '1rem', marginBottom: '2rem', borderBottom: '2px solid #e0e0e0', paddingBottom: '1rem' }}>
-        <button
-          onClick={() => setActiveTab('overview')}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: activeTab === 'overview' ? '#667eea' : 'transparent',
-            color: activeTab === 'overview' ? 'white' : '#333',
-            border: 'none',
-            cursor: 'pointer',
-            borderRadius: '4px 4px 0 0',
-            fontWeight: activeTab === 'overview' ? 'bold' : 'normal'
-          }}
-        >
-          📊 Overview
-        </button>
-        <button
-          onClick={() => setActiveTab('csv')}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: activeTab === 'csv' ? '#667eea' : 'transparent',
-            color: activeTab === 'csv' ? 'white' : '#333',
-            border: 'none',
-            cursor: 'pointer',
-            borderRadius: '4px 4px 0 0',
-            fontWeight: activeTab === 'csv' ? 'bold' : 'normal'
-          }}
-        >
-          📥 CSV Import
-        </button>
-        <button
-          onClick={() => setActiveTab('transcripts')}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: activeTab === 'transcripts' ? '#667eea' : 'transparent',
-            color: activeTab === 'transcripts' ? 'white' : '#333',
-            border: 'none',
-            cursor: 'pointer',
-            borderRadius: '4px 4px 0 0',
-            fontWeight: activeTab === 'transcripts' ? 'bold' : 'normal'
-          }}
-        >
-          📝 Transcripts
-        </button>
-        <button
-          onClick={() => setActiveTab('analytics')}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: activeTab === 'analytics' ? '#667eea' : 'transparent',
-            color: activeTab === 'analytics' ? 'white' : '#333',
-            border: 'none',
-            cursor: 'pointer',
-            borderRadius: '4px 4px 0 0',
-            fontWeight: activeTab === 'analytics' ? 'bold' : 'normal'
-          }}
-        >
-          📈 Analytics
-        </button>
-        <button
-          onClick={() => {
-            setActiveTab('calendar')
-            loadCalendarStatus()
-          }}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: activeTab === 'calendar' ? '#667eea' : 'transparent',
-            color: activeTab === 'calendar' ? 'white' : '#333',
-            border: 'none',
-            cursor: 'pointer',
-            borderRadius: '4px 4px 0 0',
-            fontWeight: activeTab === 'calendar' ? 'bold' : 'normal'
-          }}
-        >
-          📅 Calendar
-        </button>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: 8 }}>
+        <h2 style={{ margin: 0 }}>Dashboard</h2>
+        <button onClick={() => setRecordMode(true)} style={{ background: '#25D366', color: '#fff', border: 'none', borderRadius: 8, padding: '10px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' }}>🎤 Record Voice Note</button>
       </div>
 
-      {/* Overview Tab */}
-      {activeTab === 'overview' && (
-        <div>
-          {/* Metrics Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
-            <div className="card" style={{ textAlign: 'center', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', color: 'white', padding: '2rem' }}>
-              <h3 style={{ margin: '0.5rem 0', fontSize: '2.5rem' }}>{metrics.total_customers}</h3>
-              <p style={{ margin: '0.5rem 0', fontSize: '1rem' }}>Total Customers</p>
-            </div>
-            <div className="card" style={{ textAlign: 'center', background: 'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)', color: 'white', padding: '2rem' }}>
-              <h3 style={{ margin: '0.5rem 0', fontSize: '2.5rem' }}>{metrics.meetings_this_month}</h3>
-              <p style={{ margin: '0.5rem 0', fontSize: '1rem' }}>Meetings This Month</p>
-            </div>
-            <div className="card" style={{ textAlign: 'center', background: 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)', color: 'white', padding: '2rem' }}>
-              <h3 style={{ margin: '0.5rem 0', fontSize: '2.5rem' }}>{metrics.upcoming_meetings}</h3>
-              <p style={{ margin: '0.5rem 0', fontSize: '1rem' }}>Upcoming Meetings</p>
-            </div>
-          </div>
+      <div className="dashboard-subtabs" style={{ marginBottom: '1rem' }}>
+        {['overview','categories','summaries','csv'].map(tab => (
+          <button key={tab} onClick={() => setActiveTab(tab)} style={{
+            padding: '0.5rem 1rem', border: 'none', cursor: 'pointer', background: activeTab === tab ? '#3B82F6' : 'transparent',
+            color: activeTab === tab ? '#fff' : '#94A3B8', borderRadius: '6px 6px 0 0', fontWeight: activeTab === tab ? 600 : 400,
+            fontFamily: 'inherit', fontSize: 13,
+          }}>{tab === 'overview' ? '📊 Overview' : tab === 'categories' ? '🏷 Categories' : tab === 'summaries' ? '🤖 Summaries' : '📥 Import'}</button>
+        ))}
+      </div>
 
-          {/* Additional Metrics */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
-            <div className="card" style={{ padding: '1.5rem' }}>
-              <p style={{ color: '#999', margin: '0 0 0.5rem 0' }}>Average Meeting Duration</p>
-              <h3 style={{ color: '#667eea', margin: '0.5rem 0' }}>{metrics.avg_meeting_duration.toFixed(1)} min</h3>
-            </div>
-            <div className="card" style={{ padding: '1.5rem' }}>
-              <p style={{ color: '#999', margin: '0 0 0.5rem 0' }}>Busiest Day</p>
-              <h3 style={{ color: '#667eea', margin: '0.5rem 0' }}>{metrics.busiest_day}</h3>
-            </div>
-            <div className="card" style={{ padding: '1.5rem' }}>
-              <p style={{ color: '#999', margin: '0 0 0.5rem 0' }}>Total Meetings</p>
-              <h3 style={{ color: '#667eea', margin: '0.5rem 0' }}>{metrics.total_meetings}</h3>
-            </div>
-          </div>
+      {activeTab === 'overview' && <OverviewTab metrics={metrics} summaries={summaries} categories={categories} />}
+      {activeTab === 'categories' && <CategoriesTab categories={categories} summaries={summaries} catFilter={catFilter} setCatFilter={setCatFilter} />}
+      {activeTab === 'summaries' && <SummariesTab summaries={summaries} catFilter={catFilter} setCatFilter={setCatFilter} />}
+      {activeTab === 'csv' && <CSVTab csvMessage={csvMessage} csvLoading={csvLoading} handleCsvUpload={handleCsvUpload} />}
+    </div>
+  )
+}
 
-          {/* 7-Day Upcoming Leads */}
-          <div className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ margin: 0 }}>📅 Upcoming Follow-ups — Next 7 Days</h3>
-              <span style={{ fontSize: '0.85rem', color: '#999' }}>{upcomingLeads.length} lead{upcomingLeads.length !== 1 ? 's' : ''}</span>
-            </div>
-            {loading ? (
-              <div style={{ color: '#999', padding: '1rem 0' }}>Loading...</div>
-            ) : upcomingLeads.length === 0 ? (
-              <p style={{ color: '#999' }}>No upcoming follow-ups in the next 7 days.</p>
-            ) : (
-              <div style={{ overflowX: 'auto' }}>
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Customer</th>
-                      <th>Next Action</th>
-                      <th>Follow Up</th>
-                      <th>Priority</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {upcomingLeads.map(lead => (
-                      <tr key={lead.id}>
-                        <td style={{ fontWeight: 600 }}>{lead.customer_name}</td>
-                        <td style={{ maxWidth: '300px', fontSize: '0.9rem', color: '#555' }}>
-                          {lead.action_items && lead.action_items.length > 0
-                            ? lead.action_items[0]
-                            : lead.discussion_summary
-                              ? lead.discussion_summary.substring(0, 100) + (lead.discussion_summary.length > 100 ? '…' : '')
-                              : '—'}
-                        </td>
-                        <td style={{ whiteSpace: 'nowrap', color: '#667eea', fontWeight: 500 }}>
-                          📅 {lead.next_meeting}
-                        </td>
-                        <td>
-                          <span style={{
-                            display: 'inline-block', padding: '0.2rem 0.6rem',
-                            borderRadius: '10px', fontSize: '0.8rem', fontWeight: 600,
-                            background: lead.priority === 'high' ? '#f8d7da' : lead.priority === 'low' ? '#e2e3e5' : '#fff3cd',
-                            color: lead.priority === 'high' ? '#721c24' : lead.priority === 'low' ? '#383d41' : '#856404'
-                          }}>{lead.priority}</span>
-                        </td>
-                        <td>
-                          <span style={{
-                            display: 'inline-block', padding: '0.2rem 0.6rem',
-                            borderRadius: '10px', fontSize: '0.8rem', fontWeight: 600,
-                            background: lead.status === 'completed' ? '#d4edda' : lead.status === 'in_progress' ? '#cce5ff' : '#fff3cd',
-                            color: lead.status === 'completed' ? '#155724' : lead.status === 'in_progress' ? '#004085' : '#856404'
-                          }}>{lead.status}</span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
+function OverviewTab({ metrics, summaries, categories }) {
+  const m = metrics || {}
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '1.25rem' }}>
+        <StatCard label="Today" value={m.messages_today} color="#3B82F6" />
+        <StatCard label="Total" value={m.total_messages} color="#8B5CF6" />
+        <StatCard label="Processed" value={m.done_messages} color="#10B981" />
+        <StatCard label="Pending" value={m.pending_messages} color="#F59E0B" />
+        <StatCard label="Open" value={m.open_leads} color="#EF4444" />
+        <StatCard label="Customers" value={m.total_customers} color="#EC4899" />
+        <StatCard label="Meetings" value={m.total_meetings} color="#06B6D4" />
+      </div>
 
-          {/* Today's Meetings */}
-          <div className="card">
-            <h3>Today's Meetings</h3>
-            {loading ? (
-              <div className="loading">Loading...</div>
-            ) : meetings.length === 0 ? (
-              <p>No meetings scheduled for today</p>
-            ) : (
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Title</th>
-                    <th>Duration</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {meetings.map((meeting) => (
-                    <tr key={meeting.id}>
-                      <td>{new Date(meeting.scheduled_at).toLocaleTimeString()}</td>
-                      <td>{meeting.title}</td>
-                      <td>{meeting.duration_minutes} min</td>
-                      <td>
-                        <span className="status-badge success">Scheduled</span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
+      {categories.length > 0 && (
+        <div style={{ marginBottom: '1.25rem' }}>
+          <h3 style={{ marginBottom: '0.5rem', fontSize: 14 }}>Category Breakdown</h3>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+            {categories.filter(c => c.count > 0).map(c => (
+              <CategoryBadge key={c.category} cat={c} />
+            ))}
           </div>
         </div>
       )}
 
-      {/* CSV Import Tab */}
-      {activeTab === 'csv' && (
-        <div className="card">
-          <h3>📥 Bulk Import from CSV</h3>
-          <p style={{ color: '#666', marginBottom: '1rem' }}>
-            Upload a CSV file to import customers and meetings in bulk.
-          </p>
-          
-          <div style={{
-            border: '2px dashed #667eea',
-            borderRadius: '8px',
-            padding: '2rem',
-            textAlign: 'center',
-            cursor: 'pointer',
-            background: '#f8f9ff',
-            marginBottom: '1rem'
-          }}>
-            <input
-              type="file"
-              accept=".csv"
-              onChange={handleCsvUpload}
-              style={{ display: 'none' }}
-              id="csv-upload"
-              disabled={csvLoading}
-            />
-            <label htmlFor="csv-upload" style={{ cursor: 'pointer' }}>
-              <p style={{ margin: '0.5rem 0', fontSize: '1.2rem' }}>📁 Click to upload or drag and drop</p>
-              <p style={{ margin: '0.5rem 0', color: '#999', fontSize: '0.9rem' }}>CSV format with columns: name, email, phone, company, title</p>
-            </label>
-          </div>
+      {summaries.length > 0 && (
+        <div>
+          <h3 style={{ marginBottom: '0.5rem', fontSize: 14 }}>Latest Summaries</h3>
+          {summaries.slice(0, 3).map(s => <SummaryCard key={s.id} s={s} compact />)}
+        </div>
+      )}
+    </div>
+  )
+}
 
-          {csvMessage && (
-            <div style={{
-              padding: '1rem',
-              borderRadius: '4px',
-              background: csvMessage.includes('❌') ? '#ffe0e0' : '#e0ffe0',
-              color: csvMessage.includes('❌') ? '#d32f2f' : '#2e7d32',
-              marginBottom: '1rem'
-            }}>
-              {csvMessage}
+function CategoriesTab({ categories, summaries, catFilter, setCatFilter }) {
+  const filtered = catFilter === 'all' ? summaries : summaries.filter(s => s.category === catFilter)
+  const activeCat = categories.find(c => c.category === catFilter)
+
+  return (
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
+        <CategoryBadge cat={{ category: 'all', count: summaries.length, color: '#64748B', icon: '📋', label: 'All' }} active={catFilter === 'all'} onClick={() => setCatFilter('all')} />
+        {categories.filter(c => c.count > 0).map(c => (
+          <CategoryBadge key={c.category} cat={c} active={catFilter === c.category} onClick={() => setCatFilter(c.category)} />
+        ))}
+      </div>
+
+      {activeCat && catFilter !== 'all' && (
+        <div style={{ marginBottom: '0.75rem', padding: '0.5rem 0.75rem', borderRadius: 8, background: activeCat.color + '22', border: `1px solid ${activeCat.color}44`, display: 'inline-block' }}>
+          <span style={{ fontSize: 13, color: activeCat.color, fontWeight: 600 }}>{activeCat.icon} {activeCat.label}: {activeCat.count} messages ({activeCat.pct}%)</span>
+        </div>
+      )}
+
+      {filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '2rem', color: '#94A3B8', fontSize: 14 }}>No messages in this category yet.</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          {filtered.map(s => <SummaryCard key={s.id} s={s} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SummariesTab({ summaries, catFilter, setCatFilter }) {
+  const filtered = catFilter === 'all' ? summaries : summaries.filter(s => s.category === catFilter)
+  return (
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
+        <CategoryBadge cat={{ category: 'all', count: summaries.length, color: '#64748B', icon: '📋', label: 'All' }} active={catFilter === 'all'} onClick={() => setCatFilter('all')} />
+        {[...new Set(summaries.map(s => s.category))].map(cat => {
+          const meta = CAT_META[cat] || CAT_META.general
+          const cnt = summaries.filter(s => s.category === cat).length
+          return <CategoryBadge key={cat} cat={{ category: cat, count: cnt, color: meta.color, icon: meta.icon, label: meta.label }} active={catFilter === cat} onClick={() => setCatFilter(cat)} />
+        })}
+      </div>
+      {filtered.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: '3rem', color: '#94A3B8' }}>
+          <div style={{ fontSize: 48, marginBottom: 12 }}>🤖</div>
+          <h3>No summaries yet</h3>
+          <p style={{ fontSize: 14 }}>Send a voice or text message via WhatsApp to get AI-powered summaries.</p>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          {filtered.map(s => <SummaryCard key={s.id} s={s} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CategoryBadge({ cat, active, onClick }) {
+  const meta = CAT_META[cat.category] || { icon: cat.icon || '💬', color: cat.color || '#94A3B8' }
+  return (
+    <button onClick={onClick} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px',
+      borderRadius: 20, border: `1.5px solid ${active ? meta.color : '#334155'}`,
+      background: active ? meta.color + '22' : 'transparent', color: active ? meta.color : '#94A3B8',
+      fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+    }}>
+      {meta.icon} {cat.label || cat.category} <span style={{ opacity: 0.7, fontSize: 11 }}>{cat.count}</span>
+    </button>
+  )
+}
+
+function SummaryCard({ s, compact }) {
+  const meta = CAT_META[s.category] || CAT_META.general
+  const [expanded, setExpanded] = useState(false)
+  const detail = s.detailed_summary || {}
+  const entities = s.entities || {}
+
+  return (
+    <div style={{ ...CARD, borderLeft: `4px solid ${meta.color}` }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <span style={{ padding: '2px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600, background: meta.color + '22', color: meta.color }}>
+              {meta.icon} {meta.label}
+            </span>
+            {s.urgency && (
+              <span style={{ padding: '2px 8px', borderRadius: 6, fontSize: 11, fontWeight: 600, background: PRI_COLORS[s.urgency] + '22', color: PRI_COLORS[s.urgency] }}>
+                {s.urgency}
+              </span>
+            )}
+            {s.sentiment && <span style={{ fontSize: 11, color: '#64748B' }}>{s.sentiment}</span>}
+          </div>
+          <div style={{ fontWeight: 600, fontSize: 14, color: '#F1F5F9' }}>
+            {s.customer_name || s.from_phone}
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: '#64748B' }}>
+          {s.processed_at ? new Date(s.processed_at).toLocaleString() : ''}
+          <span style={{ marginLeft: 8, color: s.provider === 'groq' ? '#10B981' : '#F59E0B' }}>{s.provider ? 'via ' + s.provider : ''}</span>
+        </div>
+      </div>
+
+      {s.intent && (
+        <div style={{ fontSize: 13, color: '#CBD5E1', marginBottom: 8, fontStyle: 'italic', padding: '6px 10px', background: '#0F172A', borderRadius: 6 }}>
+          {s.intent}
+        </div>
+      )}
+
+      {s.summary && (
+        <p style={{ margin: '0 0 8px 0', fontSize: 13, color: '#CBD5E1', lineHeight: 1.6 }}>
+          {compact ? s.summary.substring(0, 200) + (s.summary.length > 200 ? '...' : '') : s.summary}
+        </p>
+      )}
+
+      {!compact && (
+        <>
+          {detail.key_points && detail.key_points.length > 0 && (
+            <Section title="Key Points" color="#60A5FA">
+              {detail.key_points.map((p, i) => <li key={i}>{p}</li>)}
+            </Section>
+          )}
+          {detail.decisions && detail.decisions.length > 0 && (
+            <Section title="Decisions" color="#10B981">
+              {detail.decisions.map((d, i) => <li key={i}>{d}</li>)}
+            </Section>
+          )}
+          {detail.risks_concerns && detail.risks_concerns.length > 0 && (
+            <Section title="Risks & Concerns" color="#EF4444">
+              {detail.risks_concerns.map((r, i) => <li key={i}>{r}</li>)}
+            </Section>
+          )}
+          {detail.next_steps && detail.next_steps.length > 0 && (
+            <Section title="Next Steps" color="#F59E0B">
+              {detail.next_steps.map((n, i) => <li key={i}>{n}</li>)}
+            </Section>
+          )}
+          {entities && Object.keys(entities).some(k => entities[k] && entities[k].length > 0) && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#64748B', marginBottom: 4 }}>Entities</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {entities.people && entities.people.map((p, i) => <Tag key={`p${i}`} icon="👤">{p}</Tag>)}
+                {entities.dates && entities.dates.map((d, i) => <Tag key={`d${i}`} icon="📅">{d}</Tag>)}
+                {entities.amounts && entities.amounts.map((a, i) => <Tag key={`a${i}`} icon="💵">{a}</Tag>)}
+                {entities.documents && entities.documents.map((d, i) => <Tag key={`doc${i}`} icon="📄">{d}</Tag>)}
+                {entities.locations && entities.locations.map((l, i) => <Tag key={`l${i}`} icon="📍">{l}</Tag>)}
+              </div>
             </div>
           )}
-
-          <div style={{ marginTop: '2rem', padding: '1rem', background: '#f5f5f5', borderRadius: '4px' }}>
-            <h4>CSV Format Example:</h4>
-            <pre style={{ overflow: 'auto', fontSize: '0.85rem' }}>
-name,email,phone,company,title
-John Doe,john@example.com,555-1234,ABC Corp,Q1 Planning
-Jane Smith,jane@example.com,555-5678,XYZ Inc,Budget Review
-            </pre>
-          </div>
-        </div>
-      )}
-
-      {/* Transcripts Tab */}
-      {activeTab === 'transcripts' && (
-        <TranscriptsList apiCall={apiCall} token={token} />
-      )}
-
-      {/* Analytics Tab */}
-      {activeTab === 'analytics' && (
-        <AnalyticsView apiCall={apiCall} token={token} meetings={meetings} />
-      )}
-
-      {/* Calendar Tab */}
-      {activeTab === 'calendar' && (
-        <CalendarSettings apiCall={apiCall} token={token} calendarStatus={calendarStatus} calendarLoading={calendarLoading} meetings={meetings} />
-      )}
-    </div>
-  )
-}
-
-function TranscriptsList({ apiCall, token }) {
-  const [transcripts, setTranscripts] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [search, setSearch] = useState('')
-  const [selectedTranscript, setSelectedTranscript] = useState(null)
-
-  useEffect(() => {
-    loadTranscripts()
-  }, [])
-
-  const loadTranscripts = async () => {
-    try {
-      setLoading(true)
-      const url = search
-        ? `/api/broker/transcripts?search=${encodeURIComponent(search)}`
-        : '/api/broker/transcripts'
-      const response = await apiCall(url)
-      const data = await response.json()
-      setTranscripts(data)
-    } catch (err) {
-      console.error('Error loading transcripts:', err)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleSearch = (e) => {
-    setSearch(e.target.value)
-    if (e.target.value.length > 2) {
-      setTimeout(loadTranscripts, 500)
-    }
-  }
-
-  if (selectedTranscript) {
-    return (
-      <div className="card">
-        <button onClick={() => setSelectedTranscript(null)} style={{ marginBottom: '1rem', padding: '0.5rem 1rem', background: '#667eea', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-          ← Back to Transcripts
-        </button>
-        
-        <h3>{selectedTranscript.title}</h3>
-        <p style={{ color: '#999' }}>Created: {new Date(selectedTranscript.created_at).toLocaleString()}</p>
-
-        <div style={{ marginTop: '1rem', padding: '1rem', background: '#f9f9f9', borderRadius: '4px', maxHeight: '400px', overflow: 'auto' }}>
-          <h4>Transcript:</h4>
-          <p style={{ whiteSpace: 'pre-wrap', lineHeight: '1.6', color: '#333' }}>
-            {typeof selectedTranscript.transcript === 'string' && selectedTranscript.transcript.startsWith('{')
-              ? selectedTranscript.transcript
-              : selectedTranscript.transcript || 'No transcript available'}
-          </p>
-        </div>
-
-        {selectedTranscript.action_items && selectedTranscript.action_items.length > 0 && (
-          <div style={{ marginTop: '1rem' }}>
-            <h4>Action Items:</h4>
-            <ul style={{ paddingLeft: '1.5rem' }}>
-              {selectedTranscript.action_items.map((item, idx) => (
-                <li key={idx} style={{ marginBottom: '0.5rem' }}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {selectedTranscript.key_points && selectedTranscript.key_points.length > 0 && (
-          <div style={{ marginTop: '1rem' }}>
-            <h4>Key Points:</h4>
-            <ul style={{ paddingLeft: '1.5rem' }}>
-              {selectedTranscript.key_points.map((point, idx) => (
-                <li key={idx} style={{ marginBottom: '0.5rem' }}>{point}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <div className="card">
-      <h3>📝 Meeting Transcripts</h3>
-      
-      <input
-        type="text"
-        placeholder="Search transcripts..."
-        value={search}
-        onChange={handleSearch}
-        style={{
-          width: '100%',
-          padding: '0.75rem',
-          marginBottom: '1rem',
-          border: '1px solid #ddd',
-          borderRadius: '4px',
-          fontSize: '1rem'
-        }}
-      />
-
-      {loading ? (
-        <div className="loading">Loading transcripts...</div>
-      ) : transcripts.length === 0 ? (
-        <p>No transcripts found</p>
-      ) : (
-        <div>
-          {transcripts.map((transcript) => (
-            <div
-              key={transcript.id}
-              onClick={() => setSelectedTranscript(transcript)}
-              style={{
-                padding: '1rem',
-                border: '1px solid #ddd',
-                borderRadius: '4px',
-                marginBottom: '0.5rem',
-                cursor: 'pointer',
-                background: '#f9f9f9',
-                transition: 'all 0.3s'
-              }}
-              onMouseOver={(e) => e.currentTarget.style.boxShadow = '0 4px 8px rgba(0,0,0,0.1)'}
-              onMouseOut={(e) => e.currentTarget.style.boxShadow = 'none'}
-            >
-              <h4 style={{ margin: '0.5rem 0' }}>{transcript.title}</h4>
-              <p style={{ margin: '0.25rem 0', color: '#999', fontSize: '0.9rem' }}>
-                {new Date(transcript.created_at).toLocaleString()}
-              </p>
-              {transcript.action_items && transcript.action_items.length > 0 && (
-                <p style={{ margin: '0.25rem 0', color: '#667eea', fontSize: '0.9rem' }}>
-                  ✓ {transcript.action_items.length} action items
-                </p>
-              )}
+          {s.tags && s.tags.length > 0 && (
+            <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+              {s.tags.map((t, i) => <Tag key={i}>{t}</Tag>)}
             </div>
-          ))}
+          )}
+          {s.meeting_suggestion && (
+            <div style={{ marginTop: 8, padding: '8px 12px', background: '#0A2A1A', borderRadius: 8, border: '1px solid #10B98133' }}>
+              <div style={{ fontWeight: 600, fontSize: 12, color: '#10B981' }}>📅 Meeting Suggested</div>
+              <div style={{ fontSize: 12, color: '#CBD5E1', marginTop: 2 }}>{s.meeting_suggestion}</div>
+            </div>
+          )}
+        </>
+      )}
+
+      {compact && (s.tags?.length > 0 || s.entities?.people?.length > 0 || s.meeting_suggestion) && (
+        <button onClick={() => setExpanded(!expanded)} style={{ background: 'none', border: 'none', color: '#3B82F6', cursor: 'pointer', fontSize: 12, padding: 0, fontFamily: 'inherit', marginTop: 4 }}>
+          {expanded ? '▲ Less' : '▼ More details'}
+        </button>
+      )}
+
+      {compact && expanded && (
+        <div style={{ marginTop: 8 }}>
+          {detail.key_points && detail.key_points.length > 0 && <Section title="Key Points" color="#60A5FA">{detail.key_points.map((p, i) => <li key={i}>{p}</li>)}</Section>}
+          {detail.next_steps && detail.next_steps.length > 0 && <Section title="Next Steps" color="#F59E0B">{detail.next_steps.map((n, i) => <li key={i}>{n}</li>)}</Section>}
+          {s.meeting_suggestion && <div style={{ marginTop: 6, fontSize: 12, color: '#10B981' }}>📅 {s.meeting_suggestion}</div>}
         </div>
       )}
     </div>
   )
 }
 
-function AnalyticsView({ apiCall, token, meetings }) {
-  const [analytics, setAnalytics] = useState(null)
+function Section({ title, color, children }) {
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ fontSize: 11, fontWeight: 600, color, marginBottom: 3 }}>{title}</div>
+      <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: '#CBD5E1', lineHeight: 1.7 }}>{children}</ul>
+    </div>
+  )
+}
+
+function Tag({ icon, children }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, padding: '2px 8px', borderRadius: 6, background: '#334155', color: '#94A3B8', fontSize: 11, fontFamily: 'inherit' }}>
+      {icon ? icon + ' ' : ''}{children}
+    </span>
+  )
+}
+
+function StatCard({ label, value, color }) {
+  return <div style={{ ...CARD, textAlign: 'center', padding: '0.75rem' }}><div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div><div style={{ fontSize: 11, color: '#94A3B8', marginTop: 2 }}>{label}</div></div>
+}
+
+function CSVTab({ csvMessage, csvLoading, handleCsvUpload }) {
+  return (
+    <div style={CARD}>
+      <h3>📥 Bulk Import</h3>
+      <p style={{ color: '#94A3B8', fontSize: 13 }}>Upload CSV (columns: name, email, phone, company, title)</p>
+      <div style={{ border: '2px dashed #3B82F6', borderRadius: 8, padding: '2rem', textAlign: 'center', cursor: 'pointer', background: '#0F172A', margin: '1rem 0' }}>
+        <input type="file" accept=".csv" onChange={handleCsvUpload} disabled={csvLoading} id="csv-upload" style={{ display: 'none' }} />
+        <label htmlFor="csv-upload" style={{ cursor: 'pointer' }}><div style={{ fontSize: 32, marginBottom: 8 }}>📁</div><div style={{ color: '#94A3B8', fontSize: 14 }}>Click to upload CSV</div></label>
+      </div>
+      {csvMessage && <div style={{ padding: '8px 12px', borderRadius: 6, background: csvMessage.includes('Error') ? '#7f1d1d44' : '#14532d44', color: csvMessage.includes('Error') ? '#FCA5A5' : '#86EFAC', fontSize: 13 }}>{csvMessage}</div>}
+    </div>
+  )
+}
+
+// ── Voice Recorder ────────────────────────────────────────────────────────
+function VoiceRecorder({ apiCall, onClose }) {
+  const [recording, setRecording] = useState(false)
+  const [transcript, setTranscript] = useState('')
+  const [summary, setSummary] = useState(null)
   const [loading, setLoading] = useState(false)
-  const [selectedMeetingId, setSelectedMeetingId] = useState(null)
+  const [error, setError] = useState('')
+  const [mediaRecorder, setMediaRecorder] = useState(null)
+  const [textMode, setTextMode] = useState(false)
+  const [textInput, setTextInput] = useState('')
 
-  const loadAnalytics = async (meetingId) => {
+  const startRecording = async () => {
+    setError('')
     try {
-      setLoading(true)
-      const response = await apiCall(`/api/broker/meetings/${meetingId}/analytics`)
-      const data = await response.json()
-      setAnalytics(data)
-      setSelectedMeetingId(meetingId)
-    } catch (err) {
-      console.error('Error loading analytics:', err)
-    } finally {
-      setLoading(false)
-    }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      const chunks = []
+      mr.ondataavailable = e => chunks.push(e.data)
+      mr.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop())
+        const blob = new Blob(chunks, { type: 'audio/webm' })
+        const fd = new FormData()
+        fd.append('file', blob, 'recording.webm')
+        setLoading(true)
+        try {
+          const r = await apiCall('/api/broker/transcribe', { method: 'POST', body: fd, headers: {} })
+          const d = await r.json()
+          if (d.transcript) { setTranscript(d.transcript); await summarize(d.transcript) }
+          else setError('No speech detected.')
+        } catch (e) { setError('Transcription failed: ' + e.message) }
+        finally { setLoading(false) }
+      }
+      mr.start()
+      setMediaRecorder(mr)
+      setRecording(true)
+    } catch (e) { setError('Microphone access denied. Use WhatsApp or text mode.') }
   }
 
-  if (analytics && selectedMeetingId) {
-    const sentimentColor = analytics.sentiment === 'positive' ? '#4caf50' : analytics.sentiment === 'negative' ? '#f44336' : '#ff9800'
-    
-    return (
-      <div className="card">
-        <button onClick={() => setAnalytics(null)} style={{ marginBottom: '1rem', padding: '0.5rem 1rem', background: '#667eea', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-          ← Back to Analytics
-        </button>
+  const stopRecording = () => { if (mediaRecorder?.state === 'recording') { mediaRecorder.stop(); setRecording(false) } }
 
-        <h3>{analytics.title}</h3>
-        
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
-          <div className="card" style={{ padding: '1.5rem', textAlign: 'center' }}>
-            <p style={{ color: '#999' }}>Duration</p>
-            <h3 style={{ color: '#667eea', margin: '0.5rem 0' }}>{analytics.duration_minutes} minutes</h3>
-          </div>
-          <div className="card" style={{ padding: '1.5rem', textAlign: 'center' }}>
-            <p style={{ color: '#999' }}>Sentiment</p>
-            <h3 style={{ color: sentimentColor, margin: '0.5rem 0', textTransform: 'capitalize' }}>
-              {analytics.sentiment} ({(analytics.sentiment_score * 100).toFixed(0)}%)
-            </h3>
-          </div>
-        </div>
+  const summarize = async (text) => {
+    setLoading(true)
+    try {
+      const r = await apiCall('/api/broker/summarize', { method: 'POST', body: JSON.stringify({ transcript: text }) })
+      const d = await r.json()
+      setSummary(d.extracted_data)
+    } catch (e) { setError('Summarization failed: ' + e.message) }
+    finally { setLoading(false) }
+  }
 
-        {analytics.action_items && analytics.action_items.length > 0 && (
-          <div style={{ marginBottom: '1.5rem' }}>
-            <h4>📋 Action Items:</h4>
-            <ul style={{ paddingLeft: '1.5rem' }}>
-              {analytics.action_items.map((item, idx) => (
-                <li key={idx} style={{ marginBottom: '0.5rem' }}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {analytics.key_points && analytics.key_points.length > 0 && (
-          <div style={{ marginBottom: '1.5rem' }}>
-            <h4>🎯 Key Points:</h4>
-            <ul style={{ paddingLeft: '1.5rem' }}>
-              {analytics.key_points.map((point, idx) => (
-                <li key={idx} style={{ marginBottom: '0.5rem' }}>{point}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {Object.keys(analytics.keyword_frequency).length > 0 && (
-          <div>
-            <h4>🔤 Top Keywords:</h4>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-              {Object.entries(analytics.keyword_frequency).map(([keyword, count]) => (
-                <span
-                  key={keyword}
-                  style={{
-                    padding: '0.5rem 1rem',
-                    background: '#e0e7ff',
-                    color: '#667eea',
-                    borderRadius: '20px',
-                    fontSize: '0.9rem'
-                  }}
-                >
-                  {keyword} ({count})
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    )
+  const handleTextSubmit = async () => {
+    if (!textInput.trim()) return
+    setLoading(true)
+    setTranscript(textInput)
+    try {
+      const r = await apiCall('/api/broker/summarize', { method: 'POST', body: JSON.stringify({ transcript: textInput }) })
+      const d = await r.json()
+      setSummary(d.extracted_data)
+    } catch (e) { setError('Summarization failed: ' + e.message) }
+    finally { setLoading(false) }
   }
 
   return (
-    <div className="card">
-      <h3>📈 Meeting Analytics</h3>
-      <p style={{ color: '#666', marginBottom: '1rem' }}>
-        Select a meeting to view detailed analytics including sentiment, keywords, and action items.
-      </p>
-
-      {loading ? (
-        <div className="loading">Loading analytics...</div>
-      ) : meetings.length === 0 ? (
-        <p>No meetings available for analysis</p>
-      ) : (
+    <div style={{ maxWidth: 600, margin: '0 auto' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+        <h3 style={{ margin: 0 }}>🎤 Voice Note</h3>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#94A3B8', cursor: 'pointer', fontSize: 18 }}>✕</button>
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: '1rem' }}>
+        <button onClick={() => setTextMode(false)} style={{ padding: '6px 16px', borderRadius: 6, border: 'none', background: !textMode ? '#3B82F6' : '#334155', color: '#fff', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13 }}>🎤 Voice</button>
+        <button onClick={() => setTextMode(true)} style={{ padding: '6px 16px', borderRadius: 6, border: 'none', background: textMode ? '#3B82F6' : '#334155', color: '#fff', cursor: 'pointer', fontFamily: 'inherit', fontSize: 13 }}>💬 Text</button>
+      </div>
+      {textMode ? (
         <div>
-          {meetings.map((meeting) => (
-            <div
-              key={meeting.id}
-              onClick={() => loadAnalytics(meeting.id)}
-              style={{
-                padding: '1rem',
-                border: '1px solid #ddd',
-                borderRadius: '4px',
-                marginBottom: '0.5rem',
-                cursor: 'pointer',
-                background: '#f9f9f9',
-                transition: 'all 0.3s'
-              }}
-              onMouseOver={(e) => e.currentTarget.style.boxShadow = '0 4px 8px rgba(0,0,0,0.1)'}
-              onMouseOut={(e) => e.currentTarget.style.boxShadow = 'none'}
-            >
-              <h4 style={{ margin: '0.5rem 0' }}>{meeting.title}</h4>
-              <p style={{ margin: '0.25rem 0', color: '#999', fontSize: '0.9rem' }}>
-                {new Date(meeting.scheduled_at).toLocaleString()} • {meeting.duration_minutes} min
-              </p>
+          <textarea value={textInput} onChange={e => setTextInput(e.target.value)} placeholder="Type or paste notes..." style={{ width: '100%', minHeight: 120, padding: 12, borderRadius: 8, border: '1px solid #334155', background: '#0F172A', color: '#F1F5F9', fontSize: 14, fontFamily: 'inherit', resize: 'vertical', boxSizing: 'border-box' }} />
+          <button onClick={handleTextSubmit} disabled={loading || !textInput.trim()} style={{ marginTop: 8, padding: '10px 24px', background: '#3B82F6', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontFamily: 'inherit', opacity: loading ? 0.6 : 1, width: '100%' }}>{loading ? '⏳ Processing...' : '🤖 Summarize with AI'}</button>
+        </div>
+      ) : (
+        <div style={{ textAlign: 'center', padding: '2rem', ...CARD }}>
+          {recording ? (
+            <div>
+              <div style={{ width: 60, height: 60, borderRadius: '50%', background: '#EF4444', margin: '0 auto 1rem', animation: 'pulse 1.5s infinite' }} />
+              <div style={{ color: '#EF4444', fontWeight: 600, marginBottom: '1rem' }}>🔴 Recording...</div>
+              <button onClick={stopRecording} style={{ padding: '12px 32px', background: '#EF4444', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontFamily: 'inherit', fontSize: 15 }}>⏹ Stop</button>
             </div>
-          ))}
+          ) : (
+            <div>
+              <button onClick={startRecording} style={{ width: 72, height: 72, borderRadius: '50%', background: '#25D366', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 0.75rem' }}><span style={{ fontSize: 28 }}>🎤</span></button>
+              <div style={{ color: '#CBD5E1', fontSize: 13 }}>Tap to record</div>
+            </div>
+          )}
         </div>
       )}
-    </div>
-  )
-}
-
-// Calendar Settings Component
-function CalendarSettings({ apiCall, token, calendarStatus, calendarLoading, meetings }) {
-  const [setupMode, setSetupMode] = useState(false)
-  const [calendarType, setCalendarType] = useState('google')
-  const [email, setEmail] = useState('')
-  const [syncMessage, setSyncMessage] = useState('')
-  const [syncing, setSyncing] = useState(false)
-
-  const handleAutoSync = async () => {
-    try {
-      setSyncing(true)
-      const response = await apiCall('/api/broker/meetings/auto-sync', {
-        method: 'GET'
-      })
-      const data = await response.json()
-      setSyncMessage(`✅ ${data.message}`)
-    } catch (err) {
-      setSyncMessage(`❌ Sync failed: ${err.message}`)
-    } finally {
-      setSyncing(false)
-    }
-  }
-
-  if (calendarLoading) {
-    return (
-      <div className="card">
-        <div style={{ textAlign: 'center', padding: '2rem' }}>
-          <p>Loading calendar status...</p>
-        </div>
-      </div>
-    )
-  }
-
-  if (calendarStatus?.connected) {
-    return (
-      <div className="card">
-        <h3>📅 Calendar Integration</h3>
-        
-        <div style={{ padding: '1.5rem', background: '#e8f5e9', borderRadius: '4px', marginBottom: '1.5rem' }}>
-          <p style={{ color: '#2e7d32', margin: '0.5rem 0', fontWeight: 'bold' }}>✅ Connected</p>
-          <p style={{ color: '#555', margin: '0.5rem 0' }}>
-            <strong>Service:</strong> {calendarStatus.calendar_type === 'google' ? '🔵 Google Calendar' : '🔵 Microsoft Outlook'}
-          </p>
-          <p style={{ color: '#555', margin: '0.5rem 0' }}>
-            <strong>Email:</strong> {calendarStatus.email}
-          </p>
-          <p style={{ color: '#555', margin: '0.5rem 0' }}>
-            <strong>Synced Meetings:</strong> {calendarStatus.synced_meetings}
-          </p>
-          <p style={{ color: '#555', margin: '0.5rem 0' }}>
-            <strong>Auto-Sync:</strong> {calendarStatus.auto_sync ? '✅ Enabled' : '⛔ Disabled'}
-          </p>
-        </div>
-
-        <button
-          onClick={handleAutoSync}
-          disabled={syncing}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: '#667eea',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            marginRight: '1rem',
-            fontSize: '1rem'
-          }}
-        >
-          {syncing ? '⏳ Syncing...' : '🔄 Auto-Sync Meetings Now'}
-        </button>
-
-        <button
-          onClick={() => setSetupMode(!setupMode)}
-          style={{
-            padding: '0.75rem 1.5rem',
-            background: '#999',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontSize: '1rem'
-          }}
-        >
-          {setupMode ? '✕ Cancel' : '⚙️ Change Calendar'}
-        </button>
-
-        {syncMessage && (
-          <div style={{
-            marginTop: '1rem',
-            padding: '1rem',
-            background: syncMessage.includes('❌') ? '#ffe0e0' : '#e0ffe0',
-            color: syncMessage.includes('❌') ? '#d32f2f' : '#2e7d32',
-            borderRadius: '4px'
-          }}>
-            {syncMessage}
-          </div>
-        )}
-
-        {setupMode && (
-          <CalendarSetupForm apiCall={apiCall} token={token} onComplete={() => setSetupMode(false)} />
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <div className="card">
-      <h3>📅 Calendar Integration</h3>
-      <p style={{ color: '#666', marginBottom: '1.5rem' }}>
-        Connect your calendar to automatically sync broker meetings. Your meetings will sync to your personal calendar (no external emails sent).
-      </p>
-
-      <div style={{ 
-        padding: '2rem', 
-        background: '#fff3e0', 
-        borderRadius: '4px', 
-        textAlign: 'center',
-        marginBottom: '1.5rem'
-      }}>
-        <p style={{ margin: '0.5rem 0', color: '#e65100', fontWeight: 'bold' }}>⛔ Not Connected</p>
-        <p style={{ margin: '0.5rem 0', color: '#666' }}>Set up calendar integration to sync your meetings automatically.</p>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-        <button
-          onClick={() => {
-            setCalendarType('google')
-            setSetupMode(true)
-          }}
-          style={{
-            padding: '1rem',
-            background: '#fff',
-            border: '2px solid #4285F4',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontSize: '1rem'
-          }}
-        >
-          <p style={{ margin: '0.5rem 0', fontSize: '1.5rem' }}>🔵 Google Calendar</p>
-          <p style={{ margin: '0.5rem 0', color: '#666', fontSize: '0.9rem' }}>Connect via Google</p>
-        </button>
-
-        <button
-          onClick={() => {
-            setCalendarType('outlook')
-            setSetupMode(true)
-          }}
-          style={{
-            padding: '1rem',
-            background: '#fff',
-            border: '2px solid #0078d4',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontSize: '1rem'
-          }}
-        >
-          <p style={{ margin: '0.5rem 0', fontSize: '1.5rem' }}>🔵 Microsoft Outlook</p>
-          <p style={{ margin: '0.5rem 0', color: '#666', fontSize: '0.9rem' }}>Connect via Office 365</p>
-        </button>
-      </div>
-
-      {setupMode && (
-        <div style={{ marginTop: '2rem' }}>
-          <CalendarSetupForm apiCall={apiCall} token={token} onComplete={() => setSetupMode(false)} calendarType={calendarType} />
+      {loading && <div style={{ textAlign: 'center', padding: '2rem', color: '#94A3B8' }}>⏳ Processing with AI...</div>}
+      {error && <div style={{ padding: '10px 14px', background: '#7f1d1d44', borderRadius: 8, color: '#FCA5A5', fontSize: 13, marginTop: 8 }}>{error}</div>}
+      {summary && (
+        <div style={{ marginTop: '1rem' }}>
+          <SummaryCard s={{
+            customer_name: summary.customer_name || 'Voice Note',
+            category: summary.category || 'general',
+            intent: summary.intent || '',
+            summary: summary.summary || summary.detailed_summary?.overview || '',
+            detailed_summary: summary.detailed_summary || {},
+            entities: summary.entities || {},
+            sentiment: summary.sentiment || '',
+            tags: summary.tags || [],
+            meeting_suggestion: summary.meeting_suggestion,
+            urgency: summary.urgency || 'medium',
+            processed_at: new Date().toISOString(),
+            provider: summary._llm_provider || 'unknown',
+          }} />
         </div>
       )}
-
-      <div style={{ marginTop: '2rem', padding: '1rem', background: '#f5f5f5', borderRadius: '4px' }}>
-        <h4>How it works:</h4>
-        <ul>
-          <li>✅ Meetings are synced to your personal calendar only</li>
-          <li>✅ No emails sent to customers</li>
-          <li>✅ Auto-sync new meetings when enabled</li>
-          <li>✅ Broker-only access and control</li>
-          <li>✅ Secure OAuth2 token storage</li>
-        </ul>
-      </div>
-    </div>
-  )
-}
-
-function CalendarSetupForm({ apiCall, token, onComplete, calendarType }) {
-  const [email, setEmail] = useState('')
-  const [accessToken, setAccessToken] = useState('')
-  const [refreshToken, setRefreshToken] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [message, setMessage] = useState('')
-
-  const handleSetup = async () => {
-    if (!email || !accessToken) {
-      setMessage('❌ Please fill in all fields')
-      return
-    }
-
-    try {
-      setLoading(true)
-      const setupData = {
-        calendar_type: calendarType || 'google',
-        access_token: accessToken,
-        refresh_token: refreshToken || '',
-        calendar_id: email,
-        email: email
-      }
-
-      const response = await fetch(
-        `/api/broker/calendar/setup?token=${token}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(setupData)
-        }
-      )
-
-      if (response.ok) {
-        setMessage(`✅ Calendar connected! Syncing started...`)
-        setTimeout(() => onComplete(), 1500)
-      } else {
-        const err = await response.json()
-        setMessage(`❌ Error: ${err.detail}`)
-      }
-    } catch (err) {
-      setMessage(`❌ Setup failed: ${err.message}`)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div style={{ padding: '1rem', background: '#f9f9f9', borderRadius: '4px', border: '1px solid #ddd' }}>
-      <h4>Setup {calendarType === 'google' ? 'Google Calendar' : 'Outlook'}</h4>
-      
-      <div style={{ marginBottom: '1rem' }}>
-        <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
-          Calendar Email:
-        </label>
-        <input
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="your.email@gmail.com"
-          style={{
-            width: '100%',
-            padding: '0.75rem',
-            border: '1px solid #ddd',
-            borderRadius: '4px',
-            fontSize: '1rem'
-          }}
-        />
-      </div>
-
-      <div style={{ marginBottom: '1rem' }}>
-        <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
-          Access Token:
-        </label>
-        <textarea
-          value={accessToken}
-          onChange={(e) => setAccessToken(e.target.value)}
-          placeholder="Paste OAuth access token"
-          style={{
-            width: '100%',
-            padding: '0.75rem',
-            border: '1px solid #ddd',
-            borderRadius: '4px',
-            fontSize: '0.9rem',
-            fontFamily: 'monospace',
-            height: '80px'
-          }}
-        />
-      </div>
-
-      <div style={{ marginBottom: '1rem' }}>
-        <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
-          Refresh Token (optional):
-        </label>
-        <textarea
-          value={refreshToken}
-          onChange={(e) => setRefreshToken(e.target.value)}
-          placeholder="Paste refresh token if available"
-          style={{
-            width: '100%',
-            padding: '0.75rem',
-            border: '1px solid #ddd',
-            borderRadius: '4px',
-            fontSize: '0.9rem',
-            fontFamily: 'monospace',
-            height: '60px'
-          }}
-        />
-      </div>
-
-      {message && (
-        <div style={{
-          marginBottom: '1rem',
-          padding: '1rem',
-          background: message.includes('❌') ? '#ffe0e0' : '#e0ffe0',
-          color: message.includes('❌') ? '#d32f2f' : '#2e7d32',
-          borderRadius: '4px'
-        }}>
-          {message}
-        </div>
-      )}
-
-      <button
-        onClick={handleSetup}
-        disabled={loading}
-        style={{
-          padding: '0.75rem 1.5rem',
-          background: '#667eea',
-          color: 'white',
-          border: 'none',
-          borderRadius: '4px',
-          cursor: 'pointer',
-          fontSize: '1rem'
-        }}
-      >
-        {loading ? '⏳ Connecting...' : '✅ Connect Calendar'}
-      </button>
-
-      <div style={{ marginTop: '1rem', padding: '1rem', background: '#e3f2fd', borderRadius: '4px', fontSize: '0.85rem', color: '#1565c0' }}>
-        <p><strong>ℹ️ How to get OAuth tokens:</strong></p>
-        <p>1. Visit Google/Microsoft OAuth authorization page</p>
-        <p>2. Authorize the broker app</p>
-        <p>3. Copy the access token from the redirect URL</p>
-        <p>4. Paste it here along with refresh token if available</p>
-      </div>
     </div>
   )
 }

@@ -1,0 +1,112 @@
+{
+  "name": "Telegram - Daily Reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 8,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "r1b2c3d4-0005-0005-0005-000000000001",
+      "name": "Every Day at 8 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.BROKER_API_URL }}/api/reminders/due-today",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "r1b2c3d4-0005-0005-0005-000000000002",
+      "name": "Fetch Due Reminders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ Array.isArray($json) ? $json.length : 0 }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "id": "r1b2c3d4-0005-0005-0005-000000000003",
+      "name": "Has Reminders?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parseMode": "HTML"
+        }
+      },
+      "id": "r1b2c3d4-0005-0005-0005-000000000005",
+      "name": "Send Daily Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [900, 240],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credential",
+          "name": "Telegram Bot (Aksnpatbot)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BROKER_API_URL }}/api/reminders/mark-sent",
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={{ JSON.stringify({ recording_ids: $json.recording_ids, meeting_ids: $json.meeting_ids }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "r1b2c3d4-0005-0005-0005-000000000006",
+      "name": "Mark as Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 240]
+    }
+  ],
+  "connections": {
+    "Every Day at 8 AM": {
+      "main": [[{ "node": "Fetch Due Reminders", "type": "main", "index": 0 }]]
+    },
+    "Fetch Due Reminders": {
+      "main": [[{ "node": "Has Reminders?", "type": "main", "index": 0 }]]
+    },
+    "Has Reminders?": {
+      "main": [
+        [{ "node": "Send Daily Report", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Send Daily Report": {
+      "main": [[{ "node": "Mark as Sent", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "v2"
+}

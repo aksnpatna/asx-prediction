@@ -1,69 +1,245 @@
+/* ── Design tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --bg:       #0F172A;
+  --surface:  #1E293B;
+  --border:   #334155;
+  --fg:       #F1F5F9;
+  --fg-alt:   #94A3B8;
+  --primary:  #3B82F6;
+  --green:    #10B981;
+  --red:      #EF4444;
+  --amber:    #F59E0B;
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100vh;
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────────── */
 .app {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  background: var(--bg);
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+.header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .header-content {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  width: 100%;
+}
+
+.header h1 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--fg);
+  letter-spacing: -0.01em;
 }
 
 .header p {
-  font-size: 0.9rem;
-  opacity: 0.9;
+  font-size: 0.75rem;
+  color: var(--fg-alt);
   margin: 0;
 }
 
+/* ── Nav tabs ──────────────────────────────────────────────────────────────── */
+.nav-tabs {
+  display: flex;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  gap: 2px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+
+.nav-tabs::-webkit-scrollbar { display: none; }
+
+.nav-tab {
+  padding: 12px 16px;
+  border: none;
+  background: transparent;
+  color: var(--fg-alt);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.nav-tab:hover { color: var(--fg); }
+
+.nav-tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+
+/* ── Container ─────────────────────────────────────────────────────────────── */
+.container {
+  flex: 1;
+  padding: 20px 24px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Global alerts ─────────────────────────────────────────────────────────── */
+.alert {
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.alert-error {
+  background: #EF444422;
+  border: 1px solid #EF444466;
+  color: #FCA5A5;
+}
+
+.alert-success {
+  background: #10B98122;
+  border: 1px solid #10B98166;
+  color: #6EE7B7;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────────── */
+.btn {
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: none;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+
+.btn:hover  { opacity: 0.88; transform: translateY(-1px); }
+.btn:active { opacity: 1;    transform: scale(0.98); }
+
+.btn-primary   { background: var(--primary); color: #fff; }
+.btn-secondary { background: var(--border);  color: var(--fg); }
+
+/* ── Auth screen ───────────────────────────────────────────────────────────── */
 .auth-container {
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: var(--bg);
 }
 
 .auth-card {
-  background: white;
-  border-radius: 8px;
-  box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
   padding: 2rem;
   width: 100%;
-  max-width: 400px;
+  max-width: 380px;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.4);
 }
 
 .auth-card h1 {
   text-align: center;
-  color: #667eea;
-  margin-bottom: 2rem;
-  font-size: 2rem;
+  color: var(--fg);
+  margin-bottom: 1.75rem;
+  font-size: 1.4rem;
+  font-weight: 700;
 }
 
 .auth-tabs {
   display: flex;
-  gap: 0;
   margin-bottom: 1.5rem;
-  border-bottom: 2px solid #ddd;
+  border-bottom: 1px solid var(--border);
 }
 
 .auth-tab {
   flex: 1;
-  padding: 0.75rem;
+  padding: 0.6rem;
   border: none;
   background: none;
   cursor: pointer;
-  font-size: 1rem;
-  border-bottom: 3px solid transparent;
-  color: #666;
-  transition: all 0.3s ease;
+  font-size: 0.9rem;
+  font-family: inherit;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-alt);
+  transition: color 0.15s, border-color 0.15s;
+  margin-bottom: -1px;
 }
 
-.auth-tab.active {
-  color: #667eea;
-  border-bottom-color: #667eea;
+.auth-tab.active { color: var(--fg); border-bottom-color: var(--primary); font-weight: 600; }
+.auth-tab:hover  { color: var(--fg); }
+
+.form-group { margin-bottom: 1rem; }
+
+.form-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-alt);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
 }
 
-.auth-tab:hover {
-  color: #667eea;
+.form-group input {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
 }
+
+.form-group input:focus { border-color: var(--primary); }
+
+/* ── WhatsApp inbox panels (legacy class kept for old CSS ref) ─────────────── */
+.wa-inbox-panels {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.wa-inbox-left {
+  width: 300px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+/* Voice recorder pulse animation */
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+

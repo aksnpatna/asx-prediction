@@ -18,6 +18,9 @@ function VoiceRecorder({ token, apiCall, setError, setSuccess }) {
   const [speechApiSupported] = useState(() => !!(
     window.SpeechRecognition || window.webkitSpeechRecognition
   ))
+  // Text note mode (alternative to voice recording)
+  const [inputMode, setInputMode] = useState('voice') // 'voice' | 'text'
+  const [textNote, setTextNote] = useState('')
   
   const mediaRecorderRef = useRef(null)
   const audioContextRef = useRef(null)
@@ -545,6 +548,78 @@ ${extracted.follow_ups}`
     <div>
       <h2>🎤 Voice Recorder</h2>
 
+      {/* ── Input mode toggle ── */}
+      <div className="card" style={{ padding: '12px 16px' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 13, color: '#374151', fontWeight: 600 }}>Input mode:</span>
+          <button
+            onClick={() => setInputMode('voice')}
+            style={{
+              padding: '6px 16px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+              background: inputMode === 'voice' ? '#3b82f6' : '#e5e7eb',
+              color: inputMode === 'voice' ? '#fff' : '#374151',
+            }}
+          >
+            🎤 Voice
+          </button>
+          <button
+            onClick={() => setInputMode('text')}
+            style={{
+              padding: '6px 16px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+              background: inputMode === 'text' ? '#3b82f6' : '#e5e7eb',
+              color: inputMode === 'text' ? '#fff' : '#374151',
+            }}
+          >
+            ✍️ Text Note
+          </button>
+          <span style={{ fontSize: 12, color: '#6b7280', marginLeft: 4 }}>
+            {inputMode === 'voice' ? 'Record and transcribe a meeting' : 'Type notes directly — LLM extracts the same data'}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Text note mode ── */}
+      {inputMode === 'text' && (
+        <div className="card">
+          <h3>✍️ Type Meeting Notes</h3>
+          <p style={{ fontSize: 13, color: '#6b7280', marginTop: 0 }}>
+            Write anything about the meeting — customer name, what was discussed, next steps, follow-ups.
+            The local LLM will extract and save the structured data exactly as it does from voice.
+          </p>
+          <textarea
+            value={textNote}
+            onChange={e => setTextNote(e.target.value)}
+            placeholder="e.g. Spoke with Rahul Sharma today about his portfolio. He wants to review BHP and CBA next week. Main concern is market volatility. Agreed to meet Thursday 3pm."
+            style={{
+              width: '100%', minHeight: 140, padding: '10px 12px', fontSize: 14,
+              border: '1px solid #d1d5db', borderRadius: 8, resize: 'vertical',
+              fontFamily: 'inherit', lineHeight: 1.6, boxSizing: 'border-box',
+            }}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button
+              className="btn btn-primary"
+              disabled={isExtracting || !textNote.trim()}
+              onClick={() => {
+                setTranscript(textNote)
+                extractData(textNote)
+              }}
+              style={{ padding: '8px 20px', fontSize: 14 }}
+            >
+              {isExtracting ? '⏳ Extracting…' : '🧠 Extract & Save with LLM'}
+            </button>
+            <button
+              onClick={() => { setTextNote(''); setExtractedData(''); setTranscript('') }}
+              style={{ padding: '8px 16px', fontSize: 13, borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', cursor: 'pointer' }}
+            >
+              🗑 Clear
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Voice mode ── */}
+      {inputMode === 'voice' && (
       <div className="card">
         <h3>Select Meeting (Optional)</h3>
         {loadingMeetings ? (
@@ -564,7 +639,10 @@ ${extracted.follow_ups}`
           </select>
         )}
       </div>
+      )}
 
+      {inputMode === 'voice' && (
+      <>
       <div className="card">
         <h3>🎙️ Audio Device Setup</h3>
         
@@ -848,16 +926,18 @@ ${extracted.follow_ups}`
           </div>
         </div>
       )}
+      </>
+      )}
 
       <div className="card" style={{ background: '#e3f2fd', borderLeft: '4px solid #2196F3', marginTop: '2rem' }}>
         <h4>📝 Phase 3 Implementation Status:</h4>
         <ul style={{ marginLeft: '1.5rem' }}>
           <li>✅ Real-time voice recording with Web Audio API</li>
-          <li>⏳ Whisper speech-to-text via Ollama (API ready, awaiting model)</li>
-          <li>⏳ LLM-powered data extraction via Ollama (API ready)</li>
+          <li>✅ Text note mode — type notes, LLM extracts same structured data</li>
+          <li>✅ Whisper speech-to-text (local faster-whisper model)</li>
+          <li>✅ LLM-powered data extraction via Ollama (local DeepSeek)</li>
           <li>✅ Meeting note auto-save to database</li>
           <li>✅ Selected meeting binding for notes</li>
-          <li>⏳ Transcript history (coming in Phase 4)</li>
         </ul>
       </div>
     </div>

@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   db:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: asx-db
     restart: unless-stopped
     deploy:
@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
     depends_on:
       db:
-        condition: service_started
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     deploy:
@@ -45,20 +45,32 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-asx_user}:${POSTGRES_PASSWORD:-asx_password}@db:5432/${POSTGRES_DB:-asx}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://ollama:11434/v1}
       LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:7b}
-      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-local,openai}
+      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,local,openai}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-env}
       JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
       FRED_API_KEY: ${FRED_API_KEY:-55689724e13717f08cb5c36bf7d20921}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ACTION_INGEST_SECRET: ${TELEGRAM_ACTION_INGEST_SECRET:-}
+      ADVICE_MIN_SCORE: ${ADVICE_MIN_SCORE:-65}
+      ADVICE_MAX_CANDIDATES: ${ADVICE_MAX_CANDIDATES:-500}
+      ADVICE_MAX_LIVE_EVAL: ${ADVICE_MAX_LIVE_EVAL:-60}
+      ADVICE_UNDER_ONE_QUOTA: ${ADVICE_UNDER_ONE_QUOTA:-2}
+      PAPER_MONITOR_MIN_INTERVAL_MIN: ${PAPER_MONITOR_MIN_INTERVAL_MIN:-10}
+      PAPER_MONITOR_MAX_TRADES: ${PAPER_MONITOR_MAX_TRADES:-250}
+      PAPER_MONITOR_STARTUP_CATCHUP: ${PAPER_MONITOR_STARTUP_CATCHUP:-true}
+      PAPER_MONITOR_STARTUP_MAX_TRADES: ${PAPER_MONITOR_STARTUP_MAX_TRADES:-75}
     ports:
       - "8000:8000"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/\")' 2>/dev/null || exit 1"]
-      interval: 15s
-      timeout: 5s
+      interval: 30s
+      timeout: 15s
       retries: 5
-      start_period: 30s
+      start_period: 60s
 
   broker-backend:
     build:
@@ -68,7 +80,7 @@ services:
     restart: unless-stopped
     depends_on:
       db:
-        condition: service_started
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -76,7 +88,27 @@ services:
         reservations:
           memory: 512M
     environment:
-      DATABASE_URL: postgresql://asx_user:asx_password_dev@db:5432/asx
+      DATABASE_URL: postgresql://${POSTGRES_USER:-asx_user}:${POSTGRES_PASSWORD:-asx_password}@db:5432/${POSTGRES_DB:-asx}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_BUSINESS_PHONE: ${WHATSAPP_BUSINESS_PHONE:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-my_verify_token}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://ollama:11434/v1}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:7b}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      N8N_URL: ${N8N_URL:-http://broker-n8n:5678}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:-}
+      TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      TELEGRAM_ACTION_INGEST_SECRET: ${TELEGRAM_ACTION_INGEST_SECRET:-}
+      ASX_BACKEND_URL: ${ASX_BACKEND_URL:-http://backend:8000}
     ports:
       - "8001:8001"
     healthcheck:
@@ -93,7 +125,8 @@ services:
     container_name: broker-frontend
     restart: unless-stopped
     depends_on:
-      - broker-backend
+      broker-backend:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -118,13 +151,15 @@ services:
         reservations:
           memory: 128M
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
-      - "80:80"
+      - "8081:80"
 
   ollama:
     image: ollama/ollama:latest
     container_name: asx-ollama
+    profiles: ["local-llm"]
     restart: unless-stopped
     deploy:
       resources:
@@ -134,6 +169,9 @@ services:
           memory: 2048M
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_KEEP_ALIVE=24h
     ports:
       - "11434:11434"
     volumes:
@@ -145,6 +183,55 @@ services:
       retries: 3
       start_period: 15s
 
+  # ─────────────────────────────────────────────
+  # n8n workflow automation (WhatsApp integration)
+  # ─────────────────────────────────────────────
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: broker-n8n
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=${N8N_HOST:-n8n.akstest.win}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=${N8N_PROTOCOL:-https}
+      - WEBHOOK_URL=https://${N8N_HOST:-n8n.akstest.win}/
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme_n8n}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:-change-this-32-char-encryption-key}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=db
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-asx}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER:-asx_user}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-asx_password}
+      - DB_POSTGRESDB_SCHEMA=n8n
+      - N8N_LOG_LEVEL=info
+      - GENERIC_TIMEZONE=Australia/Sydney
+      # Pass broker API URL into n8n so workflows can reference it
+      - BROKER_API_URL=http://broker-backend:8001
+       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
   cloudflared:
     build:
       context: .
@@ -152,11 +239,36 @@ services:
     container_name: asx-cloudflared
     restart: unless-stopped
     depends_on:
-      - frontend
-      - backend
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - my_chatbot_default
+      - photos_default
+      - education_default
+      - home_assistant_default
+      - myslack_default
+
+networks:
+  default:
+  my_chatbot_default:
+    external: true
+  photos_default:
+    external: true
+  education_default:
+    external: true
+  home_assistant_default:
+    external: true
+  myslack_default:
+    external: true
 
 volumes:
   postgres_data:
   ollama_data:
+  n8n_data:

@@ -1,0 +1,208 @@
+# ASX Prediction Platform — Design & Animation Skills Index
+
+Use this file to discover which skill to load. Each skill lives in a directory of the same name under `.claude/skills/` and contains SKILL.md.
+
+---
+
+## Design & UI Skills
+
+### frontend-design
+**Purpose:** Build professional financial dashboards with clean aesthetics, clear data hierarchy, and smooth micro-interactions.
+
+**Triggers:** stock card design, dashboard UI, price display, prediction badge, real-time updates, micro-interactions, button states, data visualization, professional design, financial dashboard.
+
+**Topics covered:**
+- Aesthetic direction for financial (not playful) UI
+- Typography strategy (IBM Plex Sans, monospace for numbers)
+- Color palette (professional blue, gain green, loss red)
+- Micro-interactions (button states, hover effects, loading states)
+- Responsive patterns (mobile-first, 44px touch targets)
+- Data visualization accessibility
+
+---
+
+### ui-design-system
+**Purpose:** Build consistent ASX dashboard design systems with component tokens, typography scales, data-driven spacing, and financial accessibility.
+
+**Triggers:** design tokens, component library, colors, typography, spacing, shadows, border radius, animations tokens, design system, consistency, reusable components, button component, card component, price display, chart container, table component, badge component.
+
+**Topics covered:**
+- Color tokens (brand, sentiment, neutrals for dark dashboard)
+- Typography tokens (font families, sizes, weights, line heights)
+- Spacing scale (4px base unit)
+- Shadow & border radius tokens
+- Animation tokens (duration, easing)
+- Component library specifications
+- Responsive breakpoints
+- Accessibility checklist
+
+---
+
+### web-accessibility
+**Purpose:** Build inclusive financial dashboards for all traders. WCAG 2.1 AA compliance, keyboard navigation, screen reader support, and real-time data accessibility.
+
+**Triggers:** accessibility, WCAG, color contrast, keyboard navigation, screen reader, ARIA, a11y, inclusive design, data visualization accessibility, financial data accessibility, real-time updates accessibility.
+
+**Topics covered:**
+- Color contrast for financial data (never color-only indicators)
+- Text sizing & readability
+- Keyboard navigation (Tab, arrow keys, Escape)
+- Focus indicators (always visible)
+- Screen reader support (ARIA, semantic HTML, live regions)
+- Forms & error messages
+- Tables with proper structure
+- Reduced motion respect
+- Financial-specific accessibility (price alerts, real-time data)
+
+---
+
+## Animation & Interaction Skills
+
+### gsap-core
+**Purpose:** Official GSAP skill for core API — gsap.to(), from(), fromTo(), easing, duration, stagger. Use for smooth 60fps animations in ASX dashboards.
+
+**Triggers:** animation, GSAP tweens, easing, stagger, stock card animation, price update, chart animation, basic animation, responsive animation, reduced motion, 60fps, performance.
+
+**Topics covered:**
+- When to use GSAP vs CSS animations
+- Tween methods (to, from, fromTo, set)
+- Transform aliases (x, y, scale, rotation — preferred over layout properties)
+- autoAlpha vs opacity
+- CSS variables animation
+- Stagger patterns
+- Easing functions (power1, power2, back, etc.)
+- Relative values (+=, -=, *=, /=)
+- gsap.matchMedia() for responsive animations
+- prefers-reduced-motion accessibility
+
+---
+
+### gsap-timeline
+**Purpose:** Official GSAP skill for timelines — gsap.timeline(), position parameter, nesting, playback. Use for sequencing ASX dashboard animations.
+
+**Triggers:** timeline, sequencing, animation sequence, multi-step animation, animation order, choreography, stock card entrance, staggered animations.
+
+**Topics covered:**
+- Creating timelines
+- Position parameter (absolute, relative, labels, placement)
+- Timeline defaults
+- Labels for readable code
+- Nesting timelines
+- Playback control (play, pause, reverse, restart, seek)
+- ASX-specific examples (stock card entrance sequences)
+
+---
+
+### gsap-react
+**Purpose:** Official GSAP skill for React — useGSAP hook, refs, gsap.context(), cleanup. Use for smooth ASX dashboard animations in React/Vite.
+
+**Triggers:** React animation, GSAP in React, useGSAP, animation cleanup, refs, context-safe callbacks, stock card animation in React, real-time data animation.
+
+**Topics covered:**
+- useGSAP hook setup & cleanup
+- Refs for targeting DOM elements
+- Dependencies & revertOnUpdate
+- gsap.context() in useEffect (fallback)
+- Context-safe callbacks for event handlers
+- Real-time data updates (price tickers)
+- Reduced motion in React
+- Staggered list animations
+- SSR & Next.js considerations
+- Common ASX dashboard patterns
+
+---
+
+### gsap-performance
+**Purpose:** Official GSAP skill for performance — prefer transforms, avoid layout thrashing, will-change, batching. Optimize ASX dashboard animations for 60fps.
+
+**Triggers:** animation performance, 60fps, jank, optimization, smooth animations, low-end device performance, layout thrashing, gsap optimization.
+
+**Topics covered:**
+- Transform & opacity (fast, GPU-accelerated)
+- Avoid layout properties (width, height, top, left)
+- will-change CSS property
+- Batch reads & writes
+- Stagger instead of manual delays
+- gsap.quickTo() for frequent updates (price tickers)
+- ScrollTrigger performance tips
+- Memory & cleanup
+- Testing on throttled devices
+- Real-time data performance (WebSocket updates)
+
+---
+
+### gsap-scrolltrigger
+**Purpose:** Official GSAP skill for ScrollTrigger — scroll-linked animations, pinning, scrub, triggers. Use for ASX dashboard scroll-based animations.
+
+**Triggers:** scroll animation, scroll-driven animation, parallax, pin section, ScrollTrigger, scrub animation, lazy loading on scroll, chart reveal.
+
+**Topics covered:**
+- Registering ScrollTrigger plugin
+- Basic trigger setup (start, end, toggleActions)
+- Scrub: tie animation to scroll position
+- Pin: stick elements during scroll
+- Standalone ScrollTrigger (custom scroll behavior)
+- ScrollTrigger.batch() for coordinated animations
+- Lazy loading on scroll
+- React integration with useGSAP
+- Refresh on dynamic content (resize, new data)
+- ASX dashboard examples
+
+---
+
+## Skills Quick Reference
+
+### When to Use Each Skill
+
+| Need | Skill(s) |
+|------|----------|
+| Design stock card appearance | frontend-design, ui-design-system |
+| Implement professional colors | ui-design-system |
+| Make dashboard accessible | web-accessibility |
+| Animate card entrance | gsap-core, gsap-react |
+| Sequence multiple animations | gsap-timeline, gsap-react |
+| Smooth real-time price updates | gsap-core, gsap-performance, gsap-react |
+| Animate chart on scroll reveal | gsap-scrolltrigger, gsap-react |
+| Optimize for 60fps on mobile | gsap-performance |
+| Respect user motion preferences | gsap-core, web-accessibility |
+| Fix performance issues | gsap-performance |
+
+---
+
+## Using These Skills
+
+Each skill is designed for autonomous use by AI agents. To invoke a skill:
+
+1. **Identify the task** — e.g., "Design a stock card component"
+2. **Choose the skill** — Match to one or more skills above
+3. **Load the skill** — Read `/home/aksai/projects/asx-prediction/.claude/skills/{skill-name}/SKILL.md`
+4. **Apply the knowledge** — Follow patterns, examples, and best practices
+
+Example:
+
+```
+Task: Animate stock cards staggered entrance on page load
+Skills needed: gsap-core (for tweens), gsap-timeline (for sequencing), gsap-react (for React integration), gsap-performance (for 60fps)
+```
+
+---
+
+## Platform Context
+
+- **Frontend:** React 18 + Vite (ASX Dashboard)
+- **Broker Frontend:** React + Vite (Broker management dashboard)
+- **Database:** PostgreSQL (real-time data)
+- **LLM:** DeepSeek R1 7B + Fallback (Groq, OpenAI)
+- **Deployment:** Docker containers
+- **Users:** Traders, investors, brokers, financial analysts
+- **Critical:** Real-time performance, accessibility for all users, professional polish
+
+---
+
+## References
+
+- SPEC.md — Technical specifications
+- design.md — Product design & vision
+- claude.md — Project overview & running services
+- WHATSAPP_SETUP.md — Broker WhatsApp integration
+- plans/phase5_enhancement_plan.md — Future enhancements

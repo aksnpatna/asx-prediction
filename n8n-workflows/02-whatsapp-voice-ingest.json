@@ -1,0 +1,122 @@
+{
+  "name": "WhatsApp - Voice Message Ingest (POST)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000001",
+      "name": "Webhook Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "whatsapp-ingest-post"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the Meta WhatsApp webhook payload and extract audio message info.\n// Returns items only for audio messages; empty array for other types (e.g. status updates).\n\nconst body = $input.first().json.body || $input.first().json;\nconst results = [];\n\nfor (const entry of (body.entry || [])) {\n  for (const change of (entry.changes || [])) {\n    const value = change.value || {};\n    for (const msg of (value.messages || [])) {\n      if (msg.type === 'audio' && msg.audio?.id) {\n        results.push({\n          json: {\n            from_phone: msg.from,\n            wa_message_id: msg.id,\n            media_id: msg.audio.id,\n            audio_mime_type: msg.audio.mime_type || 'audio/ogg; codecs=opus',\n          }\n        });\n      }\n    }\n  }\n}\n\n// Return empty item if no audio messages (e.g. read receipts) so we can still 200 OK\nif (results.length === 0) {\n  return [{ json: { skip: true } }];\n}\nreturn results;"
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000002",
+      "name": "Parse Audio Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.skip }}",
+              "operation": "notEqual",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000003",
+      "name": "Is Audio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BROKER_API_URL }}/api/whatsapp/incoming",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "from_phone", "value": "={{ $json.from_phone }}" },
+            { "name": "wa_message_id", "value": "={{ $json.wa_message_id }}" },
+            { "name": "media_id", "value": "={{ $json.media_id }}" },
+            { "name": "audio_mime_type", "value": "={{ $json.audio_mime_type }}" }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000004",
+      "name": "Queue in Broker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 240]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', job_id: $json.job_id }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000005",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1120, 240]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"ignored\"}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "b1b2c3d4-0002-0002-0002-000000000006",
+      "name": "Respond 200 Ignored",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 400]
+    }
+  ],
+  "connections": {
+    "Webhook Ingest": {
+      "main": [
+        [{ "node": "Parse Audio Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Audio Message": {
+      "main": [
+        [{ "node": "Is Audio?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Audio?": {
+      "main": [
+        [{ "node": "Queue in Broker", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 Ignored", "type": "main", "index": 0 }]
+      ]
+    },
+    "Queue in Broker": {
+      "main": [
+        [{ "node": "Respond 200 OK", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "v1"
+}

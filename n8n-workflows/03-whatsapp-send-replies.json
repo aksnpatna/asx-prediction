@@ -1,0 +1,147 @@
+{
+  "name": "WhatsApp - Send Replies (Scheduled)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "seconds", "secondsInterval": 60 }]
+        }
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000001",
+      "name": "Every 60 Seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.BROKER_API_URL }}/api/whatsapp/jobs?status=done&replied=false&limit=20",
+        "options": { "timeout": 10000 }
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000002",
+      "name": "Fetch Done Jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ Array.isArray($json) ? $json.length : 0 }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000003",
+      "name": "Has Jobs?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "=",
+        "options": {}
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000004",
+      "name": "Split Into Jobs",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [900, 240]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build WhatsApp API request body for sending a text message\nconst job = $input.first().json;\nconst phoneNumberId = $env.WHATSAPP_PHONE_NUMBER_ID;\nconst accessToken = $env.WHATSAPP_ACCESS_TOKEN;\nconst replyText = job.reply_text || 'Thanks for your message! We will follow up shortly.';\n\nreturn [{\n  json: {\n    job_id: job.id,\n    to: job.from_phone,\n    reply_text: replyText,\n    url: `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,\n    authorization: `Bearer ${accessToken}`,\n    payload: {\n      messaging_product: 'whatsapp',\n      to: job.from_phone,\n      type: 'text',\n      text: { body: replyText }\n    }\n  }\n}];"
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000005",
+      "name": "Build Reply Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ $json.authorization }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": { "timeout": 15000 }
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000006",
+      "name": "Send WhatsApp Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1320, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BROKER_API_URL }}/api/whatsapp/mark-replied/{{ $('Build Reply Payload').item.json.job_id }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "reply_text", "value": "={{ $('Build Reply Payload').item.json.reply_text }}" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "c1b2c3d4-0003-0003-0003-000000000007",
+      "name": "Mark as Replied",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1540, 240]
+    }
+  ],
+  "connections": {
+    "Every 60 Seconds": {
+      "main": [
+        [{ "node": "Fetch Done Jobs", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Done Jobs": {
+      "main": [
+        [{ "node": "Has Jobs?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Jobs?": {
+      "main": [
+        [{ "node": "Split Into Jobs", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Split Into Jobs": {
+      "main": [
+        [{ "node": "Build Reply Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Reply Payload": {
+      "main": [
+        [{ "node": "Send WhatsApp Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send WhatsApp Message": {
+      "main": [
+        [{ "node": "Mark as Replied", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": ""
+  },
+  "versionId": "v1"
+}

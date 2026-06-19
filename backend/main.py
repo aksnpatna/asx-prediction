@@ -9663,7 +9663,9 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
     """
     try:
         signal = get_probability_and_score(symbol)
-        target_price = float(signal.get("predicted_price_3m") or entry_price * 1.12)
+        predicted = float(signal.get("predicted_price_3m") or 0)
+        # For a LONG trade, target must be > entry. If the model is bearish, default to 12% upside.
+        target_price = predicted if predicted > entry_price else entry_price * 1.12
         stop_loss_price = round(entry_price * 0.92, 3)   # 8% stop
         take_profit_price = round(target_price, 3)
         trade_id = str(uuid4())

@@ -1541,11 +1541,10 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     }
 
 def get_historical_data(symbol: str, period: str = "1y", market: str = None) -> pd.DataFrame:
-    """Get historical price data for any market. Falls back to ASX if no data found.
-    Pass market=None to use the symbol as-is (no suffix appended)."""
+    """Get historical price data for any market. Falls back to ASX if no data found."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
-        return yf.Ticker(symbol).history(period=period)
+        market = detect_market(s)
     df = yf.Ticker(format_ticker(s, market)).history(period=period)
     # If empty and market wasn't explicitly AU, retry as ASX
     if df.empty and market != "AU":

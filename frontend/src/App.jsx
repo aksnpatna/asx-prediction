@@ -1,8 +1,9 @@
-﻿import React, { Component, useEffect, useMemo, useState } from 'react'
+import React, { Component, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
+import DiscoverTab from './DiscoverTab'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
@@ -617,10 +618,17 @@ function PortfolioTab({ token, preferredMarket }) {
 const zoneColors = { clear: 'var(--ig-gain)', caution: '#f59e0b', avoid: 'var(--ig-red)' }
 const zoneEmoji = { clear: '🟢', caution: '🟡', avoid: '🔴' }
 
-function WealthBuilderTab({ token, preferredMarket, setActiveTab }) {
+function WealthBuilderTab({ 
+  token, preferredMarket, setActiveTab,
+  topUniverse, rankedItems, rankLoading, selectedSymbols, setSelectedSymbols,
+  selectedCount, trackSelected, trackLoading, addSingleShare,
+  aiQuery, setAiQuery, aiProvider, setAiProvider, requestAiSuggestions,
+  aiLoading, aiSuggestions, aiProviderUsed, pillStyle, EXCHANGE_LABELS,
+  budgetInfo, fetchBudget
+}) {
   const authH = () => ({ headers: { Authorization: `Bearer ${token}` } })
 
-  const [form, setForm] = useState({
+  const [form, setForm] = React.useState({
     market: preferredMarket || 'AU',
     min_analyst_upside: 5,
     min_score: 0.45,
@@ -629,46 +637,19 @@ function WealthBuilderTab({ token, preferredMarket, setActiveTab }) {
     send_telegram: false,
     scan_mode: 'top',
   })
-  const [result, setResult] = useState(null)
-  const [cachedResult, setCachedResult] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [cacheLoading, setCacheLoading] = useState(false)
-  const [err, setErr] = useState(null)
-  const [expandedRow, setExpandedRow] = useState(null)
-  const [scanStartTime, setScanStartTime] = useState(null)
-  const [elapsedDisplay, setElapsedDisplay] = useState(0)
-
-  // Timer for live elapsed counter during scan
-  useEffect(() => {
-    if (!loading) return
-    const start = Date.now()
-    setScanStartTime(start)
-    setElapsedDisplay(0)
-    const t = setInterval(() => {
-      setElapsedDisplay(Math.round((Date.now() - start) / 1000))
-    }, 1000)
-    return () => clearInterval(t)
-  }, [loading])
-
-  const run = async () => {
-    setLoading(true)
-    setErr(null)
-    setResult(null)
-    try {
-      const r = await axios.post(`${API_BASE}/signals/wealth-builder`, form, { ...authH(), timeout: 300000 })
-      setResult(r.data)
-    } catch (e) {
-      setErr(e.response?.data?.detail || e.message || 'Scan failed')
-    }
-    setLoading(false)
-  }
+  const [result, setResult] = React.useState(null)
+  const [cachedResult, setCachedResult] = React.useState(null)
+  const [loading, setLoading] = React.useState(false)
+  const [cacheLoading, setCacheLoading] = React.useState(false)
+  const [err, setErr] = React.useState(null)
+  const [buyModal, setBuyModal] = React.useState(null)
 
   const loadCached = async () => {
     setCacheLoading(true)
     setErr(null)
     setCachedResult(null)
     try {
-      const r = await axios.get(`${API_BASE}/signals/wealth-builder/cached-broad`, {
+      const r = await axios.get(`${import.meta.env.VITE_API_URL || '/api'}/signals/wealth-builder/cached-broad`, {
         ...authH(),
         params: { market: form.market, min_score: form.min_score, min_prob_5pct: form.min_prob_5pct, min_analyst_upside: form.min_analyst_upside }
       })
@@ -679,418 +660,167 @@ function WealthBuilderTab({ token, preferredMarket, setActiveTab }) {
     setCacheLoading(false)
   }
 
-  const displayResult = result || cachedResult
+  React.useEffect(() => { loadCached() }, [])
 
-  const estTime = form.scan_mode === 'broad' ? '30-90s' : '15-40s'
   return (
-    <div>
-      {err && <div className="error-toast"><p>{err}</p><button onClick={() => setErr(null)}>×</button></div>}
-
-      {/* Loading overlay */}
-      {loading && (
-        <div className="wealth-loading-overlay">
-          <div className="spinner" />
-          <h3 style={{ margin: '16px 0 8px', color: 'var(--ig-dark)' }}>Running Wealth Builder Scan</h3>
-          <p style={{ color: 'var(--ig-muted)', marginBottom: 4 }}>
-            Screening {form.scan_mode === 'broad' ? form.max_symbols : 40} stocks across multiple factors
-          </p>
-          <p style={{ color: 'var(--ig-medium)', fontSize: 12, marginBottom: 8 }}>
-            Fetching price data, valuations, analyst targets, and entry timing...
-          </p>
-          <p style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 14, fontWeight: 700, color: 'var(--ig-red)' }}>
-            {elapsedDisplay > 0 ? `⏱ ${elapsedDisplay}s elapsed` : 'Starting...'}
-          </p>
-          <p style={{ color: 'var(--ig-muted)', fontSize: 11, marginTop: 8 }}>
-            Estimated wait: ~{estTime} | Tip: Use <strong>⚡ Quick Load</strong> for instant 5AM cached results
-          </p>
-        </div>
-      )}
-
-      <section className="panel" style={{ marginBottom: 16 }}>
-        <div className="section-header">
-          <h2>🏦 Wealth Builder — Multi-Factor Signal Screener</h2>
-          <button className="btn-secondary" onClick={() => setActiveTab('tracker')} style={{ fontSize: 11 }}>
-            ← Back to Strategy
-          </button>
-        </div>
-        <p className="section-note" style={{ marginBottom: 12 }}>
-          Combines technical score, analyst consensus targets, earnings catalyst timing, and short interest to surface high-conviction entry opportunities. <strong>Tip:</strong> Use the AI Analyzer on the Strategy tab to get forecasted shares, then screen them here with multi-factor validation.
-        </p>
-
-        <div className="wealth-controls" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 12 }}>
-          {/* Market */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Market</label>
-            <select className="provider-select" value={form.market}
-              onChange={e => setForm(p => ({ ...p, market: e.target.value }))}>
-              <option value="AU">🇦🇺 ASX</option>
-              <option value="US">🇺🇸 NASDAQ</option>
-              <option value="IN">🇮🇳 NSE</option>
-            </select>
-          </div>
-
-          {/* Min analyst upside */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min Upside %</label>
-            <input className="search-input" type="number" min="-20" max="100" style={{ width: 90 }}
-              value={form.min_analyst_upside}
-              onChange={e => setForm(p => ({ ...p, min_analyst_upside: parseFloat(e.target.value) || 0 }))} />
-          </div>
-
-          {/* Min score */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min Score</label>
-            <input className="search-input" type="number" min="0" max="1" step="0.05" style={{ width: 80 }}
-              value={form.min_score}
-              onChange={e => setForm(p => ({ ...p, min_score: parseFloat(e.target.value) || 0 }))} />
-          </div>
-
-          {/* Min P(≥5%) */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Min P(≥5%)</label>
-            <input className="search-input" type="number" min="0" max="100" style={{ width: 80 }}
-              value={form.min_prob_5pct}
-              onChange={e => setForm(p => ({ ...p, min_prob_5pct: parseFloat(e.target.value) || 0 }))} />
-          </div>
-
-          {/* Max scan */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Max Scan</label>
-            <input className="search-input" type="number" min="5" max="100" style={{ width: 70 }}
-              value={form.max_symbols}
-              onChange={e => setForm(p => ({ ...p, max_symbols: parseInt(e.target.value) || 20 }))} />
-          </div>
-
-          {/* Scan mode toggle */}
-          <div>
-            <label style={{ fontSize: 11, color: 'var(--ig-medium)', display: 'block', marginBottom: 4 }}>Universe</label>
-            <select className="provider-select" value={form.scan_mode}
-              onChange={e => setForm(p => ({ ...p, scan_mode: e.target.value }))}
-              style={{ width: 90, fontSize: 11 }}>
-              <option value="top">Top 40</option>
-              <option value="broad">Broad 200+</option>
-            </select>
-          </div>
-
-          {/* Telegram */}
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', paddingBottom: 4, whiteSpace: 'nowrap' }}>
-            <input type="checkbox" checked={form.send_telegram}
-              onChange={e => setForm(p => ({ ...p, send_telegram: e.target.checked }))} />
-            📱 Telegram
-          </label>
-
-          <button className="add-btn" onClick={run} disabled={loading} style={{ paddingInline: 24, whiteSpace: 'nowrap' }}>
-            {loading ? '⏳ Scanning…' : '🔍 Run Screen'}
-          </button>
-          <button className="btn-secondary" onClick={loadCached} disabled={cacheLoading} style={{ whiteSpace: 'nowrap', fontSize: 11 }}>
-            {cacheLoading ? '⏳…' : '⚡ Quick Load'}
-          </button>
-        </div>
-
-        {/* Legend */}
-        <div className="legend-row" style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--ig-medium)', flexWrap: 'wrap' }}>
-          <span>🟢 Clear entry</span>
-          <span>🟡 Caution</span>
-          <span>🔴 Avoid</span>
-        </div>
-      </section>
-
-      {/* Summary bar */}
-      {displayResult && (
-        <section className="stats-grid" style={{ marginBottom: 16 }}>
-          <div className="stat-card blue">
-            <div className="stat-content">
-              <span className="stat-title">Screened</span>
-              <span className="stat-value">{displayResult.screened}</span>
+    <>
+      <DiscoverTab 
+        preferredMarket={preferredMarket}
+        cachedScanData={cachedResult}
+        cachedScanLoading={cacheLoading}
+        fetchCachedWealthScan={loadCached}
+        setBuyModal={setBuyModal}
+        EXCHANGE_LABELS={{ AU: 'ASX 200', US: 'NASDAQ', IN: 'BSE/NSE' }}
+        topUniverse={topUniverse}
+        rankedItems={rankedItems}
+        rankLoading={rankLoading}
+        selectedSymbols={selectedSymbols}
+        setSelectedSymbols={setSelectedSymbols}
+        selectedCount={selectedCount}
+        trackSelected={trackSelected}
+        trackLoading={trackLoading}
+        addSingleShare={addSingleShare}
+        aiQuery={aiQuery}
+        setAiQuery={setAiQuery}
+        aiProvider={aiProvider}
+        setAiProvider={setAiProvider}
+        requestAiSuggestions={requestAiSuggestions}
+        aiLoading={aiLoading}
+        aiSuggestions={aiSuggestions}
+        aiProviderUsed={aiProviderUsed}
+        pillStyle={pillStyle}
+        budgetInfo={budgetInfo}
+      />
+      
+      {/* Buy Modal */}
+      {buyModal && (
+        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setBuyModal(null) }}>
+          <div className="modal" style={{ maxWidth: 520 }}>
+            <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 20px', background: '#0f172a', borderBottom: '2px solid #334155' }}>
+              <div>
+                <h2 style={{ margin: 0, color: '#f1f5f9', fontSize: 17, fontWeight: 800 }}>📈 Buy {buyModal.symbol}</h2>
+                <p style={{ margin: '2px 0 0', color: '#64748b', fontSize: 11 }}>{buyModal.name || 'Paper Trade'}</p>
+              </div>
+              <button className="close-btn" onClick={() => setBuyModal(null)} style={{ background: '#1e293b', borderColor: '#475569', color: '#94a3b8' }}>×</button>
             </div>
-          </div>
-          <div className="stat-card blue">
-            <div className="stat-content">
-              <span className="stat-title">Candidates Found</span>
-              <span className="stat-value" style={{ color: displayResult.candidates_found > 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
-                {displayResult.candidates_found}
-              </span>
-            </div>
-          </div>
-          <div className="stat-card blue">
-            <div className="stat-content">
-              <span className="stat-title">Clear Entry</span>
-              <span className="stat-value" style={{ color: 'var(--ig-gain)' }}>
-                {displayResult.candidates?.filter(c => c.entry_timing?.entry_zone === 'clear').length || 0}
-              </span>
-            </div>
-          </div>
-          <div className="stat-card blue">
-            <div className="stat-content">
-              <span className="stat-title">Telegram</span>
-              <span className="stat-value" style={{ fontSize: 13 }}>
-                {displayResult.telegram?.sent ? '✅ Sent' : '—'}
-              </span>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* Results table */}
-      {displayResult && displayResult.candidates?.length > 0 && (
-        <section className="panel">
-          <div className="section-header">
-            <h2>Candidates — ranked by Wealth Score {cachedResult && <span style={{ background: 'var(--ig-gain)', color: 'white', fontSize: 10, padding: '2px 8px', borderRadius: 3, marginLeft: 8 }}>CACHED {cachedResult.generated_at ? `@ ${new Date(cachedResult.generated_at).toLocaleString([], { hour: '2-digit', minute: '2-digit' })}` : ''}</span>}</h2>
-          </div>
-          
-          {/* Mobile card view */}
-          <div className="mobile-card-list">
-            {displayResult.candidates.map((c, idx) => {
-              const et = c.entry_timing || {}
-              const zone = et.entry_zone || 'caution'
-              const upside = c.analyst_upside_pct
-              const predChg = c.predicted_change_pct || 0
-              const isExpanded = expandedRow === idx
-              return (
-                <div key={c.symbol} className="mobile-card" onClick={() => setExpandedRow(isExpanded ? null : idx)}>
-                  <div className="mobile-card-header">
-                    <div>
-                      <div className="mobile-card-symbol">#{idx + 1} {c.symbol}</div>
-                      <div className="mobile-card-name">{c.name?.slice(0, 30)}</div>
-                    </div>
-                    <div style={{ textAlign: 'right' }}>
-                      <div className="mobile-card-price">${c.current_price?.toFixed(2)}</div>
-                      <div style={{ color: c.change_percent >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 12, fontWeight: 600 }}>
-                        {c.change_percent >= 0 ? '+' : ''}{c.change_percent?.toFixed(2)}%
-                      </div>
-                    </div>
+            <div className="modal-body" style={{ padding: 20, background: '#fff' }}>
+              {/* Current price badge */}
+              {buyModal.current_price && (
+                <div style={{ display: 'flex', gap: 10, marginBottom: 16, padding: '10px 14px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', letterSpacing: 1 }}>Market Price</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', fontFamily: 'monospace' }}>${Number(buyModal.current_price).toFixed(3)}</div>
                   </div>
-                  <div className="mobile-card-grid">
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Score</span>
-                      <span className="mobile-card-value" style={{ color: (c.score || 0) >= 0.65 ? 'var(--ig-gain)' : 'var(--ig-dark)' }}>{(c.score || 0).toFixed(2)}</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">P(≥5%)</span>
-                      <span className="mobile-card-value">{(c.prob_ge_5pct || 0).toFixed(1)}%</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Forecast</span>
-                      <span className="mobile-card-value" style={{ color: predChg >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{predChg >= 0 ? '+' : ''}{predChg?.toFixed(1)}%</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Upside</span>
-                      <span className="mobile-card-value" style={{ color: upside >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>{upside != null ? `${upside >= 0 ? '+' : ''}${upside.toFixed(1)}%` : '—'}</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Entry</span>
-                      <span className="mobile-card-value" style={{ color: zoneColors[zone] }}>{zoneEmoji[zone]} {zone.toUpperCase()}</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Rec</span>
-                      <span className="mobile-card-value" style={{ textTransform: 'uppercase', color: 'var(--ig-blue)' }}>{(c.analyst_recommendation || '—').toUpperCase()}</span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Liq</span>
-                      <span className="mobile-card-value" style={{ color: c.liquidity_ok !== false ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 10 }}>
-                        {c.liquidity_ok !== false ? '✓ OK' : (c.liquidity_flags || []).join(' ')}
-                      </span>
-                    </div>
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">EPS</span>
-                      <span className="mobile-card-value" style={{ color: (c.earnings_quality_flags || []).length === 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontSize: 10 }}>
-                        {(c.earnings_quality_flags || []).length === 0 ? '✓ OK' : (c.earnings_quality_flags || []).join(' ')}
-                      </span>
-                    </div>
-                    {c.rel_strength_3m != null && (
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">vs Sector</span>
-                      <span className="mobile-card-value" style={{ color: c.rel_strength_3m >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
-                        {c.rel_strength_3m >= 0 ? '+' : ''}{c.rel_strength_3m.toFixed(1)}%
-                      </span>
-                    </div>
-                    )}
-                    {c.avg_volume != null && (
-                    <div className="mobile-card-row">
-                      <span className="mobile-card-label">Avg Vol</span>
-                      <span className="mobile-card-value">{c.avg_volume > 1000000 ? `${(c.avg_volume / 1000000).toFixed(1)}M` : c.avg_volume > 1000 ? `${(c.avg_volume / 1000).toFixed(0)}K` : c.avg_volume}</span>
-                    </div>
-                    )}
-                  </div>
-                  {isExpanded && (
-                    <div className="mobile-card-expand">
-                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Entry Timing:</strong> {zoneEmoji[zone]} {zone.toUpperCase()} — {et.reason}</div>
-                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Earnings:</strong> {c.next_earnings_date || 'N/A'} {c.days_to_earnings != null && <span style={{ color: c.days_to_earnings <= 7 ? 'var(--ig-red)' : c.days_to_earnings <= 30 ? '#f59e0b' : 'var(--ig-medium)' }}>({c.days_to_earnings}d)</span>}</div>
-                      <div style={{ fontSize: 11, marginBottom: 8 }}><strong>Target:</strong> ${c.analyst_target_mean?.toFixed(2) || '—'} | <strong>Short:</strong> {c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : '—'}</div>
-                      <div style={{ fontSize: 11 }}><strong>P/E:</strong> {c.pe ? `${c.pe.toFixed(1)}x` : '—'} | <strong>Fwd P/E:</strong> {c.forward_pe ? `${c.forward_pe.toFixed(1)}x` : '—'} | <strong>EPS Growth:</strong> {c.eps_growth_fwd_pct != null ? `${c.eps_growth_fwd_pct > 0 ? '+' : ''}${c.eps_growth_fwd_pct.toFixed(1)}%` : '—'}</div>
+                  {buyModal.analyst_target && (
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', letterSpacing: 1 }}>Analyst Target</div>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: '#00a854', fontFamily: 'monospace' }}>${Number(buyModal.analyst_target).toFixed(2)}</div>
                     </div>
                   )}
                 </div>
-              )
-            })}
+              )}
+
+              {/* Smart sizing tip */}
+              {buyModal.smart_sizing && (
+                <div style={{ marginBottom: 14, padding: 10, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, fontSize: 12, color: '#166534', fontWeight: 600 }}>
+                  💡 {buyModal.smart_sizing}
+                </div>
+              )}
+              {buyModal.budget_note && (
+                <div style={{ marginBottom: 14, padding: 10, background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, color: '#1e40af' }}>
+                  💰 {buyModal.budget_note}
+                </div>
+              )}
+
+              {/* Form */}
+              <div style={{ display: 'grid', gap: 12 }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Quantity *</label>
+                  <input type="number" step="1" min="1"
+                    value={buyModal.quantity}
+                    onChange={e => setBuyModal(m => ({ ...m, quantity: e.target.value }))}
+                    placeholder="e.g. 100"
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                    Execution Price <span style={{ fontWeight: 400, color: '#94a3b8' }}>(leave blank to use live price)</span>
+                  </label>
+                  <input type="number" step="0.001" min="0"
+                    value={buyModal.execution_price || ''}
+                    onChange={e => setBuyModal(m => ({ ...m, execution_price: e.target.value }))}
+                    placeholder={buyModal.current_price ? `Market: $${Number(buyModal.current_price).toFixed(3)}` : 'e.g. 4.50'}
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Commission (optional)</label>
+                  <input type="number" step="0.01" min="0"
+                    value={buyModal.commission || ''}
+                    onChange={e => setBuyModal(m => ({ ...m, commission: e.target.value }))}
+                    placeholder="e.g. 9.50 (CommSec default)"
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Notes (optional)</label>
+                  <input type="text"
+                    value={buyModal.notes || ''}
+                    onChange={e => setBuyModal(m => ({ ...m, notes: e.target.value }))}
+                    placeholder="e.g. Following AI signal on discovery tab"
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                  />
+                </div>
+              </div>
+
+              {/* Total estimate */}
+              {buyModal.quantity && buyModal.current_price && (
+                <div style={{ marginTop: 12, padding: '8px 12px', background: '#f1f5f9', borderRadius: 6, fontSize: 12, color: '#475569' }}>
+                  📊 Estimated total: <strong style={{ color: '#0f172a' }}>
+                    ${(Number(buyModal.quantity) * Number(buyModal.execution_price || buyModal.current_price)).toFixed(2)}
+                  </strong>
+                  {buyModal.commission ? ` + $${Number(buyModal.commission).toFixed(2)} commission` : ''}
+                </div>
+              )}
+
+              {/* Action buttons */}
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
+                <button
+                  onClick={() => setBuyModal(null)}
+                  style={{ padding: '10px 20px', background: '#fff', border: '2px solid #e2e8f0', borderRadius: 6, fontWeight: 700, fontSize: 13, cursor: 'pointer', color: '#475569' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!buyModal.quantity || Number(buyModal.quantity) <= 0) {
+                      alert('Please enter a valid quantity'); return;
+                    }
+                    try {
+                      await axios.post(`${import.meta.env.VITE_API_URL || '/api'}/paper-trades`, {
+                        symbol: buyModal.symbol,
+                        market: preferredMarket || 'AU',
+                        side: 'LONG',
+                        quantity: Number(buyModal.quantity),
+                        notes: buyModal.notes || `Opened from Discover tab`
+                      }, authH())
+                      setBuyModal(null)
+                      alert(`✅ Paper trade opened: ${buyModal.quantity}x ${buyModal.symbol}! Check the Strategy tab → Paper Trades section.`)
+                    } catch (e) {
+                      alert(`❌ ${e.response?.data?.detail || 'Failed to log paper trade. Please try again.'}`)
+                    }
+                  }}
+                  style={{ padding: '10px 24px', background: 'linear-gradient(135deg, #00a854, #00c96e)', border: 'none', borderRadius: 6, fontWeight: 800, fontSize: 13, cursor: 'pointer', color: '#fff', letterSpacing: 0.3 }}
+                >
+                  ✅ Execute Paper Trade
+                </button>
+              </div>
+            </div>
           </div>
-          
-          {/* Desktop table view */}
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Symbol</th>
-                  <th>Price</th>
-                  <th>Chg%</th>
-                  <th>Score</th>
-                  <th>P(≥5%)</th>
-                  <th>Forecast</th>
-                  <th>Target</th>
-                  <th>Upside</th>
-                  <th>Liq</th>
-                  <th>EPS</th>
-                  <th>vsSect</th>
-                  <th>Entry</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody>
-                {displayResult.candidates.map((c, idx) => {
-                  const et = c.entry_timing || {}
-                  const zone = et.entry_zone || 'caution'
-                  const upside = c.analyst_upside_pct
-                  const predChg = c.predicted_change_pct || 0
-                  const isExpanded = expandedRow === idx
-                  return (
-                    <>
-                      <tr key={c.symbol} style={{ cursor: 'pointer' }} onClick={() => setExpandedRow(isExpanded ? null : idx)}>
-                        <td style={{ fontWeight: 600, opacity: 0.6 }}>{idx + 1}</td>
-                        <td><strong>{c.symbol}</strong><br /><span style={{ fontSize: 10, opacity: 0.6 }}>{c.name?.slice(0, 22)}</span></td>
-                        <td>${c.current_price?.toFixed(2)}</td>
-                        <td style={{ color: c.change_percent >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
-                          {c.change_percent >= 0 ? '+' : ''}{c.change_percent?.toFixed(2)}%
-                        </td>
-                        <td>
-                          <div className="weight-bar-wrap">
-                            <div className="weight-bar-fill" style={{ width: `${(c.score || 0) * 100}%`, background: (c.score || 0) >= 0.65 ? 'var(--ig-gain)' : 'var(--ig-blue)' }} />
-                            <span className="weight-pct">{(c.score || 0).toFixed(2)}</span>
-                          </div>
-                        </td>
-                        <td>{(c.prob_ge_5pct || 0).toFixed(1)}%</td>
-                        <td style={{ color: predChg >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
-                          {predChg >= 0 ? '+' : ''}{predChg?.toFixed(1)}%
-                        </td>
-                        <td>${c.analyst_target_mean?.toFixed(2) || '—'}</td>
-                        <td style={{ color: upside >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
-                          {upside != null ? `${upside >= 0 ? '+' : ''}${upside.toFixed(1)}%` : '—'}
-                        </td>
-                        <td style={{ fontSize: 10, color: c.liquidity_ok !== false ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
-                          {c.liquidity_ok !== false ? '✓' : (c.liquidity_flags || []).join(' ')}
-                        </td>
-                        <td style={{ fontSize: 10, color: (c.earnings_quality_flags || []).length === 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
-                          {(c.earnings_quality_flags || []).length === 0 ? '✓' : (c.earnings_quality_flags || []).join(' ')}
-                        </td>
-                        <td style={{ fontSize: 10, color: (c.rel_strength_3m || 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)', fontWeight: 600 }}>
-                          {c.rel_strength_3m != null ? `${c.rel_strength_3m >= 0 ? '+' : ''}${c.rel_strength_3m.toFixed(1)}%` : '—'}
-                        </td>
-                        <td style={{ color: zoneColors[zone], fontWeight: 700 }}>
-                          {zoneEmoji[zone]} {zone.toUpperCase()}
-                        </td>
-                        <td>
-                          <button className="btn-secondary" style={{ fontSize: 11, padding: '2px 8px' }}
-                            onClick={e => { e.stopPropagation(); setExpandedRow(isExpanded ? null : idx) }}>
-                            {isExpanded ? '▲' : '▼'}
-                          </button>
-                        </td>
-                      </tr>
-
-                      {isExpanded && (
-                        <tr key={`${c.symbol}-detail`}>
-                          <td colSpan={14} style={{ background: 'var(--ig-light-grey)', padding: 16 }}>
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }} className="expanded-detail-grid">
-                              {/* Entry timing */}
-                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
-                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📅 Entry Timing</p>
-                                <p style={{ fontSize: 12, color: zoneColors[zone], fontWeight: 700 }}>{zoneEmoji[zone]} {zone.toUpperCase()}</p>
-                                <p style={{ fontSize: 11, color: 'var(--ig-medium)', marginTop: 4 }}>{et.reason}</p>
-                                <p style={{ fontSize: 11, marginTop: 6 }}>Earnings risk: <strong>{et.earnings_risk?.toUpperCase()}</strong></p>
-                                <p style={{ fontSize: 11 }}>Technicals confirmed: <strong>{et.technical_confirmed ? '✅ Yes' : '❌ No'}</strong></p>
-                              </div>
-
-                              {/* Valuation */}
-                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
-                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📊 Valuation</p>
-                                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
-                                  <tbody>
-                                    {[
-                                      ['P/E', c.pe ? `${c.pe.toFixed(1)}x` : '—'],
-                                      ['Fwd P/E', c.forward_pe ? `${c.forward_pe.toFixed(1)}x` : '—'],
-                                      ['EPS Growth', c.eps_growth_fwd_pct != null ? `${c.eps_growth_fwd_pct > 0 ? '+' : ''}${c.eps_growth_fwd_pct.toFixed(1)}%` : '—'],
-                                      ['52w High', c.valuation?.['52w_high'] ? `$${c.valuation['52w_high'].toFixed(2)}` : '—'],
-                                      ['From Peak', c.pct_from_52w_high != null ? `${c.pct_from_52w_high.toFixed(1)}%` : '—'],
-                                      ['Short %', c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : '—'],
-                                    ].map(([label, val]) => (
-                                      <tr key={label}>
-                                        <td style={{ color: 'var(--ig-medium)', paddingRight: 8 }}>{label}</td>
-                                        <td style={{ fontWeight: 600 }}>{val}</td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-
-                              {/* Risk / positioning */}
-                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
-                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>⚠️ Risk Checklist</p>
-                                <ul style={{ fontSize: 11, paddingLeft: 16, color: 'var(--ig-dark)', lineHeight: 1.8 }}>
-                                  <li style={{ color: (c.short_pct_float || 0) > 15 ? 'var(--ig-red)' : 'inherit' }}>
-                                    Short interest: {c.short_pct_float != null ? `${c.short_pct_float.toFixed(1)}%` : 'N/A'} {(c.short_pct_float || 0) > 15 ? '⚠️ HIGH' : ''}
-                                  </li>
-                                  <li style={{ color: (c.days_to_earnings || 999) <= 14 ? '#f59e0b' : 'inherit' }}>
-                                    Earnings: {c.next_earnings_date || 'N/A'} {(c.days_to_earnings || 999) <= 14 ? '⚠️ NEAR' : ''}
-                                  </li>
-                                  <li>Sector: {c.valuation?.sector || '—'}</li>
-                                  <li># Analysts covering: {c.num_analyst_opinions || '—'}</li>
-                                  <li>Trend: {(c.trend || '—').toUpperCase()}</li>
-                                </ul>
-                                <p style={{ fontSize: 10, color: 'var(--ig-muted)', marginTop: 8 }}>
-                                  Suggested stop: ~8% below entry | Target: analyst mean ${c.analyst_target_mean?.toFixed(2) || '—'}
-                                </p>
-                              </div>
-
-                              {/* Quality & Momentum */}
-                              <div style={{ background: 'white', border: '1px solid var(--ig-border)', borderRadius: 4, padding: 12 }}>
-                                <p style={{ fontWeight: 700, fontSize: 12, marginBottom: 8 }}>📈 Quality &amp; Momentum</p>
-                                <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
-                                  <tbody>
-                                    {[
-                                      ['Liquidity', c.liquidity_ok !== false ? '✓ OK' : '⚠ LOW'],
-                                      ['Avg Vol', c.avg_volume != null ? (c.avg_volume > 1e6 ? `${(c.avg_volume / 1e6).toFixed(1)}M` : `${(c.avg_volume / 1000).toFixed(0)}K`) : '—'],
-                                      ['EPS', c.trailing_eps != null ? (c.trailing_eps > 0 ? `$${c.trailing_eps.toFixed(2)}` : `⚠ -$${Math.abs(c.trailing_eps).toFixed(2)}`) : '—'],
-                                      ['Rev Growth', c.revenue_growth != null ? `${(c.revenue_growth * 100).toFixed(1)}%` : '—'],
-                                      ['vs Sector 3m', c.rel_strength_3m != null ? `${c.rel_strength_3m >= 0 ? '+' : ''}${c.rel_strength_3m.toFixed(1)}%` : '—'],
-                                      ['Sector 1m', c.sector_perf_1mo != null ? `${c.sector_perf_1mo >= 0 ? '+' : ''}${c.sector_perf_1mo.toFixed(1)}%` : '—'],
-                                      ['EPS/Quality Flags', (c.earnings_quality_flags || []).length > 0 ? (c.earnings_quality_flags || []).join(', ') : '✓ All clear'],
-                                    ].map(([label, val]) => (
-                                      <tr key={label}>
-                                        <td style={{ color: 'var(--ig-medium)', paddingRight: 8 }}>{label}</td>
-                                        <td style={{ fontWeight: 600, fontSize: 10 }}>{val}</td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        </div>
       )}
-
-      {displayResult && displayResult.candidates?.length === 0 && (
-        <section className="panel">
-          <p className="section-note">No candidates met the filter criteria. Try lowering the score threshold or analyst upside requirement.</p>
-        </section>
-      )}
-    </div>
+    </>
   )
 }
 
@@ -1260,6 +990,15 @@ function App() {
   // Phase 6 – AI banner
   const [aiBanner, setAiBanner] = useState(null)
 
+  // Phase 7 – Investment Budget, Hedge Suggestions, Sentiment Monitor
+  const [budgetInfo, setBudgetInfo] = useState(null)
+  const [budgetLoading, setBudgetLoading] = useState(false)
+  const [budgetForm, setBudgetForm] = useState({ total_budget: '', max_position_pct: '10', currency: 'AUD' })
+  const [hedgeSuggestions, setHedgeSuggestions] = useState(null)
+  const [hedgeLoading, setHedgeLoading] = useState(false)
+  const [sentimentScan, setSentimentScan] = useState(null)
+  const [sentimentLoading, setSentimentLoading] = useState(false)
+
   const authHeaders = () => ({ headers: { Authorization: `Bearer ${token}` } })
   const selectedCount = useMemo(() => Object.values(selectedSymbols).filter(Boolean).length, [selectedSymbols])
   const activeStrategyDashboard = useMemo(
@@ -1323,7 +1062,7 @@ function App() {
         throw new Error(`Authentication failed (${authErr.response?.status}): ${authErr.response?.data?.detail || authErr.message}`)
       }
       try {
-        await Promise.all([fetchTopUniverse(marketValue), fetchTrackingOverview(), fetchMarketPulse(), fetchExplainability(), fetchTelegramRecipients(), fetchTelegramHistory(), fetchAdviceActions(), fetchPaperTrades(), fetchPositionHistory()])
+        await Promise.all([fetchTopUniverse(marketValue), fetchTrackingOverview(), fetchMarketPulse(), fetchExplainability(), fetchTelegramRecipients(), fetchTelegramHistory(), fetchAdviceActions(), fetchPaperTrades(), fetchPositionHistory(), fetchBudget()])
       } catch (dataErr) {
         setError(`Data load incomplete: ${dataErr.message}`)
       }
@@ -1359,6 +1098,67 @@ function App() {
   const fetchExplainability = async () => {
     const r = await axios.get(`${API_BASE}/v1/backtest/summary`, authHeaders())
     setExplainability(r.data)
+  }
+
+  const fetchBudget = async () => {
+    setBudgetLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/user/investment-budget`, authHeaders())
+      setBudgetInfo(r.data)
+      if (r.data?.budget_set) {
+        setBudgetForm({
+          total_budget: r.data.total_budget?.toString() || '',
+          max_position_pct: r.data.max_position_pct?.toString() || '10',
+          currency: r.data.currency || 'AUD',
+        })
+      }
+    } catch {
+      setBudgetInfo(null)
+    } finally {
+      setBudgetLoading(false)
+    }
+  }
+
+  const saveBudget = async () => {
+    setBudgetLoading(true)
+    try {
+      const r = await axios.put(`${API_BASE}/user/investment-budget`, {
+        total_budget: parseFloat(budgetForm.total_budget) || 0,
+        max_position_pct: parseFloat(budgetForm.max_position_pct) || 10,
+        currency: budgetForm.currency || 'AUD',
+      }, authHeaders())
+      if (r.data?.ok) {
+        await fetchBudget()
+      }
+    } catch (e) {
+      alert(`Failed to save budget: ${e.response?.data?.detail || e.message}`)
+    } finally {
+      setBudgetLoading(false)
+    }
+  }
+
+  const fetchHedgeSuggestions = async () => {
+    setHedgeLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/positions/hedge-suggestions`, authHeaders())
+      setHedgeSuggestions(r.data)
+    } catch {
+      setHedgeSuggestions(null)
+    } finally {
+      setHedgeLoading(false)
+    }
+  }
+
+  const fetchSentimentScan = async () => {
+    setSentimentLoading(true)
+    try {
+      const r = await axios.get(`${API_BASE}/positions/sentiment-scan`, authHeaders())
+      setSentimentScan(r.data)
+    } catch {
+      setSentimentScan(null)
+    } finally {
+      setSentimentLoading(false)
+    }
   }
 
   const fetchTelegramRecipients = async () => {
@@ -2158,6 +1958,311 @@ function App() {
               This ensures your watchlist isn't just the usual suspects (BHP, CBA, etc.) but includes genuine 
               high-conviction opportunities from the full exchange.
             </div>
+
+            {/* ── Investment Budget Widget ──────────────────────────────── */}
+            <section className="panel" style={{ marginBottom: 14, background: 'linear-gradient(135deg, #fefce8 0%, #fef9c3 100%)', borderColor: '#fde047' }}>
+              <div className="section-header" style={{ flexWrap: 'wrap', gap: 8 }}>
+                <h2>💰 Investment Budget</h2>
+                {budgetInfo?.budget_set && (
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, fontWeight: 600 }}>
+                    <span style={{ color: '#166534' }}>Deployed: ${budgetInfo.deployed_capital?.toLocaleString()}</span>
+                    <span style={{ color: '#0369a1' }}>Available: ${budgetInfo.remaining_capital?.toLocaleString()}</span>
+                    <span style={{ color: '#9333ea' }}>{budgetInfo.utilization_pct?.toFixed(0)}% used</span>
+                  </div>
+                )}
+              </div>
+              {budgetInfo?.budget_set ? (
+                <div>
+                  {/* Budget progress bar */}
+                  <div style={{ marginBottom: 12, padding: '8px 12px', background: '#fffbeb', borderRadius: 6, border: '1px solid #fde68a' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4, color: '#92400e' }}>
+                      <span>Total: ${budgetInfo.total_budget?.toLocaleString()} {budgetInfo.currency}</span>
+                      <span>Max/Position: ${budgetInfo.max_per_position?.toLocaleString()} ({budgetInfo.max_position_pct}%)</span>
+                    </div>
+                    <div style={{ width: '100%', height: 10, background: '#fef3c7', borderRadius: 5, overflow: 'hidden' }}>
+                      <div style={{
+                        width: `${Math.min(budgetInfo.utilization_pct || 0, 100)}%`,
+                        height: '100%',
+                        background: budgetInfo.utilization_pct > 90 ? '#ef4444' : budgetInfo.utilization_pct > 70 ? '#f59e0b' : '#22c55e',
+                        borderRadius: 5,
+                        transition: 'width 0.5s ease',
+                      }} />
+                    </div>
+                  </div>
+                  {/* Position weights */}
+                  {budgetInfo.position_weights?.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                      {budgetInfo.position_weights.map(pw => (
+                        <span key={pw.symbol} style={{
+                          padding: '3px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600,
+                          background: pw.over_limit ? '#fef2f2' : '#f0fdf4',
+                          border: `1px solid ${pw.over_limit ? '#fca5a5' : '#bbf7d0'}`,
+                          color: pw.over_limit ? '#dc2626' : '#166534',
+                        }}>
+                          {pw.symbol}: {pw.weight_pct}%{pw.over_limit ? ' ⚠️' : ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {budgetInfo.over_limit_count > 0 && (
+                    <p style={{ fontSize: 11, color: '#dc2626', margin: '0 0 8px' }}>
+                      ⚠️ {budgetInfo.over_limit_count} position(s) exceed {budgetInfo.max_position_pct}% limit
+                    </p>
+                  )}
+                  {/* Edit budget */}
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <input className="search-input" type="number" min="0" step="1000" placeholder="Total Budget"
+                      value={budgetForm.total_budget} onChange={e => setBudgetForm(p => ({ ...p, total_budget: e.target.value }))}
+                      style={{ width: 140 }} />
+                    <input className="search-input" type="number" min="1" max="100" placeholder="Max % per stock"
+                      value={budgetForm.max_position_pct} onChange={e => setBudgetForm(p => ({ ...p, max_position_pct: e.target.value }))}
+                      style={{ width: 100 }} />
+                    <select className="provider-select" value={budgetForm.currency}
+                      onChange={e => setBudgetForm(p => ({ ...p, currency: e.target.value }))}>
+                      <option value="AUD">AUD</option>
+                      <option value="USD">USD</option>
+                      <option value="INR">INR</option>
+                    </select>
+                    <button className="add-btn" onClick={saveBudget} disabled={budgetLoading} style={{ fontSize: 12 }}>
+                      {budgetLoading ? 'Saving...' : '💾 Update Budget'}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <p className="section-note" style={{ marginBottom: 8 }}>Set your total investment budget to enable smart position sizing across the app.</p>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <input className="search-input" type="number" min="0" step="1000" placeholder="Total budget (e.g. 50000)"
+                      value={budgetForm.total_budget} onChange={e => setBudgetForm(p => ({ ...p, total_budget: e.target.value }))}
+                      style={{ width: 200 }} />
+                    <input className="search-input" type="number" min="1" max="100" placeholder="Max % per stock (default 10)"
+                      value={budgetForm.max_position_pct} onChange={e => setBudgetForm(p => ({ ...p, max_position_pct: e.target.value }))}
+                      style={{ width: 140 }} />
+                    <select className="provider-select" value={budgetForm.currency}
+                      onChange={e => setBudgetForm(p => ({ ...p, currency: e.target.value }))}>
+                      <option value="AUD">AUD</option>
+                      <option value="USD">USD</option>
+                      <option value="INR">INR</option>
+                    </select>
+                    <button className="add-btn" onClick={saveBudget} disabled={budgetLoading || !budgetForm.total_budget}>
+                      {budgetLoading ? 'Saving...' : '💰 Set Budget'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            {/* ── Hedge Suggestions Panel ──────────────────────────────── */}
+            <section className="panel" style={{ marginBottom: 14 }}>
+              <div className="section-header">
+                <h2>🛡️ Hedge Suggestions</h2>
+                <button className="btn-secondary" onClick={fetchHedgeSuggestions} disabled={hedgeLoading} style={{ fontSize: 12 }}>
+                  {hedgeLoading ? 'Analysing...' : '🔍 Check Hedge Needs'}
+                </button>
+              </div>
+              {!hedgeSuggestions && !hedgeLoading && (
+                <p className="section-note">Click "Check Hedge Needs" to scan your holdings against current market regime and get actionable hedge recommendations (gold, bonds, cash).</p>
+              )}
+              {hedgeSuggestions && (
+                <div>
+                  {/* Regime status */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 12 }}>
+                    <div className={`stat-card ${hedgeSuggestions.regime?.current === 'risk_off' ? 'red' : hedgeSuggestions.regime?.current === 'risk_on' ? 'green' : 'blue'}`}>
+                      <div className="stat-content">
+                        <span className="stat-title">Market Regime</span>
+                        <span className="stat-value" style={{ fontSize: 14, textTransform: 'uppercase' }}>
+                          {hedgeSuggestions.regime?.current === 'risk_off' ? '🔴' : hedgeSuggestions.regime?.current === 'risk_on' ? '🟢' : '🟡'} {hedgeSuggestions.regime?.current?.replace('_', ' ')}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Equities</span>
+                        <span className="stat-value" style={{ color: (hedgeSuggestions.regime?.equities_ret || 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                          {(hedgeSuggestions.regime?.equities_ret || 0) >= 0 ? '+' : ''}{(hedgeSuggestions.regime?.equities_ret || 0).toFixed(2)}%
+                        </span>
+                      </div>
+                    </div>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Gold</span>
+                        <span className="stat-value" style={{ color: (hedgeSuggestions.regime?.gold_ret || 0) >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
+                          {(hedgeSuggestions.regime?.gold_ret || 0) >= 0 ? '+' : ''}{(hedgeSuggestions.regime?.gold_ret || 0).toFixed(2)}%
+                        </span>
+                      </div>
+                    </div>
+                    <div className="stat-card blue">
+                      <div className="stat-content">
+                        <span className="stat-title">Confidence</span>
+                        <span className="stat-value">{(hedgeSuggestions.regime?.confidence || 0).toFixed(0)}%</span>
+                      </div>
+                    </div>
+                  </div>
+                  {/* Flags */}
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+                    {hedgeSuggestions.regime?.safe_haven_flag && (
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5' }}>
+                        ⚠️ Safe Haven Active
+                      </span>
+                    )}
+                    {hedgeSuggestions.regime?.usd_headwind_flag && (
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a' }}>
+                        💵 USD Headwind
+                      </span>
+                    )}
+                    {hedgeSuggestions.regime?.divergence_flag && (
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#f0f9ff', color: '#0369a1', border: '1px solid #bae6fd' }}>
+                        📊 Divergence Detected
+                      </span>
+                    )}
+                  </div>
+                  {/* Suggestions list */}
+                  {hedgeSuggestions.suggestions?.length > 0 ? (
+                    <div style={{ display: 'grid', gap: 10 }}>
+                      {hedgeSuggestions.suggestions.map((s, i) => (
+                        <div key={i} style={{
+                          padding: 14, borderRadius: 8,
+                          background: s.urgency === 'high' ? 'linear-gradient(135deg, #fef2f2, #fee2e2)' : s.urgency === 'medium' ? 'linear-gradient(135deg, #fffbeb, #fef3c7)' : 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
+                          border: `1px solid ${s.urgency === 'high' ? '#fca5a5' : s.urgency === 'medium' ? '#fde68a' : '#bbf7d0'}`,
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                            <strong style={{ fontSize: 14 }}>
+                              {s.category === 'gold' ? '🥇' : s.category === 'bonds' ? '📉' : s.category === 'cash' ? '💵' : s.category === 'rebalance' ? '⚖️' : '🛡️'}{' '}
+                              {s.instrument !== 'DIVERSIFY' && s.instrument !== 'CURRENCY_HEDGE' ? `${s.instrument} — ` : ''}{s.name}
+                            </strong>
+                            <span style={{
+                              padding: '2px 8px', borderRadius: 10, fontSize: 10, fontWeight: 700, textTransform: 'uppercase',
+                              background: s.urgency === 'high' ? '#dc2626' : s.urgency === 'medium' ? '#f59e0b' : '#22c55e',
+                              color: '#fff',
+                            }}>
+                              {s.urgency}
+                            </span>
+                          </div>
+                          <p style={{ margin: '0 0 6px', fontSize: 12, color: '#475569', lineHeight: 1.5 }}>{s.reason}</p>
+                          {s.suggested_amount > 0 && (
+                            <p style={{ margin: 0, fontSize: 11, color: '#6b7280' }}>
+                              Suggested allocation: ~{s.suggested_allocation_pct}% (${s.suggested_amount?.toLocaleString()})
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p style={{ fontSize: 12, color: '#166534', background: '#f0fdf4', padding: 10, borderRadius: 6, border: '1px solid #bbf7d0' }}>
+                      ✅ No urgent hedge actions needed. Market conditions are favourable for your current positions.
+                    </p>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {/* ── News Sentiment Scanner ──────────────────────────────── */}
+            <section className="panel" style={{ marginBottom: 14 }}>
+              <div className="section-header">
+                <h2>📰 News Sentiment Monitor</h2>
+                <button className="btn-secondary" onClick={fetchSentimentScan} disabled={sentimentLoading} style={{ fontSize: 12 }}>
+                  {sentimentLoading ? 'Scanning...' : '🔍 Scan News Sentiment'}
+                </button>
+              </div>
+              {!sentimentScan && !sentimentLoading && (
+                <p className="section-note">Click "Scan News Sentiment" to analyse recent news for all your held positions. Negative news will generate sell alerts with profit-at-risk calculations.</p>
+              )}
+              {sentimentScan && (
+                <div>
+                  {/* Summary bar */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10, marginBottom: 12 }}>
+                    <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Scanned</span><span className="stat-value">{sentimentScan.scanned}</span></div></div>
+                    <div className={`stat-card ${sentimentScan.high_urgency_count > 0 ? 'red' : 'green'}`}>
+                      <div className="stat-content"><span className="stat-title">⚠️ High Alerts</span><span className="stat-value">{sentimentScan.high_urgency_count}</span></div>
+                    </div>
+                    <div className={`stat-card ${sentimentScan.medium_urgency_count > 0 ? '' : 'green'}`} style={{ background: sentimentScan.medium_urgency_count > 0 ? '#fef3c7' : undefined }}>
+                      <div className="stat-content"><span className="stat-title">🟡 Watch</span><span className="stat-value">{sentimentScan.medium_urgency_count}</span></div>
+                    </div>
+                  </div>
+                  <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 12 }}>
+                    {sentimentScan.summary} • Scanned at {new Date(sentimentScan.scanned_at).toLocaleTimeString()}
+                  </p>
+
+                  {/* Sell Alerts */}
+                  {sentimentScan.alerts?.filter(a => a.urgency === 'high').map((alert, i) => (
+                    <div key={i} style={{
+                      padding: 16, marginBottom: 10, borderRadius: 8,
+                      background: 'linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%)',
+                      border: '2px solid #fca5a5',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                        <strong style={{ fontSize: 15, color: '#dc2626' }}>⚠️ NEGATIVE NEWS — {alert.symbol}</strong>
+                        <span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 10, fontWeight: 700, background: '#dc2626', color: '#fff' }}>REVIEW SELL</span>
+                      </div>
+                      {alert.headline && <p style={{ margin: '0 0 8px', fontSize: 13, color: '#1e293b', fontStyle: 'italic' }}>"{alert.headline}"</p>}
+                      <p style={{ margin: '0 0 8px', fontSize: 12, color: '#475569' }}>{alert.reason}</p>
+                      {alert.themes?.length > 0 && (
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+                          {alert.themes.map((t, j) => (
+                            <span key={j} style={{ padding: '2px 8px', borderRadius: 12, fontSize: 10, background: '#fef2f2', border: '1px solid #fca5a5', color: '#b91c1c' }}>{t}</span>
+                          ))}
+                        </div>
+                      )}
+                      {alert.profit_at_risk && Object.keys(alert.profit_at_risk).length > 0 && (
+                        <div style={{ padding: 10, background: '#fff', borderRadius: 6, border: '1px solid #e5e7eb', marginBottom: 8 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8, fontSize: 12 }}>
+                            <div><span style={{ color: '#6b7280' }}>Avg Cost: </span><strong>${alert.profit_at_risk.avg_cost?.toFixed(2)}</strong></div>
+                            <div><span style={{ color: '#6b7280' }}>Live: </span><strong>${alert.profit_at_risk.live_price?.toFixed(2)}</strong></div>
+                            <div><span style={{ color: alert.profit_at_risk.unrealized_profit >= 0 ? '#166534' : '#dc2626' }}>P&L: </span>
+                              <strong style={{ color: alert.profit_at_risk.unrealized_profit >= 0 ? '#166534' : '#dc2626' }}>
+                                {alert.profit_at_risk.unrealized_profit >= 0 ? '+' : ''}${alert.profit_at_risk.unrealized_profit?.toFixed(2)} ({alert.profit_at_risk.unrealized_pct?.toFixed(1)}%)
+                              </strong>
+                            </div>
+                            <div>
+                              <span style={{ color: '#6b7280' }}>Risk if 5% drop: </span>
+                              <strong style={{ color: '#dc2626' }}>-${alert.profit_at_risk.potential_loss_at_risk_pct?.toFixed(2)}</strong>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <p style={{ fontSize: 10, color: '#94a3b8', margin: 0, fontStyle: 'italic' }}>
+                        ⚖️ Use this as decision support, not an automatic trade signal. Always verify with your own research.
+                      </p>
+                    </div>
+                  ))}
+
+                  {/* Medium alerts */}
+                  {sentimentScan.alerts?.filter(a => a.urgency === 'medium').map((alert, i) => (
+                    <div key={i} style={{
+                      padding: 12, marginBottom: 8, borderRadius: 6,
+                      background: '#fffbeb', border: '1px solid #fde68a',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <strong style={{ fontSize: 13, color: '#92400e' }}>🟡 {alert.symbol} — Monitor</strong>
+                        <span style={{ fontSize: 11, color: '#92400e' }}>Score: {alert.sentiment_score?.toFixed(2)}</span>
+                      </div>
+                      {alert.headline && <p style={{ margin: '4px 0 0', fontSize: 12, color: '#475569' }}>{alert.headline}</p>}
+                    </div>
+                  ))}
+
+                  {/* Sentiment grid for all positions */}
+                  {sentimentScan.sentiment_results?.length > 0 && (
+                    <div style={{ marginTop: 12 }}>
+                      <p style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 8 }}>Sentiment by Position:</p>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                        {sentimentScan.sentiment_results.map(sr => (
+                          <div key={sr.symbol} style={{
+                            padding: '6px 12px', borderRadius: 8, fontSize: 12, fontWeight: 600,
+                            background: sr.sentiment === 'positive' ? '#f0fdf4' : sr.sentiment === 'negative' ? '#fef2f2' : '#f8fafc',
+                            border: `1px solid ${sr.sentiment === 'positive' ? '#bbf7d0' : sr.sentiment === 'negative' ? '#fca5a5' : '#e2e8f0'}`,
+                            color: sr.sentiment === 'positive' ? '#166534' : sr.sentiment === 'negative' ? '#dc2626' : '#475569',
+                          }}>
+                            {sr.sentiment === 'positive' ? '🟢' : sr.sentiment === 'negative' ? '🔴' : '⚪'} {sr.symbol}
+                            <span style={{ marginLeft: 4, fontWeight: 400, fontSize: 11 }}>({sr.score?.toFixed(2)})</span>
+                            {sr.cached && <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>cached</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
 
             <TelegramBotGuide />
 
@@ -3394,7 +3499,32 @@ function App() {
 
         {activeTab === 'wealth' && (
           <ErrorBoundary>
-            <WealthBuilderTab token={token} preferredMarket={preferredMarket} setActiveTab={setActiveTab} />
+            <WealthBuilderTab 
+              token={token} 
+              preferredMarket={preferredMarket} 
+              setActiveTab={setActiveTab}
+              topUniverse={topUniverse}
+              rankedItems={rankedItems}
+              rankLoading={rankLoading}
+              selectedSymbols={selectedSymbols}
+              setSelectedSymbols={setSelectedSymbols}
+              selectedCount={selectedCount}
+              trackSelected={trackSelected}
+              trackLoading={trackLoading}
+              addSingleShare={addSingleShare}
+              aiQuery={aiQuery}
+              setAiQuery={setAiQuery}
+              aiProvider={aiProvider}
+              setAiProvider={setAiProvider}
+              requestAiSuggestions={requestAiSuggestions}
+              aiLoading={aiLoading}
+              aiSuggestions={aiSuggestions}
+              aiProviderUsed={aiProviderUsed}
+              pillStyle={pillStyle}
+              EXCHANGE_LABELS={EXCHANGE_LABELS}
+              budgetInfo={budgetInfo}
+              fetchBudget={fetchBudget}
+            />
           </ErrorBoundary>
         )}
 

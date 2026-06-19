@@ -441,6 +441,16 @@ def init_db():
             conn.execute(text("ALTER TABLE portfolios ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'manual'"))
         except Exception:
             pass  # Column may already exist
+        # Migrate: add investment budget columns to users
+        for budget_sql in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_investment_budget REAL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS max_position_pct REAL DEFAULT 10",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS budget_currency TEXT DEFAULT 'AUD'",
+        ]:
+            try:
+                conn.execute(text(budget_sql))
+            except Exception:
+                pass
         for sql in [
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS peak_price REAL",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS stop_loss_price REAL",
@@ -458,6 +468,24 @@ def init_db():
                 conn.execute(text(sql))
             except Exception:
                 pass
+        # Create position_sentiment_log table for news-driven sell alerts
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS position_sentiment_log (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL DEFAULT 'AU',
+                sentiment TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0,
+                themes TEXT,
+                headline TEXT,
+                alert_sent INTEGER DEFAULT 0,
+                profit_at_risk REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sentiment_log_user_symbol ON position_sentiment_log(user_id, symbol, created_at DESC)"))
 
 init_db()
 
@@ -520,6 +548,12 @@ class AiBuildPortfolioRequest(BaseModel):
     num_stocks: int = 8
     sectors: List[str] = []
     total_investment: float = 10000.0  # Dollar amount to allocate across holdings
+
+
+class InvestmentBudgetRequest(BaseModel):
+    total_budget: float
+    max_position_pct: float = 10.0
+    currency: str = "AUD"
 
 
 class RegisterRequest(BaseModel):
@@ -798,6 +832,12 @@ ASX_COMPANIES = {
     "IVV": "iShares S&P 500 ETF",
     "IJR": "iShares S&P Small-Cap ETF",
     "NDQ": "BetaShares NASDAQ 100 ETF",
+    "PMGOLD": "Perth Mint Gold",
+    "HACK": "Betashares Global Cybersecurity ETF",
+    "ETHI": "Betashares Global Sustainability Leaders ETF",
+    "FAIR": "Betashares Australian Sustainability Leaders ETF",
+    "CURE": "Global X Healthcare ETF",
+    "TECH": "Global X Morningstar Global Technology ETF",
     "HACK": "BetaShares Global Cybersecurity ETF",
     "HNDQ": "BetaShares NASDAQ 100 (AUD Hedged) ETF",
     "DHHF": "BetaShares Diversified High Growth ETF",
@@ -1483,7 +1523,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     with engine.connect() as conn:
         user = conn.execute(
-            text("SELECT id, email, full_name, preferred_market FROM users WHERE id = :id"),
+            text("SELECT id, email, full_name, preferred_market, total_investment_budget, max_position_pct, budget_currency FROM users WHERE id = :id"),
             {"id": user_id},
         ).fetchone()
 
@@ -1495,6 +1535,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         "email": user[1],
         "full_name": user[2] or "",
         "preferred_market": user[3] or "AU",
+        "total_investment_budget": float(user[4] or 0),
+        "max_position_pct": float(user[5] or 10),
+        "budget_currency": user[6] or "AUD",
     }
 
 def get_historical_data(symbol: str, period: str = "1y", market: str = None) -> pd.DataFrame:
@@ -1960,6 +2003,7 @@ def _send_telegram_payload(
     digest_key: Optional[str] = None,
     source: str = "asx_backend",
     strategy_dashboard: Optional[dict] = None,
+    reply_markup: Optional[dict] = None,
 ) -> dict:
     """Send a preformatted HTML Telegram payload and persist per-recipient results."""
     telegram_html = _merge_summary_with_strategy(message_html or "", strategy_dashboard)
@@ -1997,9 +2041,12 @@ def _send_telegram_payload(
             status_value = "failed"
             sent_at = None
             try:
+                payload = {"chat_id": chat_id, "text": normalized_message, "parse_mode": "HTML"}
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
                 resp = requests.post(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": chat_id, "text": normalized_message, "parse_mode": "HTML"},
+                    json=payload,
                     timeout=8,
                 )
                 if resp.status_code == 200:
@@ -4435,6 +4482,508 @@ async def update_preferred_market(payload: dict, current_user: dict = Depends(ge
             {"market": market, "uid": current_user["id"]},
         )
     return {"preferred_market": market}
+
+
+# ── Investment Budget endpoints ──────────────────────────────────────────────
+
+# Hedge instrument universe — used by hedge suggestions
+HEDGE_INSTRUMENTS = {
+    "AU": {
+        "gold": [
+            {"symbol": "GOLD", "name": "ETFS Physical Gold", "type": "gold_etf"},
+            {"symbol": "QAU", "name": "BetaShares Gold Bullion", "type": "gold_etf"},
+            {"symbol": "PMGOLD", "name": "Perth Mint Gold", "type": "gold_etf"},
+        ],
+        "bonds": [
+            {"symbol": "IAF", "name": "iShares Core Composite Bond", "type": "bond_etf"},
+            {"symbol": "VBND", "name": "Vanguard Global Aggregate Bond", "type": "bond_etf"},
+            {"symbol": "BOND", "name": "PIMCO Australian Bond", "type": "bond_etf"},
+        ],
+        "cash": [
+            {"symbol": "AAA", "name": "BetaShares High Interest Cash", "type": "cash_etf"},
+            {"symbol": "BILL", "name": "iShares Core Cash", "type": "cash_etf"},
+        ],
+        "defensive": [
+            {"symbol": "VHY", "name": "Vanguard High Yield", "type": "defensive_etf"},
+            {"symbol": "HVST", "name": "BetaShares Diversified Markets", "type": "defensive_etf"},
+        ],
+    },
+    "US": {
+        "gold": [
+            {"symbol": "GLD", "name": "SPDR Gold Trust", "type": "gold_etf"},
+            {"symbol": "IAU", "name": "iShares Gold Trust", "type": "gold_etf"},
+            {"symbol": "SGOL", "name": "Aberdeen Physical Gold", "type": "gold_etf"},
+        ],
+        "bonds": [
+            {"symbol": "TLT", "name": "iShares 20+ Year Treasury", "type": "bond_etf"},
+            {"symbol": "AGG", "name": "iShares Core US Aggregate Bond", "type": "bond_etf"},
+            {"symbol": "BND", "name": "Vanguard Total Bond Market", "type": "bond_etf"},
+        ],
+        "inverse": [
+            {"symbol": "SH", "name": "ProShares Short S&P500", "type": "inverse_etf"},
+            {"symbol": "PSQ", "name": "ProShares Short QQQ", "type": "inverse_etf"},
+        ],
+        "cash": [
+            {"symbol": "SHV", "name": "iShares Short Treasury Bond", "type": "cash_etf"},
+        ],
+    },
+    "IN": {
+        "gold": [
+            {"symbol": "GOLDBEES", "name": "Nippon India Gold ETF", "type": "gold_etf"},
+        ],
+        "bonds": [
+            {"symbol": "LIQUIDBEES", "name": "Nippon Liquid ETF", "type": "bond_etf"},
+        ],
+    },
+}
+
+
+@app.get("/api/user/investment-budget")
+async def get_investment_budget(current_user: dict = Depends(get_current_user)):
+    """Get user's investment budget with deployed/remaining capital calculation."""
+    total_budget = float(current_user.get("total_investment_budget") or 0)
+    max_position_pct = float(current_user.get("max_position_pct") or 10)
+    currency = current_user.get("budget_currency") or "AUD"
+
+    holdings = get_user_execution_holdings(current_user["id"])
+    deployed_capital = sum(float(h.get("invested_amount") or 0) for h in holdings)
+    remaining_capital = max(total_budget - deployed_capital, 0.0)
+    max_per_position = total_budget * (max_position_pct / 100) if total_budget > 0 else 0.0
+
+    # Sector/symbol concentration
+    position_weights = []
+    for h in holdings:
+        weight_pct = (float(h.get("invested_amount") or 0) / total_budget * 100) if total_budget > 0 else 0.0
+        position_weights.append({
+            "symbol": h["symbol"],
+            "market": h.get("market", "AU"),
+            "invested": round(float(h.get("invested_amount") or 0), 2),
+            "weight_pct": round(weight_pct, 2),
+            "over_limit": weight_pct > max_position_pct,
+        })
+
+    over_limit_count = sum(1 for pw in position_weights if pw["over_limit"])
+
+    return {
+        "total_budget": round(total_budget, 2),
+        "deployed_capital": round(deployed_capital, 2),
+        "remaining_capital": round(remaining_capital, 2),
+        "utilization_pct": round((deployed_capital / total_budget * 100) if total_budget > 0 else 0, 2),
+        "max_position_pct": round(max_position_pct, 2),
+        "max_per_position": round(max_per_position, 2),
+        "currency": currency,
+        "positions_count": len(holdings),
+        "over_limit_count": over_limit_count,
+        "position_weights": position_weights,
+        "budget_set": total_budget > 0,
+    }
+
+
+@app.put("/api/user/investment-budget")
+async def update_investment_budget(payload: InvestmentBudgetRequest, current_user: dict = Depends(get_current_user)):
+    """Set or update user's investment budget."""
+    total_budget = max(float(payload.total_budget or 0), 0.0)
+    max_position_pct = max(min(float(payload.max_position_pct or 10), 100), 1)
+    currency = (payload.currency or "AUD").upper().strip()[:3]
+
+    with db_conn() as conn:
+        conn.execute(
+            text(
+                "UPDATE users SET total_investment_budget = :budget, max_position_pct = :max_pct, budget_currency = :currency WHERE id = :uid"
+            ),
+            {"budget": total_budget, "max_pct": max_position_pct, "currency": currency, "uid": current_user["id"]},
+        )
+
+    # Return the updated budget view
+    holdings = get_user_execution_holdings(current_user["id"])
+    deployed_capital = sum(float(h.get("invested_amount") or 0) for h in holdings)
+
+    return {
+        "ok": True,
+        "total_budget": round(total_budget, 2),
+        "deployed_capital": round(deployed_capital, 2),
+        "remaining_capital": round(max(total_budget - deployed_capital, 0.0), 2),
+        "max_position_pct": round(max_position_pct, 2),
+        "max_per_position": round(total_budget * max_position_pct / 100, 2),
+        "currency": currency,
+    }
+
+
+# ── Hedge Suggestions endpoint ──────────────────────────────────────────────
+
+def _calculate_sector_exposure(holdings: list[dict]) -> dict[str, float]:
+    """Calculate sector-level exposure from holdings (uses yfinance info)."""
+    sector_totals: dict[str, float] = {}
+    total_invested = sum(float(h.get("invested_amount") or 0) for h in holdings)
+    if total_invested <= 0:
+        return {}
+    for h in holdings:
+        invested = float(h.get("invested_amount") or 0)
+        sym = h["symbol"]
+        market = h.get("market", "AU")
+        try:
+            info = yf.Ticker(format_ticker(sym, market)).info
+            sector = info.get("sector") or "Unknown"
+        except Exception:
+            sector = "Unknown"
+        sector_totals[sector] = sector_totals.get(sector, 0) + invested
+    return {sector: round(amt / total_invested * 100, 2) for sector, amt in sector_totals.items()}
+
+
+@app.get("/api/positions/hedge-suggestions")
+async def portfolio_hedge_suggestions(current_user: dict = Depends(get_current_user)):
+    """Proactive hedge suggestions based on regime + user holdings."""
+    holdings = get_user_execution_holdings(current_user["id"])
+    if not holdings:
+        return {"suggestions": [], "regime": {}, "message": "No active positions to hedge."}
+
+    regime = compute_regime_snapshot()
+    market = current_user.get("preferred_market") or "AU"
+    total_invested = sum(float(h.get("invested_amount") or 0) for h in holdings)
+
+    suggestions = []
+
+    # 1. Regime-based suggestions
+    if regime.get("safe_haven_flag"):
+        hedge_instruments = HEDGE_INSTRUMENTS.get(market, HEDGE_INSTRUMENTS["AU"]).get("gold", [])
+        for inst in hedge_instruments[:2]:
+            suggestions.append({
+                "instrument": inst["symbol"],
+                "name": inst["name"],
+                "type": "safe_haven",
+                "category": "gold",
+                "reason": f"Equities declining ({regime.get('asx200_ret', 0):.1f}%) while gold rising ({regime.get('gold_ret', 0):.1f}%) — classic safe-haven rotation",
+                "suggested_allocation_pct": 10,
+                "suggested_amount": round(total_invested * 0.10, 2),
+                "urgency": "high",
+            })
+
+    if regime.get("usd_headwind_flag"):
+        suggestions.append({
+            "instrument": "CURRENCY_HEDGE",
+            "name": "Currency-hedged ETF or AUD cash",
+            "type": "currency_protection",
+            "category": "cash",
+            "reason": f"USD strengthening (DXY: {regime.get('dxy_ret', 0):.1f}%). Exporter-heavy positions at risk.",
+            "suggested_allocation_pct": 5,
+            "suggested_amount": round(total_invested * 0.05, 2),
+            "urgency": "medium",
+        })
+
+    if regime.get("regime") == "risk_off":
+        bond_instruments = HEDGE_INSTRUMENTS.get(market, HEDGE_INSTRUMENTS["AU"]).get("bonds", [])
+        for inst in bond_instruments[:1]:
+            suggestions.append({
+                "instrument": inst["symbol"],
+                "name": inst["name"],
+                "type": "risk_off_protection",
+                "category": "bonds",
+                "reason": "Market in risk-off mode. Bonds typically outperform during equity drawdowns.",
+                "suggested_allocation_pct": 15,
+                "suggested_amount": round(total_invested * 0.15, 2),
+                "urgency": "medium",
+            })
+
+    # 2. Sector concentration warnings
+    try:
+        sector_exposure = _calculate_sector_exposure(holdings)
+        for sector, weight in sector_exposure.items():
+            if weight > 40:
+                suggestions.append({
+                    "instrument": "DIVERSIFY",
+                    "name": f"Reduce {sector} concentration",
+                    "type": "concentration_warning",
+                    "category": "rebalance",
+                    "reason": f"{sector} sector is {weight:.1f}% of portfolio (>40%). Consider trimming or hedging with uncorrelated assets.",
+                    "suggested_allocation_pct": 0,
+                    "sector": sector,
+                    "sector_weight_pct": weight,
+                    "urgency": "medium",
+                })
+    except Exception:
+        pass
+
+    # 3. If no regime issues, suggest maintaining defensive buffer
+    if not suggestions:
+        cash_instruments = HEDGE_INSTRUMENTS.get(market, HEDGE_INSTRUMENTS["AU"]).get("cash", [])
+        if cash_instruments:
+            suggestions.append({
+                "instrument": cash_instruments[0]["symbol"],
+                "name": cash_instruments[0]["name"],
+                "type": "defensive_buffer",
+                "category": "cash",
+                "reason": "Market conditions normal. Maintain a 5-10% cash buffer for opportunistic rebalancing.",
+                "suggested_allocation_pct": 5,
+                "suggested_amount": round(total_invested * 0.05, 2),
+                "urgency": "low",
+            })
+
+    return {
+        "regime": {
+            "current": regime.get("regime"),
+            "confidence": regime.get("confidence"),
+            "safe_haven_flag": regime.get("safe_haven_flag"),
+            "usd_headwind_flag": regime.get("usd_headwind_flag"),
+            "divergence_flag": regime.get("divergence_flag"),
+            "equities_ret": regime.get("asx200_ret"),
+            "gold_ret": regime.get("gold_ret"),
+            "dxy_ret": regime.get("dxy_ret"),
+        },
+        "total_invested": round(total_invested, 2),
+        "positions_count": len(holdings),
+        "suggestions": suggestions,
+        "hedge_instruments": HEDGE_INSTRUMENTS.get(market, HEDGE_INSTRUMENTS["AU"]),
+        "market": market,
+    }
+
+
+# ── Position Sentiment Monitor endpoint ──────────────────────────────────────
+
+def _get_sentiment_for_position(symbol: str, market: str = "AU") -> dict:
+    """Lightweight sentiment check for position monitoring (cached-aware)."""
+    try:
+        ticker_str = format_ticker(symbol, market)
+        tk = yf.Ticker(ticker_str)
+        news_items = []
+        try:
+            for article in (tk.news or [])[:5]:
+                news_items.append({
+                    "title": article.get("title", ""),
+                    "publisher": article.get("publisher", ""),
+                    "link": article.get("link", ""),
+                    "type": article.get("type", ""),
+                })
+        except Exception:
+            pass
+
+        if not news_items:
+            return {"sentiment": "neutral", "score": 0.0, "themes": [], "news": [], "headline": ""}
+
+        # Use LLM for sentiment analysis (quick version)
+        headlines_text = "\n".join(f"- {n['title']}" for n in news_items if n.get("title"))
+        prompt = (
+            f"Analyse these recent news headlines for {symbol} and return ONLY a JSON object.\n\n"
+            f"Headlines:\n{headlines_text}\n\n"
+            f"Return: {{\"sentiment\": \"positive|neutral|negative\", \"score\": -1.0 to 1.0, "
+            f"\"themes\": [\"theme1\", \"theme2\"], \"summary\": \"one sentence\"}}"
+        )
+
+        raw = None
+        for provider in LLM_PROVIDER_ORDER:
+            try:
+                if provider == "local":
+                    r = requests.post(
+                        f"{LOCAL_LLM_URL}/chat/completions",
+                        json={"model": LOCAL_LLM_MODEL,
+                              "messages": [{"role": "system", "content": "Financial sentiment analyst. Return strict JSON only."},
+                                           {"role": "user", "content": prompt}],
+                              "max_tokens": 300, "temperature": 0.2},
+                        timeout=30,
+                    )
+                    if r.status_code == 200:
+                        raw = strip_think_tags(r.json()["choices"][0]["message"]["content"])
+                        break
+                elif provider == "openai" and openai_client:
+                    r = openai_client.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[{"role": "system", "content": "Financial sentiment analyst. Return strict JSON only."},
+                                   {"role": "user", "content": prompt}],
+                        max_tokens=300, temperature=0.2,
+                    )
+                    raw = r.choices[0].message.content
+                    break
+            except Exception:
+                continue
+
+        if raw:
+            try:
+                cleaned = extract_json_from_llm(raw) or raw
+                s = cleaned.find("{")
+                e = cleaned.rfind("}") + 1
+                parsed = json.loads(cleaned[s:e]) if s >= 0 else {}
+                return {
+                    "sentiment": parsed.get("sentiment", "neutral"),
+                    "score": float(parsed.get("score", 0)),
+                    "themes": parsed.get("themes", []),
+                    "summary": parsed.get("summary", ""),
+                    "news": news_items,
+                    "headline": news_items[0]["title"] if news_items else "",
+                }
+            except Exception:
+                pass
+
+        return {"sentiment": "neutral", "score": 0.0, "themes": [], "news": news_items, "headline": ""}
+    except Exception:
+        return {"sentiment": "neutral", "score": 0.0, "themes": [], "news": [], "headline": ""}
+
+
+def _calculate_profit_at_risk(symbol: str, market: str, holdings: list[dict], risk_pct: float = 5.0) -> dict:
+    """Calculate unrealized profit and what could be lost if stock drops by risk_pct%."""
+    for h in holdings:
+        if h["symbol"] == symbol:
+            qty = float(h.get("quantity") or 0)
+            avg_cost = float(h.get("avg_cost") or 0)
+            invested = float(h.get("invested_amount") or 0)
+            try:
+                sd = get_stock_data(symbol, market)
+                live_price = float(sd.get("current_price") or 0)
+            except Exception:
+                live_price = avg_cost
+
+            current_value = qty * live_price if live_price > 0 else invested
+            unrealized_profit = current_value - invested
+            unrealized_pct = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+            potential_loss = current_value * (risk_pct / 100)
+            profit_after_drop = unrealized_profit - potential_loss
+
+            return {
+                "symbol": symbol,
+                "quantity": round(qty, 6),
+                "avg_cost": round(avg_cost, 4),
+                "live_price": round(live_price, 4),
+                "invested": round(invested, 2),
+                "current_value": round(current_value, 2),
+                "unrealized_profit": round(unrealized_profit, 2),
+                "unrealized_pct": round(unrealized_pct, 2),
+                "potential_loss_at_risk_pct": round(potential_loss, 2),
+                "risk_pct": risk_pct,
+                "profit_after_drop": round(profit_after_drop, 2),
+                "would_be_negative": profit_after_drop < 0,
+            }
+    return {}
+
+
+@app.get("/api/positions/sentiment-scan")
+async def positions_sentiment_scan(current_user: dict = Depends(get_current_user)):
+    """Scan all held positions for news sentiment and generate sell alerts."""
+    holdings = get_user_execution_holdings(current_user["id"])
+    if not holdings:
+        return {"alerts": [], "scanned": 0, "message": "No active positions to scan."}
+
+    alerts = []
+    sentiment_results = []
+    now = datetime.utcnow()
+
+    for h in holdings:
+        sym = h["symbol"]
+        market = h.get("market", "AU")
+
+        # Check if we already scanned this symbol recently (within 4 hours)
+        try:
+            with engine.connect() as conn:
+                recent = conn.execute(
+                    text(
+                        "SELECT sentiment, score, created_at FROM position_sentiment_log "
+                        "WHERE user_id = :uid AND symbol = :sym "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"uid": current_user["id"], "sym": sym},
+                ).fetchone()
+                if recent and recent[2]:
+                    hours_ago = (now - recent[2]).total_seconds() / 3600
+                    if hours_ago < 4:
+                        # Use cached sentiment
+                        sentiment_results.append({
+                            "symbol": sym,
+                            "sentiment": recent[0],
+                            "score": float(recent[1] or 0),
+                            "cached": True,
+                        })
+                        if recent[0] == "negative" and float(recent[1] or 0) < -0.3:
+                            par = _calculate_profit_at_risk(sym, market, holdings)
+                            alerts.append({
+                                "type": "negative_news",
+                                "symbol": sym,
+                                "market": market,
+                                "action": "REVIEW_SELL",
+                                "urgency": "high",
+                                "sentiment_score": float(recent[1] or 0),
+                                "reason": f"Recent negative sentiment (score: {float(recent[1] or 0):.2f})",
+                                "profit_at_risk": par,
+                                "cached": True,
+                            })
+                        continue
+        except Exception:
+            pass
+
+        # Run fresh sentiment scan
+        sentiment = _get_sentiment_for_position(sym, market)
+        sentiment_results.append({
+            "symbol": sym,
+            "sentiment": sentiment["sentiment"],
+            "score": sentiment["score"],
+            "themes": sentiment.get("themes", []),
+            "headline": sentiment.get("headline", ""),
+            "news_count": len(sentiment.get("news", [])),
+            "cached": False,
+        })
+
+        # Log to position_sentiment_log
+        try:
+            with db_conn() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO position_sentiment_log (id, user_id, symbol, market, sentiment, score, themes, headline, created_at) "
+                        "VALUES (:id, :uid, :sym, :market, :sentiment, :score, :themes, :headline, :created_at)"
+                    ),
+                    {
+                        "id": str(uuid4()),
+                        "uid": current_user["id"],
+                        "sym": sym,
+                        "market": market,
+                        "sentiment": sentiment["sentiment"],
+                        "score": sentiment["score"],
+                        "themes": json.dumps(sentiment.get("themes", [])),
+                        "headline": sentiment.get("headline", ""),
+                        "created_at": now,
+                    },
+                )
+        except Exception:
+            pass
+
+        # Generate alert if sentiment is negative
+        if sentiment["sentiment"] == "negative" and sentiment["score"] < -0.3:
+            par = _calculate_profit_at_risk(sym, market, holdings)
+            alerts.append({
+                "type": "negative_news",
+                "symbol": sym,
+                "market": market,
+                "action": "REVIEW_SELL",
+                "urgency": "high",
+                "sentiment_score": sentiment["score"],
+                "themes": sentiment.get("themes", []),
+                "headline": sentiment.get("headline", ""),
+                "summary": sentiment.get("summary", ""),
+                "reason": f"Negative news detected (score: {sentiment['score']:.2f}). {sentiment.get('summary', '')}",
+                "profit_at_risk": par,
+                "cached": False,
+            })
+        elif sentiment["sentiment"] == "negative":
+            alerts.append({
+                "type": "mild_negative",
+                "symbol": sym,
+                "market": market,
+                "action": "MONITOR",
+                "urgency": "medium",
+                "sentiment_score": sentiment["score"],
+                "themes": sentiment.get("themes", []),
+                "headline": sentiment.get("headline", ""),
+                "reason": f"Mildly negative sentiment (score: {sentiment['score']:.2f}). Monitor closely.",
+                "cached": False,
+            })
+
+    high_urgency = [a for a in alerts if a.get("urgency") == "high"]
+    medium_urgency = [a for a in alerts if a.get("urgency") == "medium"]
+
+    return {
+        "scanned": len(sentiment_results),
+        "alerts": alerts,
+        "sentiment_results": sentiment_results,
+        "high_urgency_count": len(high_urgency),
+        "medium_urgency_count": len(medium_urgency),
+        "summary": f"{len(high_urgency)} positions need urgent review" if high_urgency else "All positions sentiment normal.",
+        "scanned_at": now.isoformat(),
+    }
 
 
 @app.get("/api/shares")
@@ -7085,6 +7634,8 @@ class AdviceActionCreate(BaseModel):
     advice_cache_key: Optional[str] = None
     source_message_type: Optional[str] = "hedge_advice"
     notes: Optional[str] = None
+    send_telegram: bool = False
+    analyst_target: Optional[float] = None
 
 
 class TelegramActionIngest(BaseModel):
@@ -7318,6 +7869,199 @@ async def position_history(current_user: dict = Depends(get_current_user)):
     return {"items": list_position_events(current_user["id"])}
 
 
+@app.get("/api/positions/wealth-summary")
+async def positions_wealth_summary(current_user: dict = Depends(get_current_user)):
+    holdings = get_user_execution_holdings(current_user["id"])
+    if not holdings:
+        return {
+            "total_invested": 0.0,
+            "current_value": 0.0,
+            "total_pnl": 0.0,
+            "total_pnl_pct": 0.0,
+            "daily_change": 0.0,
+            "positions": [],
+        }
+
+    total_invested = 0.0
+    current_value = 0.0
+    daily_change_total = 0.0
+    positions = []
+
+    for h in holdings:
+        sym = h["symbol"]
+        market = h.get("market", "AU")
+        qty = h["quantity"]
+        avg_cost = h["avg_cost"]
+        invested = h["invested_amount"]
+
+        try:
+            sd = get_stock_data(sym, market)
+            live_price = sd.get("current_price", 0) or 0
+            day_chg_pct = sd.get("change_percent", 0) or 0
+        except Exception:
+            live_price = avg_cost
+            day_chg_pct = 0.0
+
+        pos_value = qty * live_price if live_price > 0 else invested
+        pos_pnl = pos_value - invested
+        pos_pnl_pct = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0.0
+
+        total_invested += invested
+        current_value += pos_value
+        daily_change_total += pos_value * (day_chg_pct / 100) if day_chg_pct != 0 else 0.0
+
+        positions.append({
+            "symbol": sym,
+            "market": market,
+            "quantity": round(qty, 6),
+            "avg_cost": round(avg_cost, 4),
+            "live_price": round(live_price, 4),
+            "invested_amount": round(invested, 2),
+            "current_value": round(pos_value, 2),
+            "pnl": round(pos_pnl, 2),
+            "pnl_pct": round(pos_pnl_pct, 2),
+            "day_change_pct": round(day_chg_pct, 2),
+        })
+
+    total_pnl = current_value - total_invested
+    total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0.0
+
+    return {
+        "total_invested": round(total_invested, 2),
+        "current_value": round(current_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl_pct, 2),
+        "daily_change": round(daily_change_total, 2),
+        "positions": positions,
+    }
+
+
+@app.get("/api/positions/monitor-check")
+async def positions_monitor_check(current_user: dict = Depends(get_current_user)):
+    holdings = get_user_execution_holdings(current_user["id"])
+    if not holdings:
+        return {"alerts": [], "summary": "No active positions to monitor."}
+
+    alerts = []
+    now = datetime.utcnow()
+
+    for h in holdings:
+        sym = h["symbol"]
+        market = h.get("market", "AU")
+        qty = h["quantity"]
+        avg_cost = h["avg_cost"]
+        invested = h["invested_amount"]
+
+        try:
+            sd = get_stock_data(sym, market)
+            live_price = sd.get("current_price", 0) or 0
+        except Exception:
+            continue
+
+        if live_price <= 0:
+            continue
+
+        pnl_pct = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0.0
+        try:
+            hist = get_historical_data(sym, period="6mo")
+            if hist is not None and len(hist) >= 50:
+                indicators = calculate_technical_indicators(hist)
+                rsi = indicators.get("rsi")
+            else:
+                rsi = None
+        except Exception:
+            rsi = None
+
+        try:
+            val = get_valuation_metrics(sym)
+            target_mean = val.get("analyst_target_mean")
+            days_to_e = val.get("days_to_earnings")
+        except Exception:
+            target_mean = None
+            days_to_e = None
+
+        last_action_at = h.get("last_action_at")
+        days_held = None
+        if last_action_at:
+            try:
+                entry_date = datetime.fromisoformat(last_action_at.replace("Z", "+00:00"))
+                days_held = (now.replace(tzinfo=None) - entry_date.replace(tzinfo=None)).days
+            except Exception:
+                days_held = None
+
+        alerts_for_symbol = []
+
+        if pnl_pct <= -8:
+            alerts_for_symbol.append({
+                "type": "stop_loss",
+                "symbol": sym,
+                "action": "SELL",
+                "reason": f"Down {abs(pnl_pct):.1f}% from entry — stop loss zone",
+                "urgency": "high",
+                "pnl_pct": round(pnl_pct, 2),
+                "live_price": round(live_price, 2),
+                "entry_price": round(avg_cost, 2),
+            })
+        elif target_mean and live_price >= float(target_mean):
+            alerts_for_symbol.append({
+                "type": "profit_target",
+                "symbol": sym,
+                "action": "SELL",
+                "reason": f"Price ${live_price:.2f} reached analyst target ${float(target_mean):.2f}",
+                "urgency": "high",
+                "pnl_pct": round(pnl_pct, 2),
+                "live_price": round(live_price, 2),
+                "entry_price": round(avg_cost, 2),
+                "target_price": round(float(target_mean), 2),
+            })
+        elif rsi is not None and rsi > 75:
+            alerts_for_symbol.append({
+                "type": "overbought",
+                "symbol": sym,
+                "action": "REVIEW",
+                "reason": f"RSI at {rsi:.1f} — overbought territory",
+                "urgency": "medium",
+                "rsi": round(rsi, 1),
+                "live_price": round(live_price, 2),
+                "pnl_pct": round(pnl_pct, 2),
+            })
+        elif days_held is not None and days_held > 90:
+            alerts_for_symbol.append({
+                "type": "review_prompt",
+                "symbol": sym,
+                "action": "REVIEW",
+                "reason": f"Held {days_held} days without signal — time to review",
+                "urgency": "low",
+                "days_held": days_held,
+                "pnl_pct": round(pnl_pct, 2),
+            })
+
+        if not alerts_for_symbol:
+            alerts_for_symbol.append({
+                "type": "ok",
+                "symbol": sym,
+                "action": "HOLD",
+                "reason": "Within normal range",
+                "urgency": "none",
+                "pnl_pct": round(pnl_pct, 2),
+                "live_price": round(live_price, 2),
+                "entry_price": round(avg_cost, 2),
+            })
+
+        alerts.extend(alerts_for_symbol)
+
+    high_urgency = [a for a in alerts if a.get("urgency") == "high"]
+    medium_urgency = [a for a in alerts if a.get("urgency") == "medium"]
+    summary = "All positions normal." if not high_urgency else f"{len(high_urgency)} positions need attention"
+
+    return {
+        "alerts": alerts,
+        "summary": summary,
+        "high_urgency_count": len(high_urgency),
+        "medium_urgency_count": len(medium_urgency),
+    }
+
+
 @app.get("/api/advice/actions")
 async def advice_actions(current_user: dict = Depends(get_current_user)):
     items = list_advice_execution_actions(current_user["id"], limit=100)
@@ -7335,6 +8079,7 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
     action_type = str(payload.action_type or "BUY").upper().strip()
     quantity = float(payload.quantity or 0)
     execution_price = float(payload.execution_price or 0)
+    analyst_target = float(payload.analyst_target or 0)
 
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
@@ -7358,9 +8103,37 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
         notes=payload.notes,
     )
 
+    telegram_delivery = None
+    if payload.send_telegram and action_type in {"BUY", "ADD", "SELL", "REDUCE"}:
+        recipients = get_user_telegram_recipients(current_user["id"])
+        if recipients:
+            gross_amount = quantity * execution_price
+            stop_loss_price = round(execution_price * 0.92, 2)
+            target_pct = round(((analyst_target - execution_price) / execution_price) * 100, 2) if analyst_target and execution_price > 0 else None
+            target_str = f"${analyst_target:.2f} ({target_pct:+.1f}%)" if analyst_target and target_pct else "N/A"
+
+            buy_msg = (
+                f"<b>✅ {'BUY' if action_type in ('BUY', 'ADD') else action_type} RECORDED — {symbol}.{market}</b>\n"
+                f"Shares: {quantity} @ ${execution_price:.2f}\n"
+                f"Total invested: ${gross_amount:,.2f}\n"
+                f"Stop loss target: ~${stop_loss_price:.2f} (-8%)\n"
+                f"Analyst target: {target_str}\n"
+                f"Monitoring active \U0001f4e1 — you'll be notified when conditions change."
+            )
+            telegram_delivery = _send_telegram_payload(
+                buy_msg,
+                recipients,
+                user_id=current_user["id"],
+                message_type="buy_confirmation",
+                market=market,
+                delivery_mode="manual",
+                source="buy_flow",
+            )
+
     return {
         "ok": True,
         **result,
+        "telegram": telegram_delivery,
     }
 
 
@@ -7383,8 +8156,14 @@ async def telegram_action_ingest(payload: TelegramActionIngest, request: Request
         raise HTTPException(status_code=400, detail="symbol is required")
     if action_type not in {"BUY", "ADD", "SELL", "REDUCE", "HOLD"}:
         raise HTTPException(status_code=400, detail="action_type must be BUY, ADD, SELL, REDUCE, or HOLD")
-    if quantity <= 0 or execution_price <= 0:
-        raise HTTPException(status_code=400, detail="quantity and execution_price must be greater than zero")
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be greater than zero")
+
+    if execution_price <= 0:
+        stock_data = get_stock_data(symbol, market)
+        execution_price = float(stock_data.get("current_price") or 0)
+        if execution_price <= 0:
+            raise HTTPException(status_code=400, detail=f"execution_price not provided and unable to fetch market price for {symbol}")
 
     resolved_user_id, ambiguous_chat_mapping = _resolve_user_for_chat(chat_id)
     if resolved_user_id is None:
@@ -7773,8 +8552,56 @@ def _scheduled_broad_scan_precompute():
     except Exception as e:
         print(f"[BroadScan] DB write failed: {e}")
 
+    # --- Auto-send Telegram Alerts for High Conviction Signals ---
+    try:
+        high_conviction = []
+        for c in candidates:
+            score = c.get("score") or 0
+            prob = c.get("prob_ge_5pct") or 0
+            zone = (c.get("entry_timing") or {}).get("entry_zone", "caution")
+            if score >= 0.65 and prob >= 65.0 and zone == "clear":
+                high_conviction.append(c)
+
+        if high_conviction:
+            today_key = datetime.utcnow().date().isoformat()
+            with db_conn() as conn:
+                users = conn.execute(text("SELECT id FROM users")).fetchall()
+            for user in users:
+                uid = user[0]
+                recipients = get_user_telegram_recipients(uid)
+                if not recipients:
+                    continue
+                for hc in high_conviction:
+                    digest_key = f"auto_alert_{hc['symbol']}_{today_key}"
+                    if not has_digest_been_sent(uid, "AU", digest_key):
+                        msg = _build_wealth_signal_message(
+                            hc["symbol"], hc.get("name", ""), hc, 
+                            hc.get("valuation", {}), hc.get("prediction", {}), 
+                            hc.get("entry_timing", {})
+                        )
+                        price = hc.get("current_price", 1)
+                        qty = int(2500 / price) if price > 0 else 1
+                        kb = {
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": f"🚀 1-Click Buy: {qty} shares (~$2500)",
+                                        "callback_data": f"buy_{hc['symbol']}_{qty}"
+                                    }
+                                ]
+                            ]
+                        }
+                        _send_telegram_payload(
+                            msg, recipients, user_id=uid, message_type="daily_digest", 
+                            market="AU", digest_key=digest_key, source="broad_scan_auto",
+                            reply_markup=kb
+                        )
+                        _sleep_time.sleep(1)  # Avoid hitting Telegram rate limits
+    except Exception as e:
+        print(f"[BroadScan] Auto-alerting failed: {e}")
+
     duration = (datetime.utcnow() - start).total_seconds()
-    print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s")
+    print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s. Sent auto-alerts if any.")
 
 
 def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
@@ -8549,6 +9376,153 @@ def _scheduled_wealth_builder_evaluate():
     except Exception:
         pass
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTONOMOUS POSITIONS MONITOR — runs every 2 hours during market hours
+# ─────────────────────────────────────────────────────────────────────────────
+def _scheduled_positions_monitor():
+    try:
+        from datetime import time as _dt_time
+        melbourne_tz = _get_scheduler_timezone()
+        now_mel = datetime.now(melbourne_tz)
+        if now_mel.weekday() >= 5:
+            return
+        market_open = _dt_time(10, 0)
+        market_close = _dt_time(16, 0)
+        current_time = now_mel.time()
+        if current_time < market_open or current_time > market_close:
+            return
+
+        with db_conn() as conn:
+            users_rows = conn.execute(text(
+                "SELECT DISTINCT user_id FROM advice_execution_actions"
+            )).fetchall()
+
+        for row in users_rows:
+            user_id = row[0]
+            holdings = get_user_execution_holdings(user_id)
+            if not holdings:
+                continue
+
+            recipients = get_user_telegram_recipients(user_id)
+            if not recipients:
+                continue
+
+            for h in holdings:
+                sym = h["symbol"]
+                market = h.get("market", "AU")
+                avg_cost = h["avg_cost"]
+                invested = h["invested_amount"]
+
+                try:
+                    sd = get_stock_data(sym, market)
+                    live_price = sd.get("current_price", 0) or 0
+                except Exception:
+                    continue
+
+                if live_price <= 0:
+                    continue
+
+                pnl_pct = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0.0
+
+                try:
+                    hist = get_historical_data(sym, period="6mo")
+                    if hist is not None and len(hist) >= 50:
+                        indicators = calculate_technical_indicators(hist)
+                        rsi = indicators.get("rsi")
+                    else:
+                        rsi = None
+                except Exception:
+                    rsi = None
+
+                try:
+                    val = get_valuation_metrics(sym)
+                    target_mean = val.get("analyst_target_mean")
+                    days_to_e = val.get("days_to_earnings")
+                except Exception:
+                    target_mean = None
+                    days_to_e = None
+
+                alert = None
+                alert_type = None
+
+                if pnl_pct <= -8:
+                    alert_type = "stop_loss"
+                    alert = (
+                        f"<b>🔴 STOP LOSS WARNING — {sym}.{market}</b>\n\n"
+                        f"Your entry: ${avg_cost:.2f} | Current: ${live_price:.2f}\n"
+                        f"P&amp;L: -${abs(invested * abs(pnl_pct) / 100):,.2f} ({pnl_pct:+.1f}%)\n"
+                        f"⚠️ Down more than 8% from entry\n\n"
+                        f"📊 <b>Action recommended:</b> Review immediately. Consider cutting losses or hedging.\n"
+                        f"Stop loss reference: ~${round(avg_cost * 0.92, 2)}"
+                    )
+                elif target_mean and live_price >= float(target_mean):
+                    alert_type = "profit_target"
+                    upside = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+                    target_float = float(target_mean)
+                    alert = (
+                        f"<b>🟢 PROFIT TARGET REACHED — {sym}.{market}</b>\n\n"
+                        f"Your entry: ${avg_cost:.2f} | Current: ${live_price:.2f}\n"
+                        f"P&amp;L: +${round(abs(invested * upside / 100), 2):,.2f} ({upside:+.1f}%)\n"
+                        f"Analyst target: ${target_float:.2f}\n"
+                        + (f"RSI: {rsi:.0f}" if rsi is not None else "")
+                        + f"\n\n📊 <b>Action recommended:</b> Consider taking profit.\n"
+                        f"Reply <code>SELL {sym} [qty] [price]</code> to record your sell."
+                    )
+                elif rsi is not None and rsi > 75:
+                    alert_type = "overbought"
+                    alert = (
+                        f"<b>🟡 OVERBOUGHT — {sym}.{market}</b>\n\n"
+                        f"RSI: {rsi:.1f} — overbought territory\n"
+                        f"Current price: ${live_price:.2f} | Entry: ${avg_cost:.2f}\n"
+                        f"P&amp;L: {pnl_pct:+.1f}%\n\n"
+                        f"📊 <b>Action recommended:</b> Monitor closely. Consider trailing stop."
+                    )
+                elif pnl_pct <= -2:
+                    alert_type = "daily_drop"
+                    alert = (
+                        f"<b>📉 PORTFOLIO DIP — {sym}.{market}</b>\n\n"
+                        f"Down {abs(pnl_pct):.1f}% today\n"
+                        f"Current: ${live_price:.2f} | Entry: ${avg_cost:.2f}\n\n"
+                        f"📊 <b>Note:</b> If broader market is also down, this may be normal."
+                    )
+
+                if alert and alert_type:
+                    last_key = f"pos_{sym}_{alert_type}"
+                    try:
+                        with db_conn() as check_conn:
+                            existing = check_conn.execute(text(
+                                "SELECT 1 FROM telegram_send_log "
+                                "WHERE user_id = :uid AND message_type = 'position_alert' "
+                                "AND payload_preview LIKE :pat "
+                                "AND created_at > :since "
+                                "LIMIT 1"
+                            ), {
+                                "uid": user_id,
+                                "pat": f"%{alert_type}%{sym}%",
+                                "since": datetime.utcnow() - timedelta(hours=4),
+                            }).fetchone()
+                            if existing:
+                                continue
+                    except Exception:
+                        pass
+
+                    _send_telegram_payload(
+                        alert,
+                        recipients,
+                        user_id=user_id,
+                        message_type="position_alert",
+                        market=market,
+                        delivery_mode="auto",
+                        source="auto_positions_monitor",
+                    )
+                    log_position_event("auto", user_id, alert_type,
+                                       alert.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")[:300],
+                                       {"symbol": sym, "live_price": live_price, "pnl_pct": round(pnl_pct, 2)})
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
 @app.get("/api/weekly/backtest")
 async def weekly_backtest(market: str = "AU", weeks: int = 8, current_user: dict = Depends(get_current_user)):
     """Enhanced backtest: past weekly picks vs ASX200 benchmark.
@@ -8974,6 +9948,12 @@ if SCHEDULER_AVAILABLE:
         scheduler.add_job(
             _scheduled_paper_trade_monitor, "cron",
             minute="0,15,30,45"
+        )
+        scheduler.add_job(
+            _scheduled_positions_monitor, "cron",
+            minute="0", hour="10-15", day_of_week="mon-fri",
+            id="positions_monitor_2h",
+            max_instances=1,
         )
         scheduler.add_job(
             _scheduled_broad_scan_precompute, "cron",

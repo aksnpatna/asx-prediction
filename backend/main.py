@@ -4853,6 +4853,67 @@ def _calculate_profit_at_risk(symbol: str, market: str, holdings: list[dict], ri
     return {}
 
 
+def _check_and_cache_sentiment(user_id: str, sym: str, market: str, now: datetime) -> dict:
+    """Check cache for recent sentiment or fetch new and cache it."""
+    try:
+        with engine.connect() as conn:
+            recent = conn.execute(
+                text(
+                    "SELECT sentiment, score, themes, headline, created_at FROM position_sentiment_log "
+                    "WHERE user_id = :uid AND symbol = :sym "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"uid": user_id, "sym": sym},
+            ).fetchone()
+            if recent and recent[4]:
+                hours_ago = (now - recent[4]).total_seconds() / 3600
+                if hours_ago < 4:
+                    return {
+                        "sentiment": recent[0],
+                        "score": float(recent[1] or 0),
+                        "themes": json.loads(recent[2]) if recent[2] else [],
+                        "headline": recent[3] or "",
+                        "cached": True
+                    }
+    except Exception:
+        pass
+
+    # Run fresh sentiment scan
+    sentiment = _get_sentiment_for_position(sym, market)
+    res = {
+        "sentiment": sentiment["sentiment"],
+        "score": sentiment["score"],
+        "themes": sentiment.get("themes", []),
+        "headline": sentiment.get("headline", ""),
+        "summary": sentiment.get("summary", ""),
+        "cached": False,
+    }
+
+    # Log to position_sentiment_log
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO position_sentiment_log (id, user_id, symbol, market, sentiment, score, themes, headline, created_at) "
+                    "VALUES (:id, :uid, :sym, :market, :sentiment, :score, :themes, :headline, :created_at)"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "uid": user_id,
+                    "sym": sym,
+                    "market": market,
+                    "sentiment": res["sentiment"],
+                    "score": res["score"],
+                    "themes": json.dumps(res["themes"]),
+                    "headline": res["headline"],
+                    "created_at": now,
+                },
+            )
+    except Exception:
+        pass
+    return res
+
+
 @app.get("/api/positions/sentiment-scan")
 async def positions_sentiment_scan(current_user: dict = Depends(get_current_user)):
     """Scan all held positions for news sentiment and generate sell alerts."""
@@ -4868,78 +4929,16 @@ async def positions_sentiment_scan(current_user: dict = Depends(get_current_user
         sym = h["symbol"]
         market = h.get("market", "AU")
 
-        # Check if we already scanned this symbol recently (within 4 hours)
-        try:
-            with engine.connect() as conn:
-                recent = conn.execute(
-                    text(
-                        "SELECT sentiment, score, created_at FROM position_sentiment_log "
-                        "WHERE user_id = :uid AND symbol = :sym "
-                        "ORDER BY created_at DESC LIMIT 1"
-                    ),
-                    {"uid": current_user["id"], "sym": sym},
-                ).fetchone()
-                if recent and recent[2]:
-                    hours_ago = (now - recent[2]).total_seconds() / 3600
-                    if hours_ago < 4:
-                        # Use cached sentiment
-                        sentiment_results.append({
-                            "symbol": sym,
-                            "sentiment": recent[0],
-                            "score": float(recent[1] or 0),
-                            "cached": True,
-                        })
-                        if recent[0] == "negative" and float(recent[1] or 0) < -0.3:
-                            par = _calculate_profit_at_risk(sym, market, holdings)
-                            alerts.append({
-                                "type": "negative_news",
-                                "symbol": sym,
-                                "market": market,
-                                "action": "REVIEW_SELL",
-                                "urgency": "high",
-                                "sentiment_score": float(recent[1] or 0),
-                                "reason": f"Recent negative sentiment (score: {float(recent[1] or 0):.2f})",
-                                "profit_at_risk": par,
-                                "cached": True,
-                            })
-                        continue
-        except Exception:
-            pass
-
-        # Run fresh sentiment scan
-        sentiment = _get_sentiment_for_position(sym, market)
+        sentiment = _check_and_cache_sentiment(current_user["id"], sym, market, now)
+        
         sentiment_results.append({
             "symbol": sym,
             "sentiment": sentiment["sentiment"],
             "score": sentiment["score"],
             "themes": sentiment.get("themes", []),
             "headline": sentiment.get("headline", ""),
-            "news_count": len(sentiment.get("news", [])),
-            "cached": False,
+            "cached": sentiment.get("cached", False),
         })
-
-        # Log to position_sentiment_log
-        try:
-            with db_conn() as conn:
-                conn.execute(
-                    text(
-                        "INSERT INTO position_sentiment_log (id, user_id, symbol, market, sentiment, score, themes, headline, created_at) "
-                        "VALUES (:id, :uid, :sym, :market, :sentiment, :score, :themes, :headline, :created_at)"
-                    ),
-                    {
-                        "id": str(uuid4()),
-                        "uid": current_user["id"],
-                        "sym": sym,
-                        "market": market,
-                        "sentiment": sentiment["sentiment"],
-                        "score": sentiment["score"],
-                        "themes": json.dumps(sentiment.get("themes", [])),
-                        "headline": sentiment.get("headline", ""),
-                        "created_at": now,
-                    },
-                )
-        except Exception:
-            pass
 
         # Generate alert if sentiment is negative
         if sentiment["sentiment"] == "negative" and sentiment["score"] < -0.3:
@@ -9485,6 +9484,21 @@ def _scheduled_positions_monitor():
                         f"Current: ${live_price:.2f} | Entry: ${avg_cost:.2f}\n\n"
                         f"📊 <b>Note:</b> If broader market is also down, this may be normal."
                     )
+                else:
+                    # Check sentiment if no other urgent alerts
+                    sentiment = _check_and_cache_sentiment(user_id, sym, market, datetime.utcnow())
+                    if sentiment.get("sentiment") == "negative" and sentiment.get("score", 0) < -0.3:
+                        par = _calculate_profit_at_risk(sym, market, holdings)
+                        alert_type = "negative_news"
+                        alert = (
+                            f"<b>⚠️ NEGATIVE NEWS — {sym}.{market}</b>\n\n"
+                            f"<i>\"{sentiment.get('headline', '')}\"</i>\n"
+                            f"Score: {sentiment.get('score', 0):.2f}\n\n"
+                            f"P&amp;L: {pnl_pct:+.1f}%\n"
+                        )
+                        if par and par.get("potential_loss_at_risk_pct"):
+                            alert += f"Risk if drops 5%: -${par['potential_loss_at_risk_pct']:.2f}\n"
+                        alert += f"\n📊 <b>Action recommended:</b> Review position immediately."
 
                 if alert and alert_type:
                     last_key = f"pos_{sym}_{alert_type}"

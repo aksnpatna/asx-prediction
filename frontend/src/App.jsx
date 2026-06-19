@@ -997,7 +997,6 @@ function App() {
   const [hedgeSuggestions, setHedgeSuggestions] = useState(null)
   const [hedgeLoading, setHedgeLoading] = useState(false)
   const [sentimentScan, setSentimentScan] = useState(null)
-  const [sentimentLoading, setSentimentLoading] = useState(false)
 
   const authHeaders = () => ({ headers: { Authorization: `Bearer ${token}` } })
   const selectedCount = useMemo(() => Object.values(selectedSymbols).filter(Boolean).length, [selectedSymbols])
@@ -2773,12 +2772,13 @@ function App() {
                   {paperTrades.length > 0 ? (
                     <div className="table-wrap">
                       <table className="data-table">
-                        <thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Current</th><th>Net P&amp;L</th><th>Stage</th><th>Stop</th><th>Target</th><th>Trail %</th><th>Status</th><th></th></tr></thead>
+                        <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th><th>Net P&amp;L</th><th>Stage</th><th>Stop</th><th>Target</th><th>Trail %</th><th>Status</th><th></th></tr></thead>
                         <tbody>
                           {paperTrades.map(trade => (
                             <tr key={trade.id}>
                               <td><strong>{trade.symbol}</strong></td>
                               <td>{trade.side}</td>
+                              <td>{trade.quantity}</td>
                               <td>{trade.entry_price?.toFixed(2)}</td>
                               <td>{trade.current_price?.toFixed(2)}</td>
                               <td style={{ color: trade.unrealized_pnl_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }} title={`Net Value: $${trade.unrealized_pnl_value?.toFixed(2)} (Assumes $${trade.brokerage_fees} CommSec fees)`}>

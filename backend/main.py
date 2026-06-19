@@ -1590,6 +1590,33 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     # Price momentum
     indicators['momentum_20'] = float((df['Close'].iloc[-1] - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100)
     
+    # HACOLT (Heikin Ashi Candles Oscillator Long Term)
+    try:
+        ha_close = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
+        ha_open = (df['Open'].shift(1) + df['Close'].shift(1)) / 2
+        ha_high = df[['High', 'Open', 'Close']].max(axis=1)
+        ha_low = df[['Low', 'Open', 'Close']].min(axis=1)
+        mhac = (ha_open + ha_high + ha_low + ha_close) / 4
+        
+        # 55-period TEMA of MHAC
+        ema1 = mhac.ewm(span=55, adjust=False).mean()
+        ema2 = ema1.ewm(span=55, adjust=False).mean()
+        ema3 = ema2.ewm(span=55, adjust=False).mean()
+        tema_mhac = 3 * ema1 - 3 * ema2 + ema3
+        
+        tema_diff = tema_mhac.diff().iloc[-1]
+        last_ha_close = ha_close.iloc[-1]
+        last_ha_open = ha_open.iloc[-1]
+        
+        if tema_diff > 0 and last_ha_close > last_ha_open:
+            indicators['hacolt'] = 100.0  # Strong Buy / Uptrend
+        elif tema_diff < 0 and last_ha_close < last_ha_open:
+            indicators['hacolt'] = 0.0    # Strong Sell / Downtrend
+        else:
+            indicators['hacolt'] = 50.0   # Neutral / Choppy
+    except Exception:
+        indicators['hacolt'] = 50.0
+        
     return indicators
 
 
@@ -3813,6 +3840,7 @@ Technical Indicators:
 - SMA 50: ${indicators.get('sma_50', 0):.2f}
 - SMA 200: ${indicators.get('sma_200', 0):.2f}
 - RSI (14): {indicators.get('rsi', 0):.1f}
+- HACOLT Trend: {indicators.get('hacolt', 50):.1f} (0=Sell, 50=Neutral, 100=Buy)
 - MACD: {indicators.get('macd', 0):.2f}
 - Volatility (annualized): {indicators.get('volatility', 0)*100:.1f}%
 - 20-day Momentum: {indicators.get('momentum_20', 0):.1f}%

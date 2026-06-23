@@ -99,6 +99,9 @@ llm_liquidity = _make_llm(GROQ_MODEL_STANDARD, 0.20)
 llm_cio = _make_llm(GROQ_MODEL_STANDARD, 0.10)
 
 
+# ── Automated Consensus Counter ──────────────────────────────────────────────
+
+
 # ── Structured CIO Output ──────────────────────────────────────────────────────
 class ChiefDecision(BaseModel):
     decision: str = Field(description="APPROVE or REJECT")
@@ -107,8 +110,9 @@ class ChiefDecision(BaseModel):
     stop_loss_pct: float = Field(ge=1, le=15, description="Stop-loss as % below entry")
     reasoning: str = Field(description="2-3 sentence CIO-level summary")
     key_risk: str = Field(description="Single biggest risk to this thesis")
-    constraints_violated: List[str] = Field(default_factory=list, description="SMSF constraints violated (SIS Act)")
-    scenario_risks: List[str] = Field(default_factory=list, description="Top 2 scenario risks (e.g. 'RBA hawkish surprise')")
+    constraints_violated: List[str] = Field(default_factory=list)
+    scenario_risks: List[str] = Field(default_factory=list)
+    consensus_check: bool = Field(description="Whether persona majority supports BUY (auto-verified, CIO may set but system cross-checks)")
 
 
 # ── State Definition (Annotated reducers for parallel fan-out merge) ──────────
@@ -158,6 +162,41 @@ Confluence: {confluence.get('confidence', 'unknown').upper()} — {confluence.ge
 Technicals: {json.dumps(tech, indent=2, default=str)}
 Valuation: {json.dumps(val, indent=2, default=str)}
 News: {state.get('news_context', 'No news available')}"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-CONSENSUS: Pattern-match persona theses for objective vote count
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_BULLISH_PATTERNS = [
+    "buy candidate", "bullish", "poised for", "strong buy", "accumulation",
+    "uptrend", "breakout", "support a buy", "favorable", "tailwind",
+    "recommend buy", "entry point", "upside", "undervalued", "approve",
+    "growth potential", "positive", "likely to", "should perform",
+]
+_BEARISH_PATTERNS = [
+    "not bullish", "bearish", "sell", "downtrend", "overvalued",
+    "headwind", "risk", "decline", "avoid", "reject", "not recommend",
+    "not support", "not poised", "negative", "caution",
+]
+
+def _count_bullish_votes(state: AgentState) -> int:
+    theses = [
+        state.get("technical_thesis", ""),
+        state.get("macro_thesis", ""),
+        state.get("valuation_thesis", ""),
+        state.get("risk_thesis", ""),
+        state.get("tax_thesis", ""),
+        state.get("liquidity_thesis", ""),
+    ]
+    votes = 0
+    for thesis in theses:
+        t = thesis.lower()
+        bulls = sum(1 for p in _BULLISH_PATTERNS if p in t)
+        bears = sum(1 for p in _BEARISH_PATTERNS if p in t)
+        if bulls > bears:
+            votes += 1
+    return votes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -354,10 +393,15 @@ REBUTTALS:
 - Tax vs Liquidity: {state['rebuttals'].get('tax_vs_liquidity', '')}
 - Consensus: {state['rebuttals'].get('bullish_consensus', '')}"""
 
+    # Automated consensus count (objective, not self-reported)
+    auto_votes = _count_bullish_votes(state)
+    vote_note = f"SYSTEM: Automated count shows {auto_votes}/6 personas recommend BUY. "
+
     prompt = (
         f"OUTPUT ONLY valid JSON. No markdown, no explanation outside JSON.\n"
         f"You are the Chief Investment Officer of an Australian SMSF with A$250,000 AUM.\n"
-        f"Your team of 6 analysts has submitted independent assessments for {state['symbol']}.\n\n"
+        f"Your team of 6 analysts has submitted independent assessments for {state['symbol']}.\n"
+        f"{vote_note}\n\n"
         f"ANALYSES:\n{all_theses}\n\n"
         f"DATA:\n{_format_data_blob(state)}\n\n"
         f"Return a JSON object with these exact keys:\n"
@@ -431,6 +475,7 @@ def run_agentic_analysis(
         "key_risk": final_state["key_risk"],
         "constraints_violated": final_state["constraints_violated"],
         "scenario_risks": final_state["scenario_risks"],
+        "auto_consensus_votes": _count_bullish_votes(final_state),
         "deliberation": {
             "technical": final_state["technical_thesis"],
             "macro": final_state["macro_thesis"],

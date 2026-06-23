@@ -1788,6 +1788,8 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
         "earnings_risk": earnings_risk,
         "technical_confirmed": technical_confirmed,
         "upside_to_target_pct": upside,
+        "gap_risk_warning": earnings_risk == "high",
+        "gap_risk_note": "⚠️ ASX halts + earnings gaps can breach stops. Tighten stop to 2% if holding through earnings." if earnings_risk in ("high", "moderate") else None,
     }
 
 
@@ -2163,14 +2165,15 @@ def std_norm_cdf(x: float) -> float:
 
 
 def _blend_empirical_prob(symbol: str, model_prob: float) -> float:
-    """Blend model-derived P(≥target%) with empirical win rate from completed tracking windows.
+    """Multi-horizon blended probability with PID-adjusted horizon weights.
 
-    Prevents circular logic where the probability is derived from the same model mu
-    that drives the composite score.  Weights shift toward empirical data as sample
-    size grows:
-      ≥ 5 completed windows → 50% empirical / 50% model
-      1–4 completed windows → 25% empirical / 75% model
-      0 completed windows  → model only (no empirical data yet)
+    Tracks hit rates separately for 63d and 90d horizons.  If one horizon consistently
+    outperforms the other (higher hit rate), its weight increases via PID logic.
+    Model-derived P(≥5%) enters at a baseline 0.40 weight; empirical evidence takes
+    the remaining 0.60, split between 63d and 90d observations.
+
+    Over the long run this means the system self-corrects: if the model's 90d
+    predictions are unreliable but 63d works, the blend shifts toward 63d evidence.
     """
     try:
         with db_conn() as conn:
@@ -2178,18 +2181,34 @@ def _blend_empirical_prob(symbol: str, model_prob: float) -> float:
                 text("""
                     SELECT
                         COUNT(*) AS total,
-                        SUM(CASE WHEN actual_peak_return_90d >= 8.0 OR actual_return_63d >= 5.0 THEN 1 ELSE 0 END) AS hits
+                        SUM(CASE WHEN actual_return_63d >= 5.0 THEN 1 ELSE 0 END) AS hits_63,
+                        SUM(CASE WHEN actual_peak_return_90d >= 8.0 THEN 1 ELSE 0 END) AS hits_90
                     FROM wealth_builder_evaluations
                     WHERE symbol = :sym AND evaluated = TRUE
                 """),
                 {"sym": symbol},
             ).fetchone()
-        if row and row[0] and int(row[0]) >= 5:
-            empirical = float(row[1] or 0) / float(row[0])
-            return round(0.50 * model_prob + 0.50 * empirical, 4)
-        elif row and row[0] and int(row[0]) >= 1:
-            empirical = float(row[1] or 0) / float(row[0])
-            return round(0.75 * model_prob + 0.25 * empirical, 4)
+
+        n = int(row[0] or 0)
+        n_63 = int(row[1] or 0)
+        n_90 = int(row[2] or 0)
+
+        if n < 5:
+            return model_prob  # not enough data — pure model
+
+        hit_63 = n_63 / n
+        hit_90 = n_90 / n
+
+        # PID-adjusted horizon weights: the horizon with higher hit rate gets
+        # proportionally more weight, capped at 70/30 split to avoid overfitting.
+        total_hit = max(hit_63 + hit_90, 1e-6)
+        w_63 = min(0.70, max(0.30, hit_63 / total_hit))
+        w_90 = 1.0 - w_63
+
+        # Blend: 40% model + 60% empirical (split by horizon weights)
+        empirical = w_63 * hit_63 + w_90 * hit_90
+        return round(0.40 * model_prob + 0.60 * empirical, 4)
+
     except Exception:
         pass
     return model_prob
@@ -7305,8 +7324,31 @@ async def suggest_portfolio(
             cleaned_weights = {k: v / total_w for k, v in filtered_weights.items()}
 
         # Estimate impact of transaction costs on return (approx 0.2% penalty per position on a standard $10k portfolio)
-        txn_penalty = len(cleaned_weights) * 0.002 
-        
+        txn_penalty = len(cleaned_weights) * 0.002
+
+        # ── Sector Concentration Cap (ASX is heavily financials/materials) ───
+        # Cap any sector at 40% of portfolio to avoid single-sector blowup.
+        sector_weights = {}
+        ASX_SECTOR_MAP = {
+            "BHP": "Materials", "RIO": "Materials", "FMG": "Materials", "WDS": "Energy",
+            "CBA": "Financials", "NAB": "Financials", "WBC": "Financials", "ANZ": "Financials",
+            "MQG": "Financials", "CSL": "Healthcare", "WES": "Industrials", "TLS": "Telecom",
+            "WOW": "Consumer", "COL": "Consumer", "GMG": "Real Estate", "TCL": "Industrials",
+        }
+        MAX_SECTOR_WEIGHT = 0.40
+        for sym, w in list(cleaned_weights.items()):
+            sector = ASX_SECTOR_MAP.get(sym, "Other")
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + w
+        # If any sector exceeds 40%, scale all weights in that sector down proportionally
+        overflow_sectors = {s: v for s, v in sector_weights.items() if v > MAX_SECTOR_WEIGHT}
+        if overflow_sectors:
+            for sym, w in list(cleaned_weights.items()):
+                sector = ASX_SECTOR_MAP.get(sym, "Other")
+                if sector in overflow_sectors:
+                    cleaned_weights[sym] = w * (MAX_SECTOR_WEIGHT / overflow_sectors[sector])
+            total_w = sum(cleaned_weights.values())
+            cleaned_weights = {k: v / total_w for k, v in cleaned_weights.items()}
+
         raw_perf = hrp.portfolio_performance(risk_free_rate=0.04)
         perf = (raw_perf[0] - txn_penalty, raw_perf[1], (raw_perf[0] - txn_penalty - 0.04) / max(raw_perf[1], 1e-6))
     except Exception:
@@ -10758,8 +10800,8 @@ def _scheduled_self_learning_loop():
                 WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
             """)).fetchall()
 
-            if len(trades) < 5:
-                print(f"[SelfLearning] Not enough data ({len(trades)} trades) to learn yet.")
+            if len(trades) < 20:
+                print(f"[SelfLearning] Need ≥20 closed trades for stable PID (have {len(trades)}).")
                 return
 
             win_count = 0
@@ -10785,24 +10827,28 @@ def _scheduled_self_learning_loop():
             avg_win = sum(win_pcts) / len(win_pcts) if win_pcts else 0
             avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0
             
-            target_win_rate = 55.0  # Asymmetric 2:1 R:R target
+            target_win_rate = 55.0
             error = target_win_rate - win_rate
-            
+
+            # Constants: max penalty movement from baseline per cycle
+            PENALTY_BASELINE = {"vix_extreme": 0.75, "pe_extreme": 0.70, "short_extreme": 0.50}
+            MAX_DEVIATION = 0.30  # max ±30% from baseline
+            STEP_DOWN = 0.03      # tighten by 0.03 per cycle
+            STEP_UP = 0.02        # loosen by 0.02 per cycle
+            MIN_FLOOR = {k: max(0.3, v - MAX_DEVIATION) for k, v in PENALTY_BASELINE.items()}
+            MAX_CEIL = {k: min(0.95, v + MAX_DEVIATION) for k, v in PENALTY_BASELINE.items()}
+
             rec = "Hold steady."
             if error > 5:
-                # Underperforming: Tighten penalties
-                DYNAMIC_PENALTIES["vix_extreme"] = max(0.4, DYNAMIC_PENALTIES["vix_extreme"] - 0.05)
-                DYNAMIC_PENALTIES["pe_extreme"] = max(0.4, DYNAMIC_PENALTIES["pe_extreme"] - 0.05)
-                DYNAMIC_PENALTIES["short_extreme"] = max(0.3, DYNAMIC_PENALTIES["short_extreme"] - 0.05)
-                rec = "Underperforming. PID tightened Volatility & PE penalties to reject risky setups."
+                for key in ["vix_extreme", "pe_extreme", "short_extreme"]:
+                    DYNAMIC_PENALTIES[key] = max(MIN_FLOOR[key], DYNAMIC_PENALTIES[key] - STEP_DOWN)
+                rec = f"PID tightened penalties (win_rate={win_rate:.0f}% vs target {target_win_rate:.0f}%)."
             elif error < -5:
-                # Overperforming: Loosen penalties to find more trades
-                DYNAMIC_PENALTIES["vix_extreme"] = min(0.9, DYNAMIC_PENALTIES["vix_extreme"] + 0.02)
-                DYNAMIC_PENALTIES["pe_extreme"] = min(0.9, DYNAMIC_PENALTIES["pe_extreme"] + 0.02)
-                DYNAMIC_PENALTIES["short_extreme"] = min(0.85, DYNAMIC_PENALTIES["short_extreme"] + 0.02)
-                rec = "Overperforming. PID loosened Volatility & PE penalties to expand candidate pool."
+                for key in ["vix_extreme", "pe_extreme", "short_extreme"]:
+                    DYNAMIC_PENALTIES[key] = min(MAX_CEIL[key], DYNAMIC_PENALTIES[key] + STEP_UP)
+                rec = f"PID loosened penalties (win_rate={win_rate:.0f}% > target {target_win_rate:.0f}%)."
             else:
-                rec = "Strategy operating optimally within margin. Compounding achieved."
+                rec = f"Win rate {win_rate:.0f}% within ±5pp of target — strategy is calibrated."
 
             conn.execute(text("""
                 INSERT INTO ai_self_learning_metrics (total_trades, win_count, loss_count, win_rate_pct, avg_win_pct, avg_loss_pct, recommended_action)
@@ -11302,6 +11348,7 @@ async def weekly_backtest(market: str = "AU", weeks: int = 8, current_user: dict
                 (sum(e["actual"] for e in all_evals) / len(all_evals)) > benchmark_return,
         },
         "evaluations": all_evals[:50],
+        "walk_forward_note": "For out-of-sample validation, track OOS Sharpe on a rolling 8-week window. Currently: directional accuracy only. OOS Sharpe = (avg_actual - risk_free) / stdev(actual) × sqrt(52/n_weeks). This is the single most important metric — until this is ≥0.25, the model has no edge.",
     }
 
 

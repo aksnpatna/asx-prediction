@@ -11165,6 +11165,20 @@ def _scheduled_walk_forward_oos():
             continue
 
         if not rows:
+            # Write INSUFFICIENT_DATA so we know the horizon was checked
+            try:
+                with db_conn() as conn:
+                    conn.execute(text("""
+                        INSERT INTO wfo_metrics (run_id, horizon_window_days, total_signals, notes)
+                        VALUES (:rid, :hd, 0, 'INSUFFICIENT_DATA: no scan cache entries ≥ horizon_days old')
+                        ON CONFLICT (run_id) DO UPDATE SET
+                            run_at = NOW(), total_signals = EXCLUDED.total_signals,
+                            notes = EXCLUDED.notes
+                    """), {"rid": horizon_key, "hd": horizon_days})
+                    conn.commit()
+            except Exception:
+                pass
+            print(f"[WFO] h{horizon_days}d: no scan cache entries ≥{horizon_days}d old — INSUFFICIENT_DATA.")
             continue
 
         # Flatten all candidates across scan runs
@@ -11179,11 +11193,12 @@ def _scheduled_walk_forward_oos():
                 pred_chg = c.get("predicted_change_pct") or c.get("expected_return_3m_pct") or 0
                 trend = c.get("trend", "neutral")
                 mc = (c.get("valuation") or {}).get("market_cap")
+                sector = (c.get("valuation") or {}).get("sector", "Unknown")
                 all_signals.append({
                     "symbol": sym, "score": score, "prob": prob,
                     "screened_at": str(gen_at)[:10] if gen_at else str(cutoff_date),
                     "entry_price": price, "predicted_change_pct": pred_chg,
-                    "trend": trend, "market_cap": mc,
+                    "trend": trend, "market_cap": mc, "sector": sector,
                 })
 
         if not all_signals:
@@ -11242,6 +11257,7 @@ def _scheduled_walk_forward_oos():
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
+                sector = sig.get("sector", "Unknown")
 
                 evaluated.append({
                     "symbol": sig["symbol"],
@@ -11250,6 +11266,7 @@ def _scheduled_walk_forward_oos():
                     "direction_correct": direction_correct,
                     "hit": hit,
                     "tier": tier,
+                    "sector": sector,
                     "screen_to_entry_gap_pct": round(screen_to_entry_gap, 2),
                 })
             except Exception:
@@ -11259,10 +11276,26 @@ def _scheduled_walk_forward_oos():
         if dropped_corporate_action > 0:
             print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
 
-        # Minimum 20 evaluated signals for statistically meaningful Sharpe
-        # (Sharpe on 15-20 observations has confidence interval width > 0.4)
+        # ── Minimum 20 evaluated signals for statistically meaningful Sharpe ──
+        # (Sharpe on <20 observations has CI width >0.4 — not actionable)
+        # Horizons without enough data go to INSUFFICIENT_DATA, not AMBER/RED.
+        # This includes 63d and 90d horizons at Day 30 — they won't be evaluable
+        # until enough signals age to that window.
         if n < 20:
-            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥20 for stable Sharpe CI). Skipping.")
+            # Write INSUFFICIENT_DATA record so we know the horizon was checked
+            try:
+                with db_conn() as conn:
+                    conn.execute(text("""
+                        INSERT INTO wfo_metrics (run_id, horizon_window_days, total_signals, notes)
+                        VALUES (:rid, :hd, :n, 'INSUFFICIENT_DATA')
+                        ON CONFLICT (run_id) DO UPDATE SET
+                            run_at = NOW(), total_signals = EXCLUDED.total_signals,
+                            notes = EXCLUDED.notes
+                    """), {"rid": horizon_key, "hd": horizon_days, "n": n})
+                    conn.commit()
+            except Exception:
+                pass
+            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥20). Status: INSUFFICIENT_DATA")
             continue
 
         hits = sum(1 for e in evaluated if e["hit"])
@@ -11316,22 +11349,98 @@ def _scheduled_walk_forward_oos():
             for t, v in tier_signals.items()
         }
 
-        # ── Pre-committed RED/AMBER/GREEN rules ──────────────────────────────
+        # ── Sector concentration audit ────────────────────────────────────────
+        # If >30% of evaluated signals are from a single sector, flag it —
+        # bootstrap CI assumes independence which breaks under concentration.
+        sector_counts = {}
+        for e in evaluated:
+            s = e.get("sector", "Unknown")
+            sector_counts[s] = sector_counts.get(s, 0) + 1
+        max_sector_name = max(sector_counts, key=sector_counts.get) if sector_counts else "Unknown"
+        max_sector_pct = round(sector_counts[max_sector_name] / n * 100, 1) if sector_counts else 0
+        concentration_warning = (
+            f"⚠️ Sector concentration: {max_sector_name} = {max_sector_pct}% of signals. "
+            f"Bootstrap CI assumes independence — >30% from one sector undermines this. "
+            f"Consider sub-sector analysis before acting on GREEN/AMBER/RED."
+        ) if max_sector_pct > 30 else None
+
+        # ── Screen-to-entry gap monitoring ────────────────────────────────────
+        gaps = [e.get("screen_to_entry_gap_pct", 0) or 0 for e in evaluated]
+        avg_gap = sum(gaps) / n if gaps else 0
+        gap_warning = (
+            f"⚠️ Front-run risk: average screen-to-entry gap is {avg_gap:+.3f}%. "
+            f"If consistently >|0.3%|, your 5AM signals are being priced in before market open — "
+            f"real returns are {abs(avg_gap):.2f}% worse than reported per signal."
+        ) if abs(avg_gap) > 0.3 else None
+
+        # ── Pre-committed response rules (time-boxed, documented) ────────────
+        # GREEN:  95% CI lower bound ≥ 0 → model has edge, full allocation
+        # AMBER:  Sharpe ≥ 0 but CI straddles zero → edge unproven, widen stops
+        # RED:    Sharpe < 0 → halve allocation, manual review (5-day deadline)
+        # MANUAL: Past RED → in manual review window, no auto-adjustments
+        # INSUFFICIENT_DATA: <20 evaluated signals, no decision taken
+
+        review_deadline = None
         if sharpe_ci_lower >= 0:
             edge_status = "GREEN"
             action = "Model has edge (95% CI lower bound ≥ 0). Continue at full allocation."
+            manual_review_active = False
         elif oos_sharpe >= 0:
             edge_status = "AMBER"
-            action = "Edge unproven (95% CI straddles zero). Widen stops by 1%, hold allocation."
-        else:
-            edge_status = "RED"
-            action = "No edge (OOS Sharpe < 0). Halve allocation, escalate to manual review."
+            action = "Edge unproven (95% CI straddles zero). Widen stops by 1%, hold allocation. Review in 14 days."
+            manual_review_active = False
+        elif oos_sharpe < 0:
+            # Check if we're already in an active manual review from a prior RED
+            try:
+                with db_conn() as conn:
+                    prev = conn.execute(text("""
+                        SELECT notes FROM wfo_metrics
+                        WHERE horizon_window_days = :hd
+                          AND notes LIKE '%MANUAL_REVIEW_ACTIVE%'
+                        ORDER BY run_at DESC LIMIT 1
+                    """), {"hd": horizon_days}).fetchone()
+                already_in_review = prev is not None
+            except Exception:
+                already_in_review = False
+
+            if already_in_review:
+                edge_status = "RED_MANUAL_REVIEW"
+                action = (
+                    "MANUAL REVIEW IN PROGRESS — must conclude within 5 trading days of first RED. "
+                    "Decision required: RESUME (return to full allocation), HOLD (stay at 50%), or EXIT (close all model-driven positions). "
+                    "No new model-driven positions opened until review concludes."
+                )
+                manual_review_active = True
+            else:
+                edge_status = "RED"
+                review_deadline = (today + timedelta(days=7)).isoformat()  # 5 trading days ≈ 7 calendar
+                action = (
+                    f"No edge (OOS Sharpe < 0, CI lower bound {sharpe_ci_lower:.3f}). "
+                    f"Halve allocation immediately. Manual review required by {review_deadline}. "
+                    "Review must conclude with documented decision: RESUME / HOLD / EXIT. "
+                    "This note is the audit trail — the decision date and rationale must be recorded."
+                )
+                manual_review_active = True
+
+        # Combine all notes
+        full_notes_parts = [f"{edge_status}: {action}"]
+        if concentration_warning:
+            full_notes_parts.append(concentration_warning)
+        if gap_warning:
+            full_notes_parts.append(gap_warning)
+        full_notes = " | ".join(full_notes_parts)
 
         print(
             f"[WFO] h{horizon_days}d | n={n} | Hit={hit_rate:.1f}% | Dir={dir_acc:.1f}% | "
             f"Sharpe={oos_sharpe:.3f} (95% CI [{sharpe_ci_lower:.3f}, {sharpe_ci_upper:.3f}]) | "
-            f"Bmk={benchmark_ret}% | Excess={excess_ret}% | {edge_status}"
+            f"Bmk={benchmark_ret}% | Excess={excess_ret}% | "
+            f"Sector[max]={max_sector_name}({max_sector_pct}%) | "
+            f"ScreenGap={avg_gap:+.3f}% | {edge_status}"
         )
+        if concentration_warning:
+            print(f"[WFO]   {concentration_warning}")
+        if gap_warning:
+            print(f"[WFO]   {gap_warning}")
 
         try:
             with db_conn() as conn:
@@ -11384,7 +11493,7 @@ def _scheduled_walk_forward_oos():
                     "hr_small": tier_hits["hit_rate_small"],
                     "ca_drops": dropped_corporate_action,
                     "top10": json.dumps(sorted(evaluated, key=lambda x: x["actual_return_pct"], reverse=True)[:10]),
-                    "notes": f"{edge_status}: {action}",
+                    "notes": full_notes,
                 })
                 conn.commit()
         except Exception as e:
@@ -11773,14 +11882,24 @@ async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user
         "edge_threshold": 0.25,
         "response_rules": {
             "GREEN": "95% CI lower bound ≥ 0 — model has statistical edge. Continue at full allocation.",
-            "AMBER": "95% CI straddles zero — edge unproven. Widen stops by 1%. Hold allocation, do not increase.",
-            "RED": "OOS Sharpe < 0 — no edge. Halve allocation, escalate to manual review. Re-evaluate in 30 days.",
+            "AMBER": "95% CI straddles zero — edge unproven. Widen stops by 1%. Hold allocation, do not increase. Re-evaluate in 14 days.",
+            "RED": "OOS Sharpe < 0 — no edge. Halve allocation immediately. Manual review required within 5 trading days. Must conclude with documented RESUME/HOLD/EXIT decision.",
+            "RED_MANUAL_REVIEW": "Prior RED triggered manual review. No new model-driven positions until review concludes with documented decision.",
+            "INSUFFICIENT_DATA": "Fewer than 20 evaluated signals for this horizon. No decision taken — status is informational only. Check again when signal count reaches 20+.",
         },
         "has_edge": any(
             (latest[h] or {}).get("oos_sharpe", 0) >= 0.25
             and (latest[h] or {}).get("oos_sharpe_ci_lower", -99) >= 0
             for h in [30, 63, 90] if latest[h]
         ),
+        "manual_review_active": any(
+            (latest[h] or {}).get("notes", "").startswith("RED")
+            for h in [30, 63, 90] if latest[h]
+        ),
+        "insufficient_data_horizons": [
+            h for h in [30, 63, 90]
+            if latest[h] and (latest[h].get("notes") or "").startswith("INSUFFICIENT_DATA")
+        ],
     }
 
 

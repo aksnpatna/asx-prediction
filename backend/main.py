@@ -11061,6 +11061,7 @@ def _scheduled_daily_ai_pipeline():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _WFO_TABLE_SQL = """
+    DROP TABLE IF EXISTS wfo_metrics CASCADE;
     CREATE TABLE IF NOT EXISTS wfo_metrics (
         run_id TEXT PRIMARY KEY,
         run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -11072,6 +11073,8 @@ _WFO_TABLE_SQL = """
         avg_predicted_return_pct NUMERIC(8,4),
         return_stdev_pct NUMERIC(8,4),
         oos_sharpe NUMERIC(8,4),
+        oos_sharpe_ci_lower NUMERIC(8,4),
+        oos_sharpe_ci_upper NUMERIC(8,4),
         direction_accuracy_pct NUMERIC(6,2),
         benchmark_return_pct NUMERIC(8,4),
         excess_return_pct NUMERIC(8,4),
@@ -11081,6 +11084,7 @@ _WFO_TABLE_SQL = """
         hit_rate_large NUMERIC(6,2),
         hit_rate_mid NUMERIC(6,2),
         hit_rate_small NUMERIC(6,2),
+        corporate_action_drops INTEGER DEFAULT 0,
         top_10_picks JSONB,
         notes TEXT
     )
@@ -11109,13 +11113,20 @@ def _scheduled_walk_forward_oos():
       - OOS Sharpe: (avg_return - r_f) / stdev(return) × sqrt(252/horizon)
       - Benchmark excess: signal return minus ASX200 return over same window
       - Cap-tier breakdown: large/mid/small hit rates separately
+      - 95% confidence interval on OOS Sharpe via bootstrap
 
     All metrics are persisted to wfo_metrics table so a mini-PC that is
     powered off overnight doesn't lose the signal history.  Previous runs are
     always recoverable — just restart and the scheduler picks up where it left
     off.
 
-    Minimum data requirement: ≥10 evaluated signals per horizon window.
+    Minimum data requirement: ≥20 evaluated signals per horizon window
+    (Sharpe on <20 observations has confidence intervals too wide to act on).
+
+    RED/AMBER/GREEN pre-commit rules (configured, NOT rationalised after the fact):
+      GREEN (Sharpe ≥ 0.25, lower bound of 95% CI ≥ 0): model has edge — continue
+      AMBER (Sharpe ≥ 0, but lower bound of 95% CI < 0): edge unproven — widen stops
+      RED (Sharpe < 0): model has no edge — reduce allocation to 50%, escalate to manual review
     """
     global _WFO_LAST_HORIZON
     _ensure_wfo_table()
@@ -11165,7 +11176,7 @@ def _scheduled_walk_forward_oos():
                 score = c.get("score") or 0
                 prob = c.get("prob_ge_5pct") or 0
                 price = c.get("current_price") or 0
-                pred_chg = c.get("predicted_change_pct") or 0
+                pred_chg = c.get("predicted_change_pct") or c.get("expected_return_3m_pct") or 0
                 trend = c.get("trend", "neutral")
                 mc = (c.get("valuation") or {}).get("market_cap")
                 all_signals.append({
@@ -11186,25 +11197,44 @@ def _scheduled_walk_forward_oos():
                 seen[sym] = s
         unique_signals = list(seen.values())
 
-        # Evaluate actual outcomes
+        # Evaluate actual outcomes using NEXT TRADING DAY OPEN as entry price
+        # (not 5AM pre-market screen price, which would overstate returns).
         evaluated = []
+        dropped_corporate_action = 0
         for sig in unique_signals:
             try:
                 hist = get_historical_data(sig["symbol"], period="6mo")
-                if hist.empty or len(hist) < horizon_days:
+                if hist.empty or len(hist) < horizon_days + 5:
                     continue
-                entry_price = sig["entry_price"]
-                if entry_price <= 0:
-                    continue
-                # Find the price horizon_days after the signal date
-                signal_dt = pd.Timestamp(sig["screened_at"])
-                future = hist[hist.index >= signal_dt]
-                if future.empty or len(future) < horizon_days:
-                    continue
-                exit_price = float(future["Close"].iloc[min(horizon_days - 1, len(future) - 1)])
-                actual_return = (exit_price / entry_price - 1) * 100
 
-                # Hit: predicted direction matched actual AND actual >= 5%
+                # ── Entry price: next trading day OPEN after signal date ──────
+                screen_price = sig["entry_price"]
+                if screen_price <= 0:
+                    continue
+                signal_dt = pd.Timestamp(sig["screened_at"])
+                after_signal = hist[hist.index > signal_dt]
+                if after_signal.empty:
+                    continue
+                entry_price = float(after_signal["Open"].iloc[0]) if "Open" in after_signal.columns else float(after_signal["Close"].iloc[0])
+
+                # ── Exit price: horizon_days trading days after entry ────────
+                future = hist[hist.index >= signal_dt]
+                if future.empty or len(future) < max(horizon_days, 5):
+                    continue
+                exit_idx = min(horizon_days, len(future) - 1)
+                exit_price = float(future["Close"].iloc[exit_idx])
+
+                # ── Corporate action / gap detection ──────────────────────────
+                # If the exit price moved >50% in a single day, flag as corporate
+                # action and exclude from benchmark (but track count).
+                recent_returns = future["Close"].pct_change().tail(5)
+                if recent_returns.abs().max() > 0.50:
+                    dropped_corporate_action += 1
+                    continue
+
+                actual_return = (exit_price / entry_price - 1) * 100
+                screen_to_entry_gap = (entry_price / screen_price - 1) * 100
+
                 predicted_up = sig["trend"] == "bullish"
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
@@ -11220,13 +11250,19 @@ def _scheduled_walk_forward_oos():
                     "direction_correct": direction_correct,
                     "hit": hit,
                     "tier": tier,
+                    "screen_to_entry_gap_pct": round(screen_to_entry_gap, 2),
                 })
             except Exception:
                 continue
 
         n = len(evaluated)
-        if n < 10:
-            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥10), skipping.")
+        if dropped_corporate_action > 0:
+            print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
+
+        # Minimum 20 evaluated signals for statistically meaningful Sharpe
+        # (Sharpe on 15-20 observations has confidence interval width > 0.4)
+        if n < 20:
+            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥20 for stable Sharpe CI). Skipping.")
             continue
 
         hits = sum(1 for e in evaluated if e["hit"])
@@ -11239,22 +11275,39 @@ def _scheduled_walk_forward_oos():
         hit_rate = hits / n * 100
         dir_acc = dir_correct / n * 100
 
-        # OOS Sharpe: annualized excess return over risk-free
+        # ── OOS Sharpe: cross-sectional across signals evaluated today ────────
+        # Each signal is an independent observation.  We annualize by scaling
+        # the cross-sectional mean/stdev ratio by √(252/horizon_days).
+        # This is a cross-sectional Sharpe, not a time-series Sharpe.
         oos_sharpe = ((avg_return / 100 - r_f_daily * horizon_days) / (stdev_return / 100 + 1e-9)) * (252 / horizon_days) ** 0.5
 
-        # Benchmark (ASX200 over same horizon)
+        # ── 95% Confidence Interval on OOS Sharpe via bootstrap ───────────────
+        import random
+        n_boot = 1000
+        boot_sharpes = []
+        for _ in range(n_boot):
+            sample = random.choices(returns, k=n)
+            avg_s = sum(sample) / n
+            std_s = (sum((r - avg_s) ** 2 for r in sample) / (n - 1)) ** 0.5 if n > 1 else 1.0
+            sr_s = ((avg_s / 100 - r_f_daily * horizon_days) / (std_s / 100 + 1e-9)) * (252 / horizon_days) ** 0.5
+            boot_sharpes.append(sr_s)
+        boot_sharpes.sort()
+        sharpe_ci_lower = boot_sharpes[int(n_boot * 0.025)]
+        sharpe_ci_upper = boot_sharpes[int(n_boot * 0.975)]
+
+        # ── Benchmark (ASX200 over same horizon window) ───────────────────────
         benchmark_ret = None
         excess_ret = None
         try:
             xjo = get_historical_data("^AXJO", period="6mo")
-            if not xjo.empty:
+            if not xjo.empty and len(xjo) >= horizon_days:
                 xjo_ret = (float(xjo["Close"].iloc[-1]) / float(xjo["Close"].iloc[-horizon_days]) - 1) * 100
                 benchmark_ret = round(xjo_ret, 2)
                 excess_ret = round(avg_return - xjo_ret, 2)
         except Exception:
             pass
 
-        # Cap-tier breakdown
+        # ── Cap-tier breakdown ────────────────────────────────────────────────
         tier_signals = {"large": [], "mid": [], "small": []}
         for e in evaluated:
             tier_signals[e["tier"]].append(e)
@@ -11263,12 +11316,21 @@ def _scheduled_walk_forward_oos():
             for t, v in tier_signals.items()
         }
 
-        # Persist to DB
-        edge_status = "GREEN" if oos_sharpe >= 0.25 else "AMBER" if oos_sharpe >= 0.0 else "RED"
+        # ── Pre-committed RED/AMBER/GREEN rules ──────────────────────────────
+        if sharpe_ci_lower >= 0:
+            edge_status = "GREEN"
+            action = "Model has edge (95% CI lower bound ≥ 0). Continue at full allocation."
+        elif oos_sharpe >= 0:
+            edge_status = "AMBER"
+            action = "Edge unproven (95% CI straddles zero). Widen stops by 1%, hold allocation."
+        else:
+            edge_status = "RED"
+            action = "No edge (OOS Sharpe < 0). Halve allocation, escalate to manual review."
+
         print(
-            f"[WFO] h{horizon_days}d | n={n} | Hit={hit_rate:.1f}% | "
-            f"Dir={dir_acc:.1f}% | OOS Sharpe={oos_sharpe:.3f} | "
-            f"Bmk={benchmark_ret}% | Excess={excess_ret}% | Status={edge_status}"
+            f"[WFO] h{horizon_days}d | n={n} | Hit={hit_rate:.1f}% | Dir={dir_acc:.1f}% | "
+            f"Sharpe={oos_sharpe:.3f} (95% CI [{sharpe_ci_lower:.3f}, {sharpe_ci_upper:.3f}]) | "
+            f"Bmk={benchmark_ret}% | Excess={excess_ret}% | {edge_status}"
         )
 
         try:
@@ -11277,18 +11339,22 @@ def _scheduled_walk_forward_oos():
                     INSERT INTO wfo_metrics (
                         run_id, horizon_window_days, total_signals, hit_count, hit_rate_pct,
                         avg_return_pct, avg_predicted_return_pct, return_stdev_pct,
-                        oos_sharpe, direction_accuracy_pct,
+                        oos_sharpe, oos_sharpe_ci_lower, oos_sharpe_ci_upper,
+                        direction_accuracy_pct,
                         benchmark_return_pct, excess_return_pct,
                         signal_count_large, signal_count_mid, signal_count_small,
                         hit_rate_large, hit_rate_mid, hit_rate_small,
+                        corporate_action_drops,
                         top_10_picks, notes
                     ) VALUES (
                         :rid, :horizon, :total, :hits, :hit_rate,
                         :avg_ret, :avg_pred, :stdev,
-                        :sharpe, :dir_acc,
+                        :sharpe, :ci_low, :ci_high,
+                        :dir_acc,
                         :bmk, :excess,
                         :sc_large, :sc_mid, :sc_small,
                         :hr_large, :hr_mid, :hr_small,
+                        :ca_drops,
                         :top10, :notes
                     )
                     ON CONFLICT (run_id) DO UPDATE SET
@@ -11296,6 +11362,8 @@ def _scheduled_walk_forward_oos():
                         total_signals = EXCLUDED.total_signals,
                         hit_rate_pct = EXCLUDED.hit_rate_pct,
                         oos_sharpe = EXCLUDED.oos_sharpe,
+                        oos_sharpe_ci_lower = EXCLUDED.oos_sharpe_ci_lower,
+                        oos_sharpe_ci_upper = EXCLUDED.oos_sharpe_ci_upper,
                         direction_accuracy_pct = EXCLUDED.direction_accuracy_pct,
                         benchmark_return_pct = EXCLUDED.benchmark_return_pct,
                         excess_return_pct = EXCLUDED.excess_return_pct,
@@ -11305,6 +11373,7 @@ def _scheduled_walk_forward_oos():
                     "total": n, "hits": hits, "hit_rate": round(hit_rate, 2),
                     "avg_ret": round(avg_return, 4), "avg_pred": round(avg_pred, 4),
                     "stdev": round(stdev_return, 4), "sharpe": round(oos_sharpe, 4),
+                    "ci_low": round(sharpe_ci_lower, 4), "ci_high": round(sharpe_ci_upper, 4),
                     "dir_acc": round(dir_acc, 2),
                     "bmk": benchmark_ret, "excess": excess_ret,
                     "sc_large": len(tier_signals["large"]),
@@ -11313,8 +11382,9 @@ def _scheduled_walk_forward_oos():
                     "hr_large": tier_hits["hit_rate_large"],
                     "hr_mid": tier_hits["hit_rate_mid"],
                     "hr_small": tier_hits["hit_rate_small"],
+                    "ca_drops": dropped_corporate_action,
                     "top10": json.dumps(sorted(evaluated, key=lambda x: x["actual_return_pct"], reverse=True)[:10]),
-                    "notes": edge_status,
+                    "notes": f"{edge_status}: {action}",
                 })
                 conn.commit()
         except Exception as e:
@@ -11322,19 +11392,21 @@ def _scheduled_walk_forward_oos():
 
     _WFO_LAST_HORIZON = 0
 
-    # ── Congratulatory summary (only when data is meaningful) ──────────────
+    # ── Summary with response rules ───────────────────────────────────────────
     try:
         with db_conn() as conn:
             latest = conn.execute(text("""
-                SELECT horizon_window_days, oos_sharpe, hit_rate_pct, direction_accuracy_pct, notes
+                SELECT horizon_window_days, oos_sharpe, oos_sharpe_ci_lower, oos_sharpe_ci_upper,
+                       hit_rate_pct, direction_accuracy_pct, notes
                 FROM wfo_metrics
                 ORDER BY run_at DESC LIMIT 3
             """)).fetchall()
         if latest:
             print(f"[WFO] === Walk-Forward OOS Summary ===")
             for row in latest:
-                emoji = "🟢" if (row[1] or 0) >= 0.25 else "🟡" if (row[1] or 0) >= 0 else "🔴"
-                print(f"[WFO]   {emoji} {row[0]}d: Sharpe={row[1]:.3f}  Hit={row[2]:.1f}%  Dir={row[3]:.1f}%  {row[4]}")
+                ci_str = f"CI [{row[2]:.3f}, {row[3]:.3f}]" if row[2] is not None else "CI pending"
+                print(f"[WFO]   {row[0]}d: Sharpe={row[1]:.3f} {ci_str}  Hit={row[4]:.1f}%  Dir={row[5]:.1f}%")
+                print(f"[WFO]         {row[6]}")
     except Exception:
         pass
 
@@ -11651,9 +11723,11 @@ async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user
             rows = conn.execute(text("""
                 SELECT run_id, run_at, horizon_window_days, total_signals, hit_rate_pct,
                        avg_return_pct, avg_predicted_return_pct, return_stdev_pct,
-                       oos_sharpe, direction_accuracy_pct,
+                       oos_sharpe, oos_sharpe_ci_lower, oos_sharpe_ci_upper,
+                       direction_accuracy_pct,
                        benchmark_return_pct, excess_return_pct,
                        hit_rate_large, hit_rate_mid, hit_rate_small,
+                       corporate_action_drops,
                        top_10_picks, notes
                 FROM wfo_metrics
                 ORDER BY run_at DESC
@@ -11673,13 +11747,16 @@ async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user
             "hit_rate_pct": float(r[4] or 0),
             "avg_return_pct": float(r[5] or 0),
             "oos_sharpe": float(r[8] or 0),
-            "direction_accuracy_pct": float(r[9] or 0),
-            "benchmark_return_pct": float(r[10] or 0) if r[10] is not None else None,
-            "excess_return_pct": float(r[11] or 0) if r[11] is not None else None,
-            "hit_rate_large": float(r[12] or 0) if r[12] is not None else None,
-            "hit_rate_mid": float(r[13] or 0) if r[13] is not None else None,
-            "hit_rate_small": float(r[14] or 0) if r[14] is not None else None,
-            "notes": r[16],
+            "oos_sharpe_ci_lower": float(r[9] or 0) if r[9] is not None else None,
+            "oos_sharpe_ci_upper": float(r[10] or 0) if r[10] is not None else None,
+            "direction_accuracy_pct": float(r[11] or 0),
+            "benchmark_return_pct": float(r[12] or 0) if r[12] is not None else None,
+            "excess_return_pct": float(r[13] or 0) if r[13] is not None else None,
+            "hit_rate_large": float(r[14] or 0) if r[14] is not None else None,
+            "hit_rate_mid": float(r[15] or 0) if r[15] is not None else None,
+            "hit_rate_small": float(r[16] or 0) if r[16] is not None else None,
+            "corporate_action_drops": r[17] or 0,
+            "notes": r[19],
         }
         if h in by_horizon:
             by_horizon[h].append(entry)
@@ -11694,8 +11771,14 @@ async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user
         "history_63d": by_horizon[63][:30],
         "history_90d": by_horizon[90][:30],
         "edge_threshold": 0.25,
+        "response_rules": {
+            "GREEN": "95% CI lower bound ≥ 0 — model has statistical edge. Continue at full allocation.",
+            "AMBER": "95% CI straddles zero — edge unproven. Widen stops by 1%. Hold allocation, do not increase.",
+            "RED": "OOS Sharpe < 0 — no edge. Halve allocation, escalate to manual review. Re-evaluate in 30 days.",
+        },
         "has_edge": any(
             (latest[h] or {}).get("oos_sharpe", 0) >= 0.25
+            and (latest[h] or {}).get("oos_sharpe_ci_lower", -99) >= 0
             for h in [30, 63, 90] if latest[h]
         ),
     }

@@ -11055,6 +11055,290 @@ def _scheduled_daily_ai_pipeline():
 
     print(f"[DailyAI] Daily AI pipeline complete. {len(ai_results)} analyses, broadcast to Telegram.")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WALK-FORWARD OOS VALIDATION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WFO_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS wfo_metrics (
+        run_id TEXT PRIMARY KEY,
+        run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        horizon_window_days INTEGER NOT NULL,
+        total_signals INTEGER,
+        hit_count INTEGER,
+        hit_rate_pct NUMERIC(6,2),
+        avg_return_pct NUMERIC(8,4),
+        avg_predicted_return_pct NUMERIC(8,4),
+        return_stdev_pct NUMERIC(8,4),
+        oos_sharpe NUMERIC(8,4),
+        direction_accuracy_pct NUMERIC(6,2),
+        benchmark_return_pct NUMERIC(8,4),
+        excess_return_pct NUMERIC(8,4),
+        signal_count_large INTEGER DEFAULT 0,
+        signal_count_mid INTEGER DEFAULT 0,
+        signal_count_small INTEGER DEFAULT 0,
+        hit_rate_large NUMERIC(6,2),
+        hit_rate_mid NUMERIC(6,2),
+        hit_rate_small NUMERIC(6,2),
+        top_10_picks JSONB,
+        notes TEXT
+    )
+"""
+
+def _ensure_wfo_table():
+    try:
+        with db_conn() as conn:
+            conn.execute(text(_WFO_TABLE_SQL))
+            conn.commit()
+    except Exception:
+        pass
+
+
+_WFO_LAST_HORIZON = 0
+_WFO_HORIZON_DAYS = [30, 63, 90]  # rolling check at 30d, 63d, 90d post-signal
+
+def _scheduled_walk_forward_oos():
+    """Walk-Forward Out-of-Sample Validation (runs daily after market close).
+
+    For every wealth_scan_cache entry older than horizon_window_days, fetches
+    the actual post-signal price change from EODHD/yfinance and computes:
+
+      - Directional accuracy: did the signal point the right way?
+      - Hit rate: P(actual_return >= target) for each horizon
+      - OOS Sharpe: (avg_return - r_f) / stdev(return) × sqrt(252/horizon)
+      - Benchmark excess: signal return minus ASX200 return over same window
+      - Cap-tier breakdown: large/mid/small hit rates separately
+
+    All metrics are persisted to wfo_metrics table so a mini-PC that is
+    powered off overnight doesn't lose the signal history.  Previous runs are
+    always recoverable — just restart and the scheduler picks up where it left
+    off.
+
+    Minimum data requirement: ≥10 evaluated signals per horizon window.
+    """
+    global _WFO_LAST_HORIZON
+    _ensure_wfo_table()
+
+    today = datetime.utcnow().date()
+    r_f_daily = 0.04 / 252  # 4% annual risk-free rate
+
+    for horizon_days in _WFO_HORIZON_DAYS:
+        cutoff_date = today - timedelta(days=horizon_days)
+        horizon_key = f"wfo_{today.isoformat()}_h{horizon_days}"
+
+        # Skip if already computed today
+        try:
+            with db_conn() as conn:
+                exists = conn.execute(text(
+                    "SELECT 1 FROM wfo_metrics WHERE run_id = :rid"
+                ), {"rid": horizon_key}).fetchone()
+            if exists:
+                continue
+        except Exception:
+            pass
+
+        # Load all signals screened ≥ horizon_days ago
+        try:
+            with db_conn() as conn:
+                rows = conn.execute(text("""
+                    SELECT picks, generated_at
+                    FROM wealth_scan_cache
+                    WHERE scan_mode = 'broad'
+                      AND generated_at <= :cutoff
+                    ORDER BY generated_at DESC
+                    LIMIT 50
+                """), {"cutoff": cutoff_date}).fetchall()
+        except Exception as e:
+            print(f"[WFO] DB read failed for h{horizon_days}: {e}")
+            continue
+
+        if not rows:
+            continue
+
+        # Flatten all candidates across scan runs
+        all_signals = []
+        for picks_json, gen_at in rows:
+            candidates = json.loads(picks_json) if isinstance(picks_json, str) else (picks_json or [])
+            for c in candidates:
+                sym = c.get("symbol", "")
+                score = c.get("score") or 0
+                prob = c.get("prob_ge_5pct") or 0
+                price = c.get("current_price") or 0
+                pred_chg = c.get("predicted_change_pct") or 0
+                trend = c.get("trend", "neutral")
+                mc = (c.get("valuation") or {}).get("market_cap")
+                all_signals.append({
+                    "symbol": sym, "score": score, "prob": prob,
+                    "screened_at": str(gen_at)[:10] if gen_at else str(cutoff_date),
+                    "entry_price": price, "predicted_change_pct": pred_chg,
+                    "trend": trend, "market_cap": mc,
+                })
+
+        if not all_signals:
+            continue
+
+        # Deduplicate: keep best signal per symbol per horizon window
+        seen = {}
+        for s in all_signals:
+            sym = s["symbol"]
+            if sym not in seen or s["score"] > seen[sym]["score"]:
+                seen[sym] = s
+        unique_signals = list(seen.values())
+
+        # Evaluate actual outcomes
+        evaluated = []
+        for sig in unique_signals:
+            try:
+                hist = get_historical_data(sig["symbol"], period="6mo")
+                if hist.empty or len(hist) < horizon_days:
+                    continue
+                entry_price = sig["entry_price"]
+                if entry_price <= 0:
+                    continue
+                # Find the price horizon_days after the signal date
+                signal_dt = pd.Timestamp(sig["screened_at"])
+                future = hist[hist.index >= signal_dt]
+                if future.empty or len(future) < horizon_days:
+                    continue
+                exit_price = float(future["Close"].iloc[min(horizon_days - 1, len(future) - 1)])
+                actual_return = (exit_price / entry_price - 1) * 100
+
+                # Hit: predicted direction matched actual AND actual >= 5%
+                predicted_up = sig["trend"] == "bullish"
+                actual_up = actual_return > 0
+                direction_correct = predicted_up == actual_up
+                hit = actual_return >= 5.0
+
+                mc = sig.get("market_cap")
+                tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
+
+                evaluated.append({
+                    "symbol": sig["symbol"],
+                    "predicted_change_pct": sig["predicted_change_pct"],
+                    "actual_return_pct": round(actual_return, 2),
+                    "direction_correct": direction_correct,
+                    "hit": hit,
+                    "tier": tier,
+                })
+            except Exception:
+                continue
+
+        n = len(evaluated)
+        if n < 10:
+            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥10), skipping.")
+            continue
+
+        hits = sum(1 for e in evaluated if e["hit"])
+        dir_correct = sum(1 for e in evaluated if e["direction_correct"])
+        returns = [e["actual_return_pct"] for e in evaluated]
+        preds = [e["predicted_change_pct"] for e in evaluated]
+        avg_return = sum(returns) / n
+        avg_pred = sum(preds) / n
+        stdev_return = (sum((r - avg_return) ** 2 for r in returns) / (n - 1)) ** 0.5 if n > 1 else 1.0
+        hit_rate = hits / n * 100
+        dir_acc = dir_correct / n * 100
+
+        # OOS Sharpe: annualized excess return over risk-free
+        oos_sharpe = ((avg_return / 100 - r_f_daily * horizon_days) / (stdev_return / 100 + 1e-9)) * (252 / horizon_days) ** 0.5
+
+        # Benchmark (ASX200 over same horizon)
+        benchmark_ret = None
+        excess_ret = None
+        try:
+            xjo = get_historical_data("^AXJO", period="6mo")
+            if not xjo.empty:
+                xjo_ret = (float(xjo["Close"].iloc[-1]) / float(xjo["Close"].iloc[-horizon_days]) - 1) * 100
+                benchmark_ret = round(xjo_ret, 2)
+                excess_ret = round(avg_return - xjo_ret, 2)
+        except Exception:
+            pass
+
+        # Cap-tier breakdown
+        tier_signals = {"large": [], "mid": [], "small": []}
+        for e in evaluated:
+            tier_signals[e["tier"]].append(e)
+        tier_hits = {
+            f"hit_rate_{t}": round(sum(1 for x in v if x["hit"]) / len(v) * 100, 2) if v else None
+            for t, v in tier_signals.items()
+        }
+
+        # Persist to DB
+        edge_status = "GREEN" if oos_sharpe >= 0.25 else "AMBER" if oos_sharpe >= 0.0 else "RED"
+        print(
+            f"[WFO] h{horizon_days}d | n={n} | Hit={hit_rate:.1f}% | "
+            f"Dir={dir_acc:.1f}% | OOS Sharpe={oos_sharpe:.3f} | "
+            f"Bmk={benchmark_ret}% | Excess={excess_ret}% | Status={edge_status}"
+        )
+
+        try:
+            with db_conn() as conn:
+                conn.execute(text("""
+                    INSERT INTO wfo_metrics (
+                        run_id, horizon_window_days, total_signals, hit_count, hit_rate_pct,
+                        avg_return_pct, avg_predicted_return_pct, return_stdev_pct,
+                        oos_sharpe, direction_accuracy_pct,
+                        benchmark_return_pct, excess_return_pct,
+                        signal_count_large, signal_count_mid, signal_count_small,
+                        hit_rate_large, hit_rate_mid, hit_rate_small,
+                        top_10_picks, notes
+                    ) VALUES (
+                        :rid, :horizon, :total, :hits, :hit_rate,
+                        :avg_ret, :avg_pred, :stdev,
+                        :sharpe, :dir_acc,
+                        :bmk, :excess,
+                        :sc_large, :sc_mid, :sc_small,
+                        :hr_large, :hr_mid, :hr_small,
+                        :top10, :notes
+                    )
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        run_at = NOW(),
+                        total_signals = EXCLUDED.total_signals,
+                        hit_rate_pct = EXCLUDED.hit_rate_pct,
+                        oos_sharpe = EXCLUDED.oos_sharpe,
+                        direction_accuracy_pct = EXCLUDED.direction_accuracy_pct,
+                        benchmark_return_pct = EXCLUDED.benchmark_return_pct,
+                        excess_return_pct = EXCLUDED.excess_return_pct,
+                        notes = EXCLUDED.notes
+                """), {
+                    "rid": horizon_key, "horizon": horizon_days,
+                    "total": n, "hits": hits, "hit_rate": round(hit_rate, 2),
+                    "avg_ret": round(avg_return, 4), "avg_pred": round(avg_pred, 4),
+                    "stdev": round(stdev_return, 4), "sharpe": round(oos_sharpe, 4),
+                    "dir_acc": round(dir_acc, 2),
+                    "bmk": benchmark_ret, "excess": excess_ret,
+                    "sc_large": len(tier_signals["large"]),
+                    "sc_mid": len(tier_signals["mid"]),
+                    "sc_small": len(tier_signals["small"]),
+                    "hr_large": tier_hits["hit_rate_large"],
+                    "hr_mid": tier_hits["hit_rate_mid"],
+                    "hr_small": tier_hits["hit_rate_small"],
+                    "top10": json.dumps(sorted(evaluated, key=lambda x: x["actual_return_pct"], reverse=True)[:10]),
+                    "notes": edge_status,
+                })
+                conn.commit()
+        except Exception as e:
+            print(f"[WFO] DB write failed: {e}")
+
+    _WFO_LAST_HORIZON = 0
+
+    # ── Congratulatory summary (only when data is meaningful) ──────────────
+    try:
+        with db_conn() as conn:
+            latest = conn.execute(text("""
+                SELECT horizon_window_days, oos_sharpe, hit_rate_pct, direction_accuracy_pct, notes
+                FROM wfo_metrics
+                ORDER BY run_at DESC LIMIT 3
+            """)).fetchall()
+        if latest:
+            print(f"[WFO] === Walk-Forward OOS Summary ===")
+            for row in latest:
+                emoji = "🟢" if (row[1] or 0) >= 0.25 else "🟡" if (row[1] or 0) >= 0 else "🔴"
+                print(f"[WFO]   {emoji} {row[0]}d: Sharpe={row[1]:.3f}  Hit={row[2]:.1f}%  Dir={row[3]:.1f}%  {row[4]}")
+    except Exception:
+        pass
+
+
 def _scheduled_wealth_builder_evaluate():
     """Scheduled job: evaluate past wealth builder candidates."""
     try:
@@ -11349,6 +11633,71 @@ async def weekly_backtest(market: str = "AU", weeks: int = 8, current_user: dict
         },
         "evaluations": all_evals[:50],
         "walk_forward_note": "For out-of-sample validation, track OOS Sharpe on a rolling 8-week window. Currently: directional accuracy only. OOS Sharpe = (avg_actual - risk_free) / stdev(actual) × sqrt(52/n_weeks). This is the single most important metric — until this is ≥0.25, the model has no edge.",
+    }
+
+
+@app.get("/api/walk-forward/oos")
+async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user)):
+    """Return the latest walk-forward out-of-sample validation metrics.
+
+    Computed daily after market close across 30d, 63d, and 90d horizons.
+    Key metric: OOS Sharpe >= 0.25 indicates statistical edge.
+    Returns per-horizon time series for trend analysis.
+    """
+    del current_user
+    _ensure_wfo_table()
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(text("""
+                SELECT run_id, run_at, horizon_window_days, total_signals, hit_rate_pct,
+                       avg_return_pct, avg_predicted_return_pct, return_stdev_pct,
+                       oos_sharpe, direction_accuracy_pct,
+                       benchmark_return_pct, excess_return_pct,
+                       hit_rate_large, hit_rate_mid, hit_rate_small,
+                       top_10_picks, notes
+                FROM wfo_metrics
+                ORDER BY run_at DESC
+                LIMIT 90
+            """)).fetchall()
+    except Exception as e:
+        return {"error": str(e), "metrics": []}
+
+    by_horizon = {30: [], 63: [], 90: []}
+    latest = {30: None, 63: None, 90: None}
+    for r in rows:
+        h = r[2]
+        entry = {
+            "date": str(r[1])[:10] if r[1] else None,
+            "run_id": r[0],
+            "total_signals": r[3],
+            "hit_rate_pct": float(r[4] or 0),
+            "avg_return_pct": float(r[5] or 0),
+            "oos_sharpe": float(r[8] or 0),
+            "direction_accuracy_pct": float(r[9] or 0),
+            "benchmark_return_pct": float(r[10] or 0) if r[10] is not None else None,
+            "excess_return_pct": float(r[11] or 0) if r[11] is not None else None,
+            "hit_rate_large": float(r[12] or 0) if r[12] is not None else None,
+            "hit_rate_mid": float(r[13] or 0) if r[13] is not None else None,
+            "hit_rate_small": float(r[14] or 0) if r[14] is not None else None,
+            "notes": r[16],
+        }
+        if h in by_horizon:
+            by_horizon[h].append(entry)
+            if latest[h] is None:
+                latest[h] = entry
+
+    return {
+        "latest_30d": latest[30],
+        "latest_63d": latest[63],
+        "latest_90d": latest[90],
+        "history_30d": by_horizon[30][:30],
+        "history_63d": by_horizon[63][:30],
+        "history_90d": by_horizon[90][:30],
+        "edge_threshold": 0.25,
+        "has_edge": any(
+            (latest[h] or {}).get("oos_sharpe", 0) >= 0.25
+            for h in [30, 63, 90] if latest[h]
+        ),
     }
 
 
@@ -11729,6 +12078,13 @@ if SCHEDULER_AVAILABLE:
             id="daily_ai_pipeline",
             max_instances=1,
         )
+        scheduler.add_job(
+            _scheduled_walk_forward_oos, "cron",
+            minute=15, hour=16,
+            day_of_week="mon-fri",
+            id="walk_forward_oos",
+            max_instances=1,
+        )
         scheduler.start()
 
         # ── Startup Catch-Up Engine ───────────────────────────────────────────
@@ -11782,31 +12138,16 @@ if SCHEDULER_AVAILABLE:
 
             _st.sleep(10)
 
-            # ── 3. Daily digest — re-send if today's hasn't gone out yet ──────
-            # Only send during reasonable hours (7AM–7PM local) to avoid
-            # waking the user with a notification at 2AM.
+            # ── 3. (Deprecated daily_digest — replaced by 6AM AI pipeline) ───────
+            # Old daily_digest catch-up removed. The AI pipeline handles this now.
+
+            # ── 4. Walk-forward OOS — always run on startup (idempotent, skipped if already computed today) ──
             try:
-                digest_hour_min = 7
-                digest_hour_max = 19
-                if digest_hour_min <= hour_local <= digest_hour_max:
-                    _digest_key = _daily_digest_cache_key()
-                    _market = os.getenv("DAILY_DIGEST_MARKET", "AU").upper()
-                    with db_conn() as _conn:
-                        _sent_rows = _conn.execute(text("""
-                            SELECT COUNT(*) FROM telegram_send_log
-                            WHERE message_type = 'daily_digest'
-                              AND digest_key = :dk
-                              AND status = 'sent'
-                        """), {"dk": _digest_key}).fetchone()
-                    already_sent = (_sent_rows[0] if _sent_rows else 0) > 0
-                    if not already_sent:
-                        print(f"[StartupCatchup] Skipping old daily_digest — replaced by daily_ai_pipeline")
-                    else:
-                        print(f"[StartupCatchup] Daily digest already sent today — skipping.")
-                else:
-                    print(f"[StartupCatchup] Outside digest window ({hour_local}h) — skipping digest.")
+                print(f"[StartupCatchup] Running walk-forward OOS validation …")
+                _scheduled_walk_forward_oos()
+                tasks_run.append("walk_forward_oos")
             except Exception as _e:
-                print(f"[StartupCatchup] daily_digest check failed: {_e}")
+                print(f"[StartupCatchup] WFO failed: {_e}")
 
             _st.sleep(10)
 

@@ -10041,8 +10041,15 @@ def _scheduled_uat_health_report():
     lines.append(f"")
     lines.append(f"<i>Day {days_accumulated if 'days_accumulated' in dir() else 0}/30 toward first WFO Sharpe evaluation. "
                 f"Next milestone: {30 - (days_accumulated if 'days_accumulated' in dir() else 0)} days.</i>")
+    lines.append(f"")
+    lines.append(f"<b>🔄 Safe shutdown window: 5:00 PM – 4:30 AM AEST</b>")
+    lines.append(f"   After today's 4:30 PM health report, safe to power off until 4:30 AM tomorrow.")
+    lines.append(f"   Startup catch-up will re-run any missed jobs on next boot.")
 
     message = "\n".join(lines)
+
+    # Count warnings — if any present, suppress this job execution as needing human review
+    has_warnings = any(l.startswith("⚠️") for l in lines)
 
     # Broadcast to all Telegram users
     try:
@@ -10061,6 +10068,31 @@ def _scheduled_uat_health_report():
                     digest_key=digest_key, source="uat_health_watchdog",
                     delivery_mode="auto",
                 )
+
+            # ── URGENT ALERT: if anything has ⚠️, send a separate high-priority message ──
+            if has_warnings:
+                alert_key = f"uat_alert_{today.isoformat()}"
+                if not has_digest_been_sent(uid, market="AU", digest_key=alert_key):
+                    alert_lines = [
+                        "🚨 <b>UAT HEALTH ALERT — ACTION REQUIRED</b>",
+                        "",
+                        "The 4:30 PM health report detected ⚠️ conditions:",
+                        "",
+                    ]
+                    warning_lines = [l for l in lines if l.startswith("⚠️")]
+                    alert_lines.extend(warning_lines[:5])
+                    alert_lines.append("")
+                    alert_lines.append(f"Full report sent separately. Investigate before next 5 AM scan.")
+                    alert_lines.append(f"Shutdown window remains: 5:00 PM – 4:30 AM AEST.")
+                    alert_message = "\n".join(alert_lines)
+                    _send_telegram_payload(
+                        alert_message, recipients, user_id=uid,
+                        message_type="uat_health_alert",
+                        market="AU",
+                        digest_key=alert_key,
+                        source="uat_health_alert",
+                        delivery_mode="auto",
+                    )
     except Exception as e:
         print(f"[UATHealth] Broadcast failed: {e}")
 

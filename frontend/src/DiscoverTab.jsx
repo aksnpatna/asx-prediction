@@ -1,4 +1,5 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
+import { Line } from 'react-chartjs-2'
 
 const zoneColors = { clear: '#00a854', caution: '#f59e0b', avoid: '#e5281e' }
 const zoneEmoji  = { clear: '🟢', caution: '🟡', avoid: '🔴' }
@@ -10,19 +11,14 @@ const WARN_LABELS = {
   overbought:        'RSI above 70 — stock may be overbought, pullback risk.',
 }
 
-function getMockWinRate(symbol) {
-  let hash = 0;
-  for (let i = 0; i < symbol.length; i++) hash = symbol.charCodeAt(i) + ((hash << 5) - hash);
-  const hits = 6 + (Math.abs(hash) % 4); // 6 to 9
-  return `Model has successfully predicted a 5%+ jump on this stock ${hits} out of the last 10 times.`;
-}
+
 
 function ScoreBadge({ score }) {
   const pct = Math.round((score || 0) * 100)
   const color = pct >= 70 ? '#00a854' : pct >= 50 ? '#f59e0b' : '#e5281e'
   return (
     <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-      <div style={{ width:48, height:6, background:'#e5e7eb', borderRadius:3, overflow:'hidden' }}>
+      <div style={{ width:48, height:6, background:'var(--border-color)', borderRadius:3, overflow:'hidden' }}>
         <div style={{ width:`${pct}%`, height:'100%', background:color, borderRadius:3 }} />
       </div>
       <span style={{ fontSize:12, fontWeight:700, color }}>{(score||0).toFixed(2)}</span>
@@ -36,16 +32,16 @@ function SpotlightCard({ c, idx, onBuy }) {
   const upside = c.analyst_upside_pct
   return (
     <div style={{
-      background:'linear-gradient(135deg,#0f172a 0%,#1e293b 100%)',
-      border:`2px solid ${zoneColors[zone] || '#334155'}`,
+      background:'linear-gradient(135deg,var(--text-primary) 0%,var(--text-primary) 100%)',
+      border:`2px solid ${zoneColors[zone] || 'var(--border-strong)'}`,
       borderRadius:12, padding:20, position:'relative', overflow:'hidden',
       minWidth:0, flex:'1 1 240px',
     }}>
-      <div style={{ position:'absolute', top:0, right:0, padding:'6px 12px', background:zoneColors[zone]||'#334155', borderBottomLeftRadius:8, fontSize:11, fontWeight:700, color:'#fff' }}>
+      <div style={{ position:'absolute', top:0, right:0, padding:'6px 12px', background:zoneColors[zone]||'var(--border-strong)', borderBottomLeftRadius:8, fontSize:11, fontWeight:700, color:'var(--bg-secondary)' }}>
         #{idx+1} {zoneEmoji[zone]} {zone.toUpperCase()}
       </div>
       <div style={{ marginBottom:8 }}>
-        <div style={{ fontSize:22, fontWeight:800, color:'#f1f5f9', letterSpacing:1 }}>{c.symbol}</div>
+        <div style={{ fontSize:22, fontWeight:800, color:'var(--bg-tertiary)', letterSpacing:1 }}>{c.symbol}</div>
         <div style={{ fontSize:12, color:'#94a3b8', marginTop:2 }}>{(c.name||'').slice(0,36)}</div>
       </div>
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
@@ -57,17 +53,21 @@ function SpotlightCard({ c, idx, onBuy }) {
         ].map(([k,v])=>(
           <div key={k}>
             <div style={{ fontSize:10, color:'#64748b', textTransform:'uppercase', letterSpacing:1 }}>{k}</div>
-            <div style={{ fontSize:15, fontWeight:700, color:'#e2e8f0', marginTop:2 }}>{v}</div>
+            <div style={{ fontSize:15, fontWeight:700, color:'var(--border-color)', marginTop:2 }}>{v}</div>
           </div>
         ))}
       </div>
-      <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6 }}>{et.reason}</div>
-      <div style={{ fontSize:10, color:'#38bdf8', marginBottom:12, padding:'4px 6px', background:'#0ea5e915', borderRadius:4 }}>
-        🎯 {getMockWinRate(c.symbol)}
+      
+      <div style={{ padding:'8px 10px', background:'#5f1515', border:'1px solid #991b1b', borderRadius:6, marginBottom:12 }}>
+        <p style={{ margin:0, color:'rgba(255, 51, 51, 0.3)', fontSize:10, fontWeight:700, lineHeight:1.4 }}>
+          ⚠️ PREMORTEM GUARDRAIL: <span style={{fontWeight:400}}>Verify no upcoming earnings or recent stock splits. AI strictly evaluates technical price action and is blind to binary corporate events.</span>
+        </p>
       </div>
+
+      <div style={{ fontSize:11, color:'#94a3b8', marginBottom:12 }}>{et.reason}</div>
       <button onClick={()=>onBuy(c)} style={{
         width:'100%', padding:'9px 0', background:'linear-gradient(90deg,#00a854,#00c96e)',
-        border:'none', borderRadius:6, color:'#fff', fontWeight:700, fontSize:13, cursor:'pointer',
+        border:'none', borderRadius:6, color:'var(--bg-secondary)', fontWeight:700, fontSize:13, cursor:'pointer',
       }}>✅ I'm Buying This</button>
     </div>
   )
@@ -75,19 +75,100 @@ function SpotlightCard({ c, idx, onBuy }) {
 
 function ExpandPanel({ label, children }) {
   return (
-    <div style={{ background:'#fff', border:'1px solid #e2e8f0', borderRadius:6, padding:12 }}>
-      <p style={{ fontWeight:700, fontSize:12, marginBottom:8, color:'#334155' }}>{label}</p>
+    <div style={{ background:'var(--bg-secondary)', border:'1px solid var(--border-color)', borderRadius:6, padding:12 }}>
+      <p style={{ fontWeight:700, fontSize:12, marginBottom:8, color:'var(--border-strong)' }}>{label}</p>
       {children}
     </div>
   )
 }
 
-function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
+function VolatilityMeter({ score, capRiskNote }) {
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 4 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--border-strong)' }}>Volatility Rating</span>
+        <span style={{ fontSize: 13, fontWeight: 800, color: score <= 3 ? '#00a854' : score <= 6 ? '#f59e0b' : '#e5281e' }}>{score}/10</span>
+      </div>
+      <div style={{ display: 'flex', gap: 2 }}>
+        {[1,2,3,4,5,6,7,8,9,10].map(n => {
+          let bgColor = 'var(--border-color)';
+          if (n <= score) {
+            if (score <= 3) bgColor = '#00a854';
+            else if (score <= 6) bgColor = '#f59e0b';
+            else bgColor = '#e5281e';
+          }
+          return (
+            <div key={n} style={{ flex: 1, height: 8, borderRadius: 1, background: bgColor }} />
+          )
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: '#64748b', marginTop: 6, lineHeight: 1.4 }}>
+        {capRiskNote}
+      </div>
+    </div>
+  )
+}
+
+function CandidateRow({ c, idx, isExpanded, onToggle, onBuy, budgetInfo }) {
   const et   = c.entry_timing || {}
   const zone = (et.entry_zone || 'caution').toLowerCase()
   const upside = c.analyst_upside_pct
-  const predChg = c.predicted_change_pct || 0
+  const predChg = c.predicted_change_pct || c.expected_return_3m_pct || 0
+  const predPrice = c.predicted_price_3m || c.predicted_price
   const warnMsg = WARN_LABELS[c.warning_type] || c.warning_message || 'Elevated risk — review before trading.'
+
+  const [newsData, setNewsData] = useState(null)
+  const [newsLoading, setNewsLoading] = useState(false)
+  const [graphData, setGraphData] = useState(null)
+  const [graphLoading, setGraphLoading] = useState(false)
+
+  useEffect(() => {
+    if (isExpanded && !graphData && !graphLoading) {
+      setGraphLoading(true);
+      fetch(`${import.meta.env.VITE_API_URL || '/api'}/ai/analyze/${c.symbol}?market=${c.market||'AU'}`)
+        .then(r => r.json())
+        .then(d => setGraphData(d))
+        .catch(e => console.error(e))
+        .finally(() => setGraphLoading(false));
+    }
+  }, [isExpanded, c.symbol, c.market]);
+
+  const loadNews = async () => {
+    if (newsData) return;
+    setNewsLoading(true);
+    try {
+      const res = await fetch(`/api/analyze/sentiment?symbol=${c.symbol}`);
+      if (res.ok) {
+        const data = await res.json();
+        setNewsData(data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    setNewsLoading(false);
+  };
+
+  let sizingSuggestion = 'Standard Size (e.g. $2,500)';
+  if (budgetInfo && budgetInfo.budget_set && budgetInfo.remaining_capital > 0) {
+    const maxForPosition = Math.min(budgetInfo.max_per_position || budgetInfo.remaining_capital, budgetInfo.remaining_capital);
+    const scoreMultiplier = (c.score || 0) >= 0.7 ? 1.0 : (c.score || 0) >= 0.5 ? 0.7 : 0.5;
+    let target = maxForPosition * scoreMultiplier;
+    if (c.high_volatility_warning) target *= 0.6;
+    sizingSuggestion = `$${target.toFixed(0)} (Max allowed: $${maxForPosition.toFixed(0)})`;
+  }
+
+  let capRiskNote = 'Standard Volatility';
+  let volatilityScore = 5;
+  if (c.market_cap) {
+    if (c.market_cap < 300000000) { capRiskNote = 'High Volatility (Micro Cap) - Historically prone to extreme swings and low liquidity. Reduce position size.'; volatilityScore = 9; }
+    else if (c.market_cap < 2000000000) { capRiskNote = 'Moderate Volatility (Small Cap) - Higher growth potential but wider spreads. Stick to limits.'; volatilityScore = 7; }
+    else if (c.market_cap < 10000000000) { capRiskNote = 'Balanced (Mid Cap) - Established business but can move aggressively on news.'; volatilityScore = 4; }
+    else { capRiskNote = 'Lower Volatility (Large Cap) - Established blue chip, safer historical tracking.'; volatilityScore = 2; }
+  }
+  if (c.high_volatility_warning) {
+    volatilityScore = Math.min(10, volatilityScore + 2);
+    capRiskNote += ' ⚠️ Active volatility warning detected.';
+  }
 
   return (
     <>
@@ -108,10 +189,10 @@ function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
         <td><ScoreBadge score={c.score} /></td>
         <td>{(c.prob_ge_5pct||0).toFixed(1)}%</td>
         <td style={{ color: predChg>=0?'#00a854':'#e5281e', fontWeight:600 }}>
-          {predChg>=0?'+':''}{predChg.toFixed(1)}%
+          {predPrice ? `$${predPrice.toFixed(2)} ` : ''}({predChg>=0?'+':''}{predChg.toFixed(1)}%)
         </td>
         <td style={{ color: (upside||0)>=0?'#00a854':'#e5281e', fontWeight:600 }}>
-          {upside!=null?`${upside>=0?'+':''}${upside.toFixed(1)}%`:'—'}
+          {c.analyst_target_mean ? `$${c.analyst_target_mean.toFixed(2)} ` : ''}{upside!=null?`(${upside>=0?'+':''}${upside.toFixed(1)}%)`:'—'}
         </td>
         <td style={{ color:zoneColors[zone]||'#94a3b8', fontWeight:700, fontSize:12 }}>
           {zoneEmoji[zone]} {zone.toUpperCase()}
@@ -128,14 +209,17 @@ function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
       </tr>
       {isExpanded && (
         <tr>
-          <td colSpan={10} style={{ background:'#f8fafc', padding:16 }}>
+          <td colSpan={10} style={{ background:'var(--bg-tertiary)', padding:16, whiteSpace: 'normal', wordWrap: 'break-word' }}>
+            <div style={{ padding:'10px 12px', background:'#fee2e2', border:'1px solid rgba(255, 51, 51, 0.3)', borderRadius:6, marginBottom:14 }}>
+              <p style={{ margin:0, color:'var(--ig-red)', fontSize:11, fontWeight:700, lineHeight: 1.5 }}>
+                🚨 CRITICAL SYSTEM GUARDRAIL CHECK: 
+                <span style={{fontWeight:500}}> The algorithmic engine is statistically robust but strictly blind to sudden binary events. Before buying, you MUST manually verify: 1) No Earnings Reports in the next 3 days, 2) No unadjusted stock splits/special dividends artificially warping the price chart, and 3) Prepare for "Fat Tail" unpredictable news drops in Micro-Caps.</span>
+              </p>
+            </div>
             <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(210px,1fr))', gap:12 }}>
               <ExpandPanel label="📅 Entry Timing & Accuracy">
                 <p style={{ fontSize:12, color:zoneColors[zone], fontWeight:700, marginBottom:4 }}>{zoneEmoji[zone]} {zone.toUpperCase()}</p>
-                <p style={{ fontSize:11, color:'#64748b', marginBottom:4 }}>{et.reason}</p>
-                <div style={{ fontSize:10, color:'#0284c7', marginBottom:8, padding:'4px 6px', background:'#e0f2fe', borderRadius:4 }}>
-                  🎯 {getMockWinRate(c.symbol)}
-                </div>
+                <p style={{ fontSize:11, color:'#64748b', marginBottom:8, lineHeight:1.5 }}>{et.reason}</p>
                 <p style={{ fontSize:11 }}>Earnings risk: <strong>{(et.earnings_risk||'—').toUpperCase()}</strong></p>
                 <p style={{ fontSize:11 }}>Technicals: <strong>{et.technical_confirmed?'✅ Confirmed':'❌ Not confirmed'}</strong></p>
               </ExpandPanel>
@@ -145,10 +229,11 @@ function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
                   ['Fwd P/E', c.forward_pe?`${c.forward_pe.toFixed(1)}x`:'—'],
                   ['EPS Growth', c.eps_growth_fwd_pct!=null?`${c.eps_growth_fwd_pct>0?'+':''}${c.eps_growth_fwd_pct.toFixed(1)}%`:'—'],
                   ['Analyst Target', c.analyst_target_mean?`$${c.analyst_target_mean.toFixed(2)}`:'—'],
+                  ['Dividend Yield', c.dividend_yield?`${c.dividend_yield.toFixed(1)}%`:'—'],
+                  ['52w Range', (c['52w_low'] && c['52w_high']) ? `$${c['52w_low'].toFixed(2)} - $${c['52w_high'].toFixed(2)}` : '—'],
                   ['Short Interest', c.short_pct_float!=null?`${c.short_pct_float.toFixed(1)}%`:'—'],
-                  ['From 52w High', c.pct_from_52w_high!=null?`${c.pct_from_52w_high.toFixed(1)}%`:'—'],
                 ].map(([k,v])=>(
-                  <div key={k} style={{ display:'flex', justifyContent:'space-between', fontSize:11, borderBottom:'1px solid #f1f5f9', padding:'3px 0' }}>
+                  <div key={k} style={{ display:'flex', justifyContent:'space-between', fontSize:11, borderBottom:'1px solid var(--bg-tertiary)', padding:'3px 0' }}>
                     <span style={{ color:'#64748b' }}>{k}</span><strong>{v}</strong>
                   </div>
                 ))}
@@ -163,12 +248,13 @@ function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
                     Earnings: {c.next_earnings_date||'N/A'}
                     {(c.days_to_earnings||999)<=14?' ⚠️ NEAR':''}
                   </li>
-                  <li>Sector: {c.valuation?.sector||'—'}</li>
+                  <li>Sector: {c.sector || c.valuation?.sector || '—'}</li>
+                  <li>Industry: {c.industry || '—'}</li>
                   <li>Analysts covering: {c.num_analyst_opinions||'—'}</li>
                   <li>Trend: {(c.trend||'—').toUpperCase()}</li>
                 </ul>
                 <p style={{ fontSize:10, color:'#94a3b8', marginTop:6 }}>
-                  Suggested stop: ~8% below entry | Target: ${c.analyst_target_mean?.toFixed(2)||'—'}
+                  Suggested stop: 5-6% below entry (cap tier dependent) | Target: ${c.analyst_target_mean?.toFixed(2)||'—'}
                 </p>
               </ExpandPanel>
               <ExpandPanel label="📈 Quality & Momentum">
@@ -180,10 +266,77 @@ function CandidateRow({ c, idx, isExpanded, onToggle, onBuy }) {
                   ['vs Sector 3m', c.rel_strength_3m!=null?`${c.rel_strength_3m>=0?'+':''}${c.rel_strength_3m.toFixed(1)}%`:'—'],
                   ['EPS Flags', (c.earnings_quality_flags||[]).length>0?(c.earnings_quality_flags||[]).join(', '):'✓ All clear'],
                 ].map(([k,v])=>(
-                  <div key={k} style={{ display:'flex', justifyContent:'space-between', fontSize:11, borderBottom:'1px solid #f1f5f9', padding:'3px 0' }}>
+                  <div key={k} style={{ display:'flex', justifyContent:'space-between', fontSize:11, borderBottom:'1px solid var(--bg-tertiary)', padding:'3px 0' }}>
                     <span style={{ color:'#64748b' }}>{k}</span><strong>{v}</strong>
                   </div>
                 ))}
+              </ExpandPanel>
+              <ExpandPanel label="📊 14-Day Traceability">
+                {graphLoading ? (
+                  <p style={{fontSize:11, color:'#64748b'}}>Loading historical accuracy...</p>
+                ) : graphData?.weekly_data?.length > 0 ? (
+                  <div style={{ position: 'relative', height: 180 }}>
+                    <Line
+                      data={{
+                        labels: graphData.weekly_data.map(d => d.date),
+                        datasets: [
+                          { label: 'Actual', data: graphData.weekly_data.map(d => d.actual_price), borderColor: '#00a854', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, tension: 0.2 },
+                          { label: 'Predicted', data: graphData.weekly_data.map(d => d.predicted_price), borderColor: '#d4ac0d', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, tension: 0.2, borderDash: [5,5] }
+                        ]
+                      }}
+                      options={{
+                        responsive: true, maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: { x: { display: false }, y: { ticks: { fontSize: 9 } } }
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <p style={{fontSize:11, color:'#64748b'}}>No recent tracking data available.</p>
+                )}
+              </ExpandPanel>
+
+              <ExpandPanel label="💼 Strategy Mix & Position Sizing">
+                <p style={{ fontSize:11, color:'#64748b', marginBottom:8, lineHeight:1.6 }}>
+                  Based on your configured total budget, our algorithm suggests scaling into this trade proportionally.
+                </p>
+                <div style={{ background:'var(--bg-tertiary)', padding:10, borderRadius:6, marginBottom:10 }}>
+                  <div style={{ fontSize:11, color:'#64748b', textTransform:'uppercase', letterSpacing:1 }}>Suggested Size</div>
+                  <div style={{ fontSize:16, fontWeight:700, color:'var(--text-primary)' }}>{sizingSuggestion}</div>
+                </div>
+                <VolatilityMeter score={volatilityScore} capRiskNote={capRiskNote} />
+              </ExpandPanel>
+
+              <ExpandPanel label="📰 Sentiment & News">
+                {!newsData ? (
+                  <div style={{ textAlign: 'center', padding: '10px 0' }}>
+                    <button onClick={loadNews} disabled={newsLoading} style={{
+                      padding:'6px 12px', background:'var(--border-color)', color:'var(--text-secondary)', borderRadius:6, border:'none', fontSize:11, fontWeight:600, cursor:newsLoading?'not-allowed':'pointer'
+                    }}>
+                      {newsLoading ? 'Fetching latest news...' : 'Load Latest EODHD News & Sentiment'}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    {(!newsData.news || newsData.news.length === 0 || (newsData.news.length === 1 && newsData.news[0].title.startsWith("No recent news"))) ? (
+                      <p style={{ fontSize:11, color:'#64748b', textAlign: 'center', padding: '10px 0' }}>No recent news available for this ticker.</p>
+                    ) : (
+                      <>
+                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
+                          <span style={{ fontSize:12, fontWeight:700 }}>Overall: <span style={{ color: newsData.score >= 0.2 ? '#00a854' : newsData.score <= -0.2 ? '#e5281e' : '#f59e0b' }}>{newsData.sentiment.toUpperCase()}</span></span>
+                          <span style={{ fontSize:10, color:'#94a3b8' }}>Score: {newsData.score?.toFixed(2)}</span>
+                        </div>
+                        <p style={{ fontSize:11, color:'var(--text-secondary)', marginBottom:10, lineHeight:1.5 }}>{newsData.summary}</p>
+                        <div style={{ fontSize:11, fontWeight:700, marginBottom:4 }}>Headlines:</div>
+                        <ul style={{ paddingLeft:16, margin:0, fontSize:10, color:'#64748b', lineHeight:1.5 }}>
+                          {(newsData.news || []).slice(0,4).map((n, i) => (
+                            <li key={i}>{n.title}</li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                  </div>
+                )}
               </ExpandPanel>
             </div>
           </td>
@@ -273,16 +426,75 @@ export default function DiscoverTab({
     overbought:        'RSI above 70 — may be overbought and due for pullback.',
   }
 
+  // Cap grouping
+  const largeCap = filtered.filter(c => c.market_cap >= 10000000000).sort((a,b)=>(b.score||0)-(a.score||0));
+  const midCap = filtered.filter(c => c.market_cap >= 2000000000 && c.market_cap < 10000000000).sort((a,b)=>(b.score||0)-(a.score||0));
+  const smallCap = filtered.filter(c => c.market_cap == null || c.market_cap < 2000000000).sort((a,b)=>(b.score||0)-(a.score||0));
+
+  // If a cap is empty after filtering, grab top 3 from unfiltered candidates of that cap size
+  if (largeCap.length === 0) {
+    largeCap.push(...candidates.filter(c => c.market_cap >= 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
+  }
+  if (midCap.length === 0) {
+    midCap.push(...candidates.filter(c => c.market_cap >= 2000000000 && c.market_cap < 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
+  }
+  if (smallCap.length === 0) {
+    smallCap.push(...candidates.filter(c => c.market_cap == null || c.market_cap < 2000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
+  }
+
+  const renderCapTable = (title, list, capType) => (
+    <div style={{ marginBottom: 24 }}>
+      <h3 style={{ margin:'0 0 10px 0', fontSize:14, color:'var(--text-secondary)' }}>{title}</h3>
+      {list.length === 0 ? (
+        <div style={{ padding: 12, background: 'var(--bg-tertiary)', borderRadius: 8, color: '#94a3b8', fontSize: 13 }}>
+          No candidates found in this category.
+        </div>
+      ) : (
+        <div className="table-wrap" style={{ margin:0, border:'1px solid var(--border-color)', borderRadius:8 }}>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Symbol</th><th>Price</th><th>Score</th>
+                <th>P(≥5%)</th><th>AI Target (3M)</th><th>Analyst Target</th>
+                <th>Entry</th><th></th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.map((c,idx)=>{
+                // Ensure unique key if grabbed from unfiltered list
+                const isFilteredOut = !filtered.find(fc => fc.symbol === c.symbol);
+                return (
+                  <React.Fragment key={`${capType}-${c.symbol}`}>
+                    {isFilteredOut && idx === 0 && (
+                       <tr><td colSpan={10} style={{ padding:'8px 12px', background:'rgba(255, 184, 0, 0.1)', color:'var(--ig-warning)', fontSize:11, fontWeight:600 }}>
+                         Note: Top {list.length} shown below did not meet the "{filterZone}" or score filters, but are listed for reference.
+                       </td></tr>
+                    )}
+                    <CandidateRow c={c} idx={idx}
+                      isExpanded={expandedRow===`${capType}-${idx}`}
+                      onToggle={()=>setExpandedRow(expandedRow===`${capType}-${idx}`?null:`${capType}-${idx}`)}
+                      onBuy={onBuy}
+                      budgetInfo={budgetInfo} />
+                  </React.Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+
   return (
     <div>
       {/* ── Header bar ─────────────────────────────────────────── */}
       <div style={{
-        background:'linear-gradient(135deg,#0f172a 0%,#1e293b 100%)',
+        background:'linear-gradient(135deg,var(--text-primary) 0%,var(--text-primary) 100%)',
         borderRadius:10, padding:'18px 22px', marginBottom:16,
         display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:12,
       }}>
         <div>
-          <h2 style={{ margin:0, color:'#f1f5f9', fontSize:18, fontWeight:800 }}>
+          <h2 style={{ margin:0, color:'var(--bg-tertiary)', fontSize:18, fontWeight:800 }}>
             🔍 Discover — {EXCHANGE_LABELS[preferredMarket]} Deep Scan
           </h2>
           <p style={{ margin:'4px 0 0', color:'#64748b', fontSize:12 }}>
@@ -299,8 +511,8 @@ export default function DiscoverTab({
               onClick={()=>{ setFilterZone(z); setExpandedRow(null) }}
               style={{
                 padding:'5px 12px', borderRadius:20, fontSize:11, fontWeight:700, cursor:'pointer', border:'none',
-                background: filterZone===z ? (z==='all'?'#475569':zoneColors[z]||'#475569') : '#1e293b',
-                color: filterZone===z ? '#fff' : '#94a3b8',
+                background: filterZone===z ? (z==='all'?'var(--text-secondary)':zoneColors[z]||'var(--text-secondary)') : 'var(--text-primary)',
+                color: filterZone===z ? 'var(--bg-secondary)' : '#94a3b8',
               }}>
               {z==='all'?'All':zoneEmoji[z]+' '+z.charAt(0).toUpperCase()+z.slice(1)}
               {z!=='all' && ` (${z==='clear'?clearCount:z==='caution'?cautionCount:avoidCount})`}
@@ -331,15 +543,6 @@ export default function DiscoverTab({
       <section className="panel" style={{ marginBottom:16 }}>
         <div className="section-header">
           <h2>📊 Full Scored Feed {filtered.length<candidates.length && `— ${filtered.length} of ${candidates.length} shown`}</h2>
-          <div style={{ display:'flex', gap:8, alignItems:'center' }}>
-            <label style={{ fontSize:11, color:'var(--ig-medium)' }}>
-              Min Score:
-              <input type="range" min={0} max={0.9} step={0.05} value={minScore}
-                onChange={e=>setMinScore(parseFloat(e.target.value))}
-                style={{ marginLeft:6, width:80 }} />
-              <span style={{ marginLeft:4, fontWeight:700 }}>{minScore.toFixed(2)}</span>
-            </label>
-          </div>
         </div>
         <p className="section-note">
           Click any row to expand full detail — valuation, risk checklist, entry timing, and quality metrics.
@@ -350,31 +553,46 @@ export default function DiscoverTab({
             <button className="btn-secondary" style={{ marginLeft:8 }} onClick={fetchCachedWealthScan}>Check Now</button>
           </p>
         ) : (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>#</th><th>Symbol</th><th>Price</th><th>Score</th>
-                  <th>P(≥5%)</th><th>Forecast</th><th>Upside</th>
-                  <th>Entry</th><th></th><th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((c,idx)=>(
-                  <CandidateRow key={c.symbol} c={c} idx={idx}
-                    isExpanded={expandedRow===idx}
-                    onToggle={()=>setExpandedRow(expandedRow===idx?null:idx)}
-                    onBuy={onBuy} />
-                ))}
-                {filtered.length===0 && (
-                  <tr><td colSpan={10} style={{ textAlign:'center', color:'var(--ig-muted)', padding:24 }}>
-                    No candidates match current filters.
-                  </td></tr>
-                )}
-              </tbody>
-            </table>
+          <div>
+            {renderCapTable('Large Cap (>$10B)', largeCap, 'large')}
+            {renderCapTable('Mid Cap ($2B - $10B)', midCap, 'mid')}
+            {renderCapTable('Small & Micro Cap (<$2B)', smallCap, 'small')}
           </div>
         )}
+      </section>
+
+      {/* ── ETFs & Commodities Spotlight ────────────────────────── */}
+      <section className="panel" style={{ marginBottom:16 }}>
+        <div className="section-header">
+          <h2>🪙 ETFs & Commodities Spotlight</h2>
+        </div>
+        <p className="section-note">
+          A dedicated view for broad indices and precious metals. (Suggested selections — automated scanning coming soon!)
+        </p>
+        <div className="table-wrap" style={{ margin:0, border:'1px solid var(--border-color)', borderRadius:8 }}>
+          <table className="data-table">
+            <thead>
+              <tr><th>Asset</th><th>Type</th><th>Rationale</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={{ fontWeight:700 }}>GOLD.AX</td>
+                <td style={{ color:'#64748b' }}>Physical Gold ETF</td>
+                <td style={{ fontSize:12, color:'var(--text-secondary)' }}>Excellent hedge against high market volatility and inflation.</td>
+              </tr>
+              <tr>
+                <td style={{ fontWeight:700 }}>NDQ.AX</td>
+                <td style={{ color:'#64748b' }}>NASDAQ 100 ETF</td>
+                <td style={{ fontSize:12, color:'var(--text-secondary)' }}>Broad tech exposure. High momentum in low-rate environments.</td>
+              </tr>
+              <tr>
+                <td style={{ fontWeight:700 }}>IOZ.AX</td>
+                <td style={{ color:'#64748b' }}>ASX 200 ETF</td>
+                <td style={{ fontSize:12, color:'var(--text-secondary)' }}>Core portfolio foundation tracking the broad Australian market.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       {/* ── Ranked Candidates (collapsible) ─────────────────────── */}

@@ -19,3 +19,8 @@ pyportfolioopt
 packaging
 pycoingecko==3.1.0
 apscheduler==3.10.4
+langchain
+langgraph
+langchain-openai
+langchain-community
+tavily-python

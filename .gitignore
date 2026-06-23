@@ -49,3 +49,4 @@ bc2b54c5-*.json
 
 # Large binary packages
 *.deb
+graphify-out/

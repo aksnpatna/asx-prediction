@@ -1,0 +1,6 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "plugin": [
+    "file:///home/aksai/projects/asx-prediction/.kilo/plugins/graphify.js"
+  ]
+}

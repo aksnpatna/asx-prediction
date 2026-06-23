@@ -28,6 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import numpy as np
+import threading
 from openai import OpenAI
 try:
     from groq import Groq as GroqClient
@@ -43,7 +44,13 @@ from sqlalchemy.exc import SQLAlchemyError
 import yfinance as yf
 
 try:
-    from pypfopt import EfficientFrontier, risk_models, expected_returns
+    from agentic_brain import run_agentic_analysis
+except ImportError as e:
+    print(f"Agentic Brain not loaded: {e}")
+    run_agentic_analysis = None
+
+try:
+    from pypfopt import EfficientFrontier, risk_models, expected_returns, HRPOpt
     PYPFOPT_AVAILABLE = True
 except ImportError:
     PYPFOPT_AVAILABLE = False
@@ -61,6 +68,27 @@ except ImportError:
     EDGAR_AVAILABLE = False
 
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+EODHD_API_KEY = os.getenv("EODHD_API_KEY", "").strip()
+
+# ── UAT / Production Mode ─────────────────────────────────────────────────────
+# Set ENV=UAT to enable safety guards: reduced scan cap, options channel disabled,
+# extra inter-call sleep, and dry-run mode for LLM calls.
+UAT_MODE = os.getenv("ENV", "production").upper() == "UAT"
+
+# ── EODHD Rate Limiter (thread-safe token bucket for 20 calls/min free tier) ──
+_EODHD_RATE_LOCK = threading.Lock()
+_EODHD_LAST_CALL = 0.0
+_EODHD_MIN_INTERVAL = 1.5  # 40 calls/min — EODHD free tier handles bursts above 20/min
+
+def _eodhd_rate_limit():
+    """Block the calling thread until the EODHD rate-limit window reopens."""
+    global _EODHD_LAST_CALL
+    with _EODHD_RATE_LOCK:
+        now = time.time()
+        wait = _EODHD_MIN_INTERVAL - (now - _EODHD_LAST_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        _EODHD_LAST_CALL = time.time()
 
 # Initialise FRED client if key is available
 _fred_client = None
@@ -69,6 +97,81 @@ if FREDAPI_AVAILABLE and FRED_API_KEY:
         _fred_client = Fred(api_key=FRED_API_KEY)
     except Exception:
         _fred_client = None
+
+
+# ── EODHD Dynamic Universe Cache ─────────────────────────────────────────────
+# When EODHD_API_KEY is set (paid plan), we fetch the full ASX common-stock
+# list (~1,600+ tickers) instead of relying on the 257-ticker hardcoded dict.
+# This is cached in-memory for 24 hours and refreshed at startup.
+_EODHD_ASX_UNIVERSE: Optional[dict] = None   # {code: name}
+_EODHD_ASX_UNIVERSE_TS: float = 0.0
+_EODHD_UNIVERSE_TTL: float = 86400.0  # 24 hours
+
+
+def _fetch_eodhd_asx_universe() -> dict:
+    """Fetch the full ASX common-stock list from EODHD exchange-symbol-list.
+
+    Returns a {ticker: name} dict of clean 2-5 letter ASX codes.  Falls back
+    to an empty dict on any error so callers can fall back to ASX_COMPANIES.
+    Applies a minimal pre-filter:
+      - Type = 'Common Stock' only (excludes Funds, Notes, Preferred)
+      - Code must match ^[A-Z]{2,5}$ (real ASX ticker format)
+      - Skips obvious micro-cap / shell name patterns to reduce scan noise
+    """
+    if not EODHD_API_KEY:
+        return {}
+    try:
+        resp = requests.get(
+            "https://eodhd.com/api/exchange-symbol-list/AU",
+            params={"api_token": EODHD_API_KEY, "fmt": "json"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            print(f"[EODHD Universe] HTTP {resp.status_code} — falling back to hardcoded list")
+            return {}
+        data = resp.json()
+        universe: dict = {}
+        skip_words = {"ltd", "limited", "resources", "minerals", "metals"}  # not skip words, just common
+        # Words that strongly suggest shells / tiny illiquid tickers we want to exclude
+        shell_words = {"dormant", "administration", "liquidat", "suspended"}
+        for item in data:
+            code = item.get("Code", "")
+            name = item.get("Name") or ""
+            typ  = item.get("Type", "")
+            if typ != "Common Stock":
+                continue
+            if not re.match(r"^[A-Z]{2,5}$", code):
+                continue
+            name_lower = name.lower()
+            if any(w in name_lower for w in shell_words):
+                continue
+            universe[code] = name
+        print(f"[EODHD Universe] Loaded {len(universe)} ASX common stocks")
+        return universe
+    except Exception as exc:
+        print(f"[EODHD Universe] Failed to fetch: {exc}")
+        return {}
+
+
+def get_asx_universe() -> dict:
+    """Return the best available ASX universe dict {ticker: name}.
+
+    Priority:
+      1. EODHD dynamic list (refreshed every 24h) — 1,600+ stocks
+      2. Hardcoded ASX_COMPANIES — 257 curated stocks
+    """
+    global _EODHD_ASX_UNIVERSE, _EODHD_ASX_UNIVERSE_TS
+    now = time.time()
+    if EODHD_API_KEY:
+        if _EODHD_ASX_UNIVERSE is None or (now - _EODHD_ASX_UNIVERSE_TS) > _EODHD_UNIVERSE_TTL:
+            fetched = _fetch_eodhd_asx_universe()
+            if fetched:
+                _EODHD_ASX_UNIVERSE = fetched
+                _EODHD_ASX_UNIVERSE_TS = now
+        if _EODHD_ASX_UNIVERSE:
+            return _EODHD_ASX_UNIVERSE
+    return ASX_COMPANIES
+
 
 
 def get_macro_indicators() -> dict:
@@ -93,6 +196,16 @@ def get_macro_indicators() -> dict:
     return result
 
 
+# Dynamic ML multipliers modified by the Self-Learning Loop
+DYNAMIC_PENALTIES = {
+    "vix_extreme": 0.75,
+    "vix_high": 0.88,
+    "pe_extreme": 0.70,
+    "pe_high": 0.85,
+    "short_extreme": 0.50,
+    "short_high": 0.75
+}
+
 # Initialize FastAPI
 app = FastAPI(title="ASX Stock Predictor API", version="1.0.0")
 
@@ -111,19 +224,139 @@ LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "deepseek-r1:7b")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
+# Provider order: defaults to deepseek → nvidia → groq → local → openai
+_default_order = os.getenv("LLM_PROVIDER_ORDER", "deepseek,nvidia,groq,local,openai")
 LLM_PROVIDER_ORDER = [
     provider.strip().lower()
-    for provider in os.getenv("LLM_PROVIDER_ORDER", "groq,local,openai").split(",")
+    for provider in _default_order.split(",")
     if provider.strip()
 ]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 groq_client = GroqClient(api_key=GROQ_API_KEY) if (GROQ_SDK_AVAILABLE and GROQ_API_KEY) else None
+
+# ── Nvidia NIM client (OpenAI-compatible endpoint) ────────────────────────────
+nvidia_client = None
+if NVIDIA_API_KEY:
+    try:
+        nvidia_client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=NVIDIA_API_KEY,
+        )
+    except Exception:
+        nvidia_client = None
+
+# ── DeepSeek client (OpenAI-compatible, native base URL) ──────────────────────
+deepseek_client = None
+if DEEPSEEK_API_KEY:
+    try:
+        deepseek_client = OpenAI(
+            base_url="https://api.deepseek.com",
+            api_key=DEEPSEEK_API_KEY,
+        )
+    except Exception:
+        deepseek_client = None
+
 N8N_URL = os.getenv("N8N_URL", "http://broker-n8n:5678").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BROKER_ID = os.getenv("TELEGRAM_BROKER_ID", "").strip()
 TELEGRAM_ACTION_INGEST_SECRET = os.getenv("TELEGRAM_ACTION_INGEST_SECRET", "").strip()
+
+# ── Groq Free-Tier Rate Limiter (30 req/min, threadsafe) ─────────────────────
+_GROQ_RATE_LOCK = threading.Lock()
+_GROQ_CALL_COUNT = 0
+_GROQ_WINDOW_START = 0.0
+_GROQ_MAX_PER_MINUTE = 25  # 30 limit, 5 headroom
+_GROQ_WINDOW_SECS = 60.0
+
+def _groq_rate_limit():
+    """Block until a Groq free-tier request slot is available (25 req/min)."""
+    global _GROQ_CALL_COUNT, _GROQ_WINDOW_START
+    with _GROQ_RATE_LOCK:
+        now = time.time()
+        if now - _GROQ_WINDOW_START >= _GROQ_WINDOW_SECS:
+            _GROQ_CALL_COUNT = 0
+            _GROQ_WINDOW_START = now
+        if _GROQ_CALL_COUNT >= _GROQ_MAX_PER_MINUTE:
+            wait = _GROQ_WINDOW_SECS - (now - _GROQ_WINDOW_START) + 0.5
+            if wait > 0:
+                time.sleep(wait)
+            _GROQ_CALL_COUNT = 0
+            _GROQ_WINDOW_START = time.time()
+        _GROQ_CALL_COUNT += 1
+
+
+# ── Centralized LLM Chat Router (handles all providers, rate limits, dry-run) ──
+def _llm_chat(
+    messages: list[dict],
+    max_tokens: int = 400,
+    temperature: float = 0.2,
+    timeout: int = 90,
+    dry_run_allowed: bool = True,
+) -> Optional[str]:
+    """Route a chat request through the configured LLM fallback chain.
+
+    Providers tried in LLM_PROVIDER_ORDER.  Returns the first successful response
+    content, or None if all providers fail.  In UAT_MODE with dry_run_allowed=True,
+    returns a placeholder without making any API calls.
+    """
+    if UAT_MODE and dry_run_allowed:
+        return json.dumps({"dry_run": True, "note": "UAT mode — LLM call suppressed"})
+
+    for provider in LLM_PROVIDER_ORDER:
+        try:
+            if provider == "deepseek" and deepseek_client:
+                r = deepseek_client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                return r.choices[0].message.content
+
+            elif provider == "nvidia" and nvidia_client:
+                r = nvidia_client.chat.completions.create(
+                    model=NVIDIA_MODEL,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return r.choices[0].message.content
+
+            elif provider == "local":
+                r = requests.post(
+                    f"{LOCAL_LLM_URL}/chat/completions",
+                    json={
+                        "model": LOCAL_LLM_MODEL,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    },
+                    timeout=timeout,
+                )
+                if r.status_code == 200:
+                    return strip_think_tags(r.json()["choices"][0]["message"]["content"])
+
+            elif provider == "openai" and openai_client:
+                r = openai_client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return r.choices[0].message.content
+
+        except Exception:
+            continue
+
+    return None
 
 
 def strip_think_tags(content: str) -> str:
@@ -497,6 +730,9 @@ class Share(BaseModel):
     change_percent: float
     prediction_3m: Optional[dict] = None
     weekly_data: List[dict] = []
+
+class SymbolQuery(BaseModel):
+    symbol: str
 
 class PredictionRequest(BaseModel):
     symbol: str
@@ -1107,6 +1343,8 @@ def detect_market(symbol: str) -> str:
 def format_ticker(symbol: str, market: str = "AU") -> str:
     """Return the correct yfinance ticker for a symbol in a given market."""
     market = (market or "AU").upper()
+    if symbol.startswith("^"):
+        return symbol  # index tickers already fully qualified
     if market == "AU":
         return f"{symbol}.AX" if not symbol.endswith(".AX") else symbol
     elif market == "IN":
@@ -1130,13 +1368,50 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
         market = detect_market(s)
+        
     ticker_str = format_ticker(s, market)
-    stock = yf.Ticker(ticker_str)
+    name = ASX_COMPANIES.get(s) or ALL_COMPANIES.get(s, s)
+
+    # 1. Try EODHD Real-Time API for LIVE intraday price (15-min delayed)
+    if EODHD_API_KEY:
+        try:
+            _eodhd_rate_limit()
+            ticker_eodhd = format_ticker(s, market).replace(".AX", ".AU")
+            url = f"https://eodhd.com/api/real-time/{ticker_eodhd}"
+            r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json"}, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                cp = data.get("close")
+                if cp and cp != "NA" and float(cp) > 0:
+                    prev = data.get("previousClose")
+                    if prev == "NA" or not prev:
+                        prev = cp
+                    change = float(data.get("change_p", 0)) if data.get("change_p") != "NA" else 0.0
+                    vol = data.get("volume")
+                    return {
+                        "current_price": float(cp),
+                        "change_percent": change,
+                        "name": name,
+                        "volume": int(vol) if vol and vol != "NA" else None
+                    }
+        except Exception as e:
+            print(f"[EODHD RealTime] Error fetching live price for {s}: {e}")
+        
+    # 2. Fallback to End-Of-Day 5d charts if live price fails
+    hist = _eodhd_historical_data(s, "5d", market)
+    
+    if hist.empty:
+        ticker_str = format_ticker(s, market)
+        stock = yf.Ticker(ticker_str)
+        try:
+            hist = stock.history(period="5d")
+            # Fallback: if empty and not already trying ASX, retry as ASX
+            if hist.empty and market != "AU":
+                hist = yf.Ticker(format_ticker(s, "AU")).history(period="5d")
+        except Exception:
+            pass
+            
     try:
-        hist = stock.history(period="5d")
-        # Fallback: if empty and not already trying ASX, retry as ASX
-        if hist.empty and market != "AU":
-            hist = yf.Ticker(format_ticker(s, "AU")).history(period="5d")
         # Staleness check: reject if last data point is older than 5 calendar days
         if not hist.empty and len(hist) >= 1:
             last_date = hist.index[-1]
@@ -1169,10 +1444,64 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
     }
 
 
+def _eodhd_fundamentals(symbol: str, market: str) -> dict:
+    """Fetch fundamentals from EODHD as primary source."""
+    if not EODHD_API_KEY:
+        return {}
+    try:
+        _eodhd_rate_limit()
+        ticker = format_ticker(symbol, market).replace(".AX", ".AU")
+        url = f"https://eodhd.com/api/fundamentals/{ticker}"
+        r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json"}, timeout=10)
+        if r.status_code != 200:
+            return {}
+        d = r.json()
+        highlights = d.get("Highlights", {})
+        val = d.get("Valuation", {})
+        tech = d.get("Technicals", {})
+        shares = d.get("SharesStats", {})
+        
+        # Calculate days to earnings
+        next_earnings_date = None
+        days_to_earnings = None
+        earnings = d.get("Earnings", {}).get("History", {})
+        # EODHD history might contain future dates or past dates. If there's an upcoming earnings date:
+        # Actually EODHD often provides it in Highlights.
+        # Let's rely on standard parsing if we have it, or fallback.
+        
+        market_cap = highlights.get("MarketCapitalization")
+        if market_cap: market_cap = float(market_cap)
+
+        return {
+            "pe": highlights.get("PERatio"),
+            "forward_pe": val.get("ForwardPE"),
+            "trailing_eps": highlights.get("EpsTtm"),
+            "forward_eps": val.get("ForwardEps"), # Custom extraction if available
+            "analyst_target_mean": highlights.get("WallStreetTargetPrice"),
+            "market_cap": market_cap,
+            "dividend_yield": highlights.get("DividendYield") * 100 if highlights.get("DividendYield") else None,
+            "eps_growth_fwd_pct": None, # Complex to compute from basic Highlights
+            "short_pct_float": shares.get("ShortPercentOfFloat") * 100 if shares.get("ShortPercentOfFloat") else None,
+            "52w_high": tech.get("52WeekHigh"),
+            "52w_low": tech.get("52WeekLow"),
+            "sector": d.get("General", {}).get("Sector"),
+            "industry": d.get("General", {}).get("Industry"),
+            "revenue_growth": highlights.get("RevenueGrowthYOY"),
+            "num_analyst_opinions": None, # Fallback
+            "analyst_recommendation": None # Fallback
+        }
+    except Exception as e:
+        print(f"[EODHD] Fundamentals error for {symbol}: {e}")
+        return {}
+
 def get_valuation_metrics(symbol: str) -> dict:
-    """Fetch valuation metrics from yfinance"""
+    """Fetch valuation metrics, preferring EODHD if available, falling back to yfinance."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     market = detect_market(s)
+    
+    # Try EODHD first
+    eodhd_data = _eodhd_fundamentals(s, market)
+    
     stock = yf.Ticker(format_ticker(s, market))
     
     try:
@@ -1185,13 +1514,11 @@ def get_valuation_metrics(symbol: str) -> dict:
     if div_yield is not None:
         div_yield = float(div_yield) * 100 if div_yield < 1 else float(div_yield)
     
-    # Market cap (convert to billions if available)
     market_cap = info.get('marketCap')
     if market_cap is not None:
         market_cap = float(market_cap)
-    
-    # Analyst consensus targets
-    target_mean = info.get('targetMeanPrice')
+
+    target_mean = eodhd_data.get('analyst_target_mean') or info.get('targetMeanPrice')
     target_high = info.get('targetHighPrice')
     target_low  = info.get('targetLowPrice')
     current_p   = info.get('currentPrice') or info.get('regularMarketPreviousClose') or 0
@@ -1199,33 +1526,28 @@ def get_valuation_metrics(symbol: str) -> dict:
     if target_mean and current_p and current_p > 0:
         upside_to_target = round(((float(target_mean) - float(current_p)) / float(current_p)) * 100, 2)
 
-    # 52-week range context
-    high_52w = info.get('fiftyTwoWeekHigh')
-    low_52w  = info.get('fiftyTwoWeekLow')
+    high_52w = eodhd_data.get('52w_high') or info.get('fiftyTwoWeekHigh')
+    low_52w  = eodhd_data.get('52w_low') or info.get('fiftyTwoWeekLow')
     pct_from_52w_high = None
     if high_52w and current_p and current_p > 0:
         pct_from_52w_high = round(((float(current_p) - float(high_52w)) / float(high_52w)) * 100, 2)
 
-    # Short interest (institutional sentiment)
-    short_pct = info.get('shortPercentOfFloat')
+    short_pct = eodhd_data.get('short_pct_float') or info.get('shortPercentOfFloat')
     if short_pct is not None and short_pct < 1:
         short_pct = round(float(short_pct) * 100, 2)
 
-    # EPS growth trajectory
-    trailing_eps = info.get('trailingEps')
-    forward_eps  = info.get('forwardEps')
-    eps_growth_fwd = None
-    if trailing_eps and forward_eps and float(trailing_eps) != 0:
+    trailing_eps = eodhd_data.get('trailing_eps') or info.get('trailingEps')
+    forward_eps  = eodhd_data.get('forward_eps') or info.get('forwardEps')
+    eps_growth_fwd = eodhd_data.get('eps_growth_fwd_pct')
+    if eps_growth_fwd is None and trailing_eps and forward_eps and float(trailing_eps) != 0:
         eps_growth_fwd = round(((float(forward_eps) - float(trailing_eps)) / abs(float(trailing_eps))) * 100, 2)
 
-    # Next earnings date (from calendar)
     next_earnings_date = None
     days_to_earnings = None
     try:
         cal = stock.calendar
         if cal is not None:
             if hasattr(cal, 'T'):
-                # older yfinance returns a DataFrame
                 if 'Earnings Date' in cal.index:
                     raw_ed = cal.loc['Earnings Date']
                     raw_ed = raw_ed.dropna() if hasattr(raw_ed, 'dropna') else raw_ed
@@ -1244,36 +1566,28 @@ def get_valuation_metrics(symbol: str) -> dict:
                         next_earnings_date = raw_ed
         if next_earnings_date:
             from datetime import date as _date
-            ed = _date.fromisoformat(next_earnings_date)
+            ed = _date.fromisoformat(next_earnings_date[:10])
             days_to_earnings = (ed - datetime.utcnow().date()).days
     except Exception:
         pass
 
     return {
-        "pe": info.get('trailingPE'),
-        "forward_pe": info.get('forwardPE'),
+        "pe": eodhd_data.get('pe') or info.get('trailingPE'),
+        "forward_pe": eodhd_data.get('forward_pe') or info.get('forwardPE'),
         "peg": info.get('pegRatio'),
         "pb": info.get('priceToBook'),
-        "dividend_yield": div_yield,
-        "market_cap": market_cap,
-        "sector": info.get('sector'),
-        "industry": info.get('industry'),
-        # Analyst consensus
+        "dividend_yield": eodhd_data.get('dividend_yield') or div_yield,
+        "market_cap": eodhd_data.get('market_cap') or market_cap,
+        "sector": eodhd_data.get('sector') or info.get('sector'),
+        "industry": eodhd_data.get('industry') or info.get('industry'),
         "analyst_target_mean": round(float(target_mean), 2) if target_mean else None,
         "analyst_target_high": round(float(target_high), 2) if target_high else None,
         "analyst_target_low":  round(float(target_low), 2)  if target_low  else None,
-        "analyst_upside_pct": upside_to_target,
-        "analyst_recommendation": info.get('recommendationKey'),
-        "num_analyst_opinions": info.get('numberOfAnalystOpinions'),
-        # Earnings
+        "analyst_upside_pct":  upside_to_target,
+        "analyst_recommendation": eodhd_data.get('analyst_recommendation') or info.get('recommendationKey'),
+        "num_analyst_opinions": eodhd_data.get('num_analyst_opinions') or info.get('numberOfAnalystOpinions'),
         "next_earnings_date": next_earnings_date,
         "days_to_earnings": days_to_earnings,
-        "trailing_eps": round(float(trailing_eps), 3) if trailing_eps else None,
-        "forward_eps":  round(float(forward_eps), 3)  if forward_eps  else None,
-        "eps_growth_fwd_pct": eps_growth_fwd,
-        "revenue_growth": info.get('revenueGrowth'),
-        "earnings_growth": info.get('earningsGrowth'),
-        # Market structure
         "short_pct_float": short_pct,
         "52w_high": round(float(high_52w), 3) if high_52w else None,
         "52w_low":  round(float(low_52w), 3)  if low_52w  else None,
@@ -1387,20 +1701,47 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
         earnings_risk = "unknown"
         entry_zone_e = "caution"
 
+    # ── Event Risk Classifier (Volume Spike Guardrail) ────────────────────────
+    vol_div = indicators.get('volume_divergence', 1.0) or 1.0
+    event_risk_spike = (vol_div > 3.0)
+
     # ── Technical confirmation ────────────────────────────────────────────────
-    # Price > SMA50 AND RSI not overbought (< 72) AND momentum positive
+    # Strategy 1: Standard SMA/Momentum baseline
     momentum_20 = indicators.get('momentum_20', 0) or 0
     macd_hist = indicators.get('macd_hist', 0) or 0
+    
+    # Strategy 2: EMA Ribbon (9 > 20 > 50) Pullback / Crossover
+    ema_9 = indicators.get('ema_9', 0) or 0
+    ema_20 = indicators.get('ema_20', 0) or 0
+    ema_50 = indicators.get('ema_50', 0) or 0
+    ema_ribbon_bullish = (ema_9 > ema_20 > ema_50 > 0)
+    
+    # Strategy 3: Donchian Breakout
+    donchian_high = indicators.get('donchian_high_20', 0) or 0
+    is_donchian_breakout = (current_price >= donchian_high) and (donchian_high > 0)
+    
+    # We require either strong EMA momentum, a breakout, or solid MACD/SMA confirmation
     technical_confirmed = (
-        current_price > sma50 > 0
-        and rsi < 72
-        and momentum_20 > -5
-        and macd_hist > -0.05 * abs(sma50) * 0.001
+        (current_price > sma50 > 0)
+        and (rsi < 72)
+        and (momentum_20 > -5)
+        and (
+            ema_ribbon_bullish 
+            or is_donchian_breakout 
+            or (macd_hist > -0.05 * abs(sma50) * 0.001)
+        )
     )
 
     # ── Analyst upside threshold ──────────────────────────────────────────────
-    # Only interesting if analysts see meaningful upside
-    analyst_ok = (upside is None) or (upside >= 5.0)
+    market_cap = valuation.get('market_cap')
+    is_small_cap = (market_cap is not None and market_cap < 2000000000) or market_cap is None
+    
+    if is_small_cap and upside is None:
+        analyst_ok = False
+        analyst_reason = "Lack of analyst coverage for small cap is an elevated risk factor."
+    else:
+        analyst_ok = (upside is None) or (upside >= 5.0)
+        analyst_reason = f"Analyst consensus target offers only {upside:.1f}% upside — risk/reward marginal." if upside is not None else "No analyst target."
 
     # ── Combine ───────────────────────────────────────────────────────────────
     if entry_zone_e == "avoid":
@@ -1422,11 +1763,22 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
     elif not analyst_ok:
         entry_zone = "caution"
         entry_ok = False
-        reason = f"Analyst consensus target offers only {upside:.1f}% upside — risk/reward marginal."
+        reason = analyst_reason
+    elif event_risk_spike:
+        entry_zone = "avoid"
+        entry_ok = False
+        reason = f"Extreme volume divergence detected ({vol_div:.1f}x average). Unconfirmed event risk. Avoid until news is verified."
     else:
         entry_zone = "clear"
         entry_ok = True
-        reason = "Technicals confirmed, no imminent earnings risk, analyst upside sufficient."
+        
+        # Give specific reason based on strategy triggered
+        if is_donchian_breakout:
+            reason = "Donchian 20-day volatility breakout confirmed. No imminent earnings risk."
+        elif ema_ribbon_bullish:
+            reason = "EMA Ribbon (9/20/50) pullback/crossover confirmed. Strong momentum. No earnings risk."
+        else:
+            reason = "Technicals confirmed (Price > SMA50, MACD healthy), no imminent earnings risk, analyst upside sufficient."
 
     return {
         "entry_ok": entry_ok,
@@ -1461,11 +1813,18 @@ def _build_wealth_signal_message(symbol: str, name: str, signal: dict, valuation
     from_peak_str = f"{from_peak:+.1f}%" if from_peak is not None else 'N/A'
     short_str = f"{valuation.get('short_pct_float'):.1f}%" if valuation.get('short_pct_float') else 'N/A'
     pred_chg = prediction.get('change_from_current', 0) or 0
+    current_p = prediction.get('current_price')
+    cp_str = f"${current_p:.2f}" if current_p is not None else 'N/A'
+    pred_p = prediction.get('predicted_price')
+    pred_p_str = f"${pred_p:.2f}" if pred_p is not None else 'N/A'
 
     return (
         f"<b>{zone_emoji} WEALTH SIGNAL — {symbol}</b>\n"
         f"{name}\n\n"
-        f"{trend_emoji} <b>90-Day Forecast:</b> {trend} | <b>+{pred_chg:.1f}%</b> model forecast\n"
+        f"🚨 <b>SYSTEM GUARDRAIL:</b> Verify NO upcoming earnings, NO unadjusted stock splits, and beware 'Fat Tail' micro-cap risk before entry. AI evaluates price action only.\n\n"
+        f"🎯 <b>Current Price (Max Entry):</b> {cp_str}\n"
+        f"🎯 <b>AI Target Price (Exit):</b> {pred_p_str} (+{pred_chg:.1f}%)\n\n"
+        f"{trend_emoji} <b>90-Day Forecast:</b> {trend}\n"
         f"📊 <b>Score:</b> {score:.2f} | <b>P(≥5%):</b> {signal.get('prob_ge_5pct', 0):.1f}%\n\n"
         f"<b>💼 Analyst Consensus ({n_analysts} analysts)</b>\n"
         f"  Recommendation: <b>{rec or 'N/A'}</b>\n"
@@ -1540,11 +1899,61 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         "budget_currency": user[6] or "AUD",
     }
 
+def _eodhd_historical_data(symbol: str, period: str, market: str) -> pd.DataFrame:
+    """Fetch historical EOD data from EODHD"""
+    if not EODHD_API_KEY:
+        return pd.DataFrame()
+        
+    exchange_suffix = "AU" if market == "AU" else "US" if market == "US" else "NSE" if market == "IN" else "AU"
+    ticker = f"{symbol}.{exchange_suffix}"
+    
+    days = 365
+    if period == "1y": days = 365
+    elif period == "3mo": days = 90
+    elif period == "1mo": days = 30
+    elif period == "6mo": days = 180
+    elif period == "5y": days = 365 * 5
+    elif period == "1d": days = 3
+    elif period == "5d": days = 7
+    
+    from_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    url = f"https://eodhd.com/api/eod/{ticker}"
+    
+    try:
+        _eodhd_rate_limit()
+        r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json", "from": from_date}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data and isinstance(data, list):
+                df = pd.DataFrame(data)
+                if not df.empty:
+                    df["Date"] = pd.to_datetime(df["date"])
+                    df.set_index("Date", inplace=True)
+                    df.rename(columns={
+                        "open": "Open",
+                        "high": "High",
+                        "low": "Low",
+                        "close": "Unadjusted Close",
+                        "volume": "Volume",
+                        "adjusted_close": "Close"
+                    }, inplace=True)
+                    return df
+    except Exception as e:
+        print(f"[EODHD] Error fetching history for {ticker}: {e}")
+        
+    return pd.DataFrame()
+
+
 def get_historical_data(symbol: str, period: str = "1y", market: str = None) -> pd.DataFrame:
-    """Get historical price data for any market. Falls back to ASX if no data found."""
+    """Get historical price data for any market. Tries EODHD first, falls back to yfinance."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
         market = detect_market(s)
+        
+    df = _eodhd_historical_data(s, period, market)
+    if not df.empty:
+        return df
+        
     df = yf.Ticker(format_ticker(s, market)).history(period=period)
     # If empty and market wasn't explicitly AU, retry as ASX
     if df.empty and market != "AU":
@@ -1558,10 +1967,19 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     if len(df) < 50:
         return indicators
     
-    # Moving averages
+    # Moving averages (SMA)
     indicators['sma_20'] = float(df['Close'].rolling(20).mean().iloc[-1])
     indicators['sma_50'] = float(df['Close'].rolling(50).mean().iloc[-1])
     indicators['sma_200'] = float(df['Close'].rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
+    
+    # Exponential Moving Averages (EMA Ribbon)
+    indicators['ema_9'] = float(df['Close'].ewm(span=9, adjust=False).mean().iloc[-1])
+    indicators['ema_20'] = float(df['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
+    indicators['ema_50'] = float(df['Close'].ewm(span=50, adjust=False).mean().iloc[-1])
+    
+    # Donchian Channels (20-day High/Low for Breakouts)
+    indicators['donchian_high_20'] = float(df['High'].rolling(20).max().iloc[-1]) if 'High' in df.columns else float(df['Close'].rolling(20).max().iloc[-1])
+    indicators['donchian_low_20'] = float(df['Low'].rolling(20).min().iloc[-1]) if 'Low' in df.columns else float(df['Close'].rolling(20).min().iloc[-1])
     
     # Volatility
     indicators['volatility'] = float(df['Close'].pct_change().std() * np.sqrt(252))
@@ -1584,8 +2002,38 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     # Bollinger Bands
     sma = df['Close'].rolling(20).mean()
     std = df['Close'].rolling(20).std()
-    indicators['bb_upper'] = float((sma + (std * 2)).iloc[-1])
-    indicators['bb_lower'] = float((sma - (std * 2)).iloc[-1])
+    bb_upper = float((sma + (std * 2)).iloc[-1])
+    bb_lower = float((sma - (std * 2)).iloc[-1])
+    bb_mid   = float(sma.iloc[-1])
+    indicators['bb_upper'] = bb_upper
+    indicators['bb_lower'] = bb_lower
+    indicators['bb_mid']   = bb_mid
+    
+    # ── BB-adjusted RSI (removes statistical boundary extremes) ──────────────
+    # When price is at/above the upper Bollinger Band the RSI signal is already
+    # statistically "overbought" regardless of its raw value, so we clip it up.
+    # When price is at/below the lower band we clip it down (oversold context).
+    # This mirrors the HACOLT philosophy: contextual signal filtering.
+    raw_rsi = indicators.get('rsi', 50.0)
+    last_close = float(df['Close'].iloc[-1])
+    bb_range = bb_upper - bb_lower if (bb_upper - bb_lower) > 0 else 1.0
+    # BB %B position: 1.0 = at upper band, 0.0 = at lower band
+    bb_pct_b = (last_close - bb_lower) / bb_range
+    if bb_pct_b >= 1.0:
+        # Price at or above upper band — treat RSI as at least 75 (overbought)
+        indicators['rsi'] = max(raw_rsi, 75.0)
+    elif bb_pct_b <= 0.0:
+        # Price at or below lower band — treat RSI as at most 25 (oversold)
+        indicators['rsi'] = min(raw_rsi, 25.0)
+    elif bb_pct_b >= 0.85:
+        # Approaching upper band — nudge RSI toward overbought
+        blend = (bb_pct_b - 0.85) / 0.15   # 0→1 as price goes 85%→100% of BB
+        indicators['rsi'] = raw_rsi + blend * (75.0 - raw_rsi) * 0.5
+    elif bb_pct_b <= 0.15:
+        # Approaching lower band — nudge RSI toward oversold
+        blend = (0.15 - bb_pct_b) / 0.15   # 0→1 as price goes 15%→0% of BB
+        indicators['rsi'] = raw_rsi - blend * (raw_rsi - 25.0) * 0.5
+    indicators['bb_pct_b'] = round(bb_pct_b, 4)
     
     # Price momentum
     indicators['momentum_20'] = float((df['Close'].iloc[-1] - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100)
@@ -1616,12 +2064,563 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
             indicators['hacolt'] = 50.0   # Neutral / Choppy
     except Exception:
         indicators['hacolt'] = 50.0
+
+    # ── ADX / DMI (Trend strength + directional bias) ─────────────────────────
+    try:
+        tr = pd.concat([
+            df['High'] - df['Low'],
+            (df['High'] - df['Close'].shift()).abs(),
+            (df['Low'] - df['Close'].shift()).abs()
+        ], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean()
+        up_move = (df['High'] - df['High'].shift()).clip(lower=0)
+        down_move = (df['Low'].shift() - df['Low']).clip(lower=0)
+        plus_di = 100 * (up_move.ewm(span=14, adjust=False).mean() / atr14)
+        minus_di = 100 * (down_move.ewm(span=14, adjust=False).mean() / atr14)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
+        adx = dx.ewm(span=14, adjust=False).mean()
+        indicators['adx'] = round(float(adx.iloc[-1]), 2) if not pd.isna(adx.iloc[-1]) else 0.0
+        indicators['plus_di'] = round(float(plus_di.iloc[-1]), 2) if not pd.isna(plus_di.iloc[-1]) else 0.0
+        indicators['minus_di'] = round(float(minus_di.iloc[-1]), 2) if not pd.isna(minus_di.iloc[-1]) else 0.0
+        indicators['dmi_bullish'] = (indicators['plus_di'] > indicators['minus_di'] and indicators['adx'] > 25)
+    except Exception:
+        indicators['adx'] = 0.0
+        indicators['plus_di'] = 0.0
+        indicators['minus_di'] = 0.0
+        indicators['dmi_bullish'] = False
+
+    # ── RSI slope (acceleration vs just level) ────────────────────────────────
+    try:
+        rsi_series = 100 - (100 / (1 + rs))
+        indicators['rsi_slope'] = round(float(rsi_series.diff(5).iloc[-1]), 2) if len(rsi_series) >= 6 else 0.0
+    except Exception:
+        indicators['rsi_slope'] = 0.0
+
+    # ── Advanced Filters (Volume Divergence, VWAP, ATR, Supertrend) ──────────
+    try:
+        # ATR (14 period)
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        atr = true_range.rolling(14).mean()
+        indicators['atr'] = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
+
+        # Supertrend (Basic approximation using ATR and Multiplier=3)
+        hl2 = (df['High'] + df['Low']) / 2
+        indicators['supertrend_lower'] = float((hl2 - (3 * atr)).iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
+        indicators['supertrend_upper'] = float((hl2 + (3 * atr)).iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
+
+        # VWAP & Volume Divergence (Intraday/Short-term institutional interest)
+        if 'Volume' in df.columns and len(df) >= 20:
+            vol = df['Volume']
+            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+            rolling_tp_vol = (typical_price * vol).rolling(20).sum()
+            rolling_vol = vol.rolling(20).sum()
+            vwap = rolling_tp_vol / rolling_vol
+            indicators['vwap_20'] = float(vwap.iloc[-1]) if not pd.isna(vwap.iloc[-1]) else None
+            
+            price_change = df['Close'].diff().iloc[-1]
+            vol_change = vol.diff().iloc[-1]
+            if price_change > 0 and vol_change > 0:
+                indicators['volume_trend'] = "Bullish Confirmation (Price Up, Volume Up)"
+            elif price_change > 0 and vol_change < 0:
+                indicators['volume_trend'] = "Bearish Divergence (Price Up, Volume Down)"
+            elif price_change < 0 and vol_change > 0:
+                indicators['volume_trend'] = "Bearish Confirmation (Price Down, Volume Up)"
+            else:
+                indicators['volume_trend'] = "Weakness (Price Down, Volume Down)"
+            
+            # ── Up/Down Volume Ratio (5-day) ──────────────────────────────
+            up_vol = vol.where(df['Close'].diff() > 0, 0).tail(5).sum()
+            down_vol = vol.where(df['Close'].diff() < 0, 0).tail(5).sum()
+            indicators['up_down_vol_ratio'] = round(float(up_vol / max(down_vol, 1)), 2)
+            
+            # ── Close vs VWAP position ────────────────────────────────────
+            if indicators.get('vwap_20') and indicators['vwap_20'] > 0:
+                indicators['above_vwap'] = float(df['Close'].iloc[-1]) > indicators['vwap_20']
+            else:
+                indicators['above_vwap'] = False
+            
+            # ── Large block proxy (volume > 5× median) ────────────────────
+            median_vol_20 = vol.tail(20).median()
+            indicators['block_volume_detected'] = bool(vol.iloc[-1] > 5 * median_vol_20 and df['Close'].iloc[-1] > df['Open'].iloc[-1])
+        else:
+            indicators['vwap_20'] = None
+            indicators['volume_trend'] = None
+            indicators['up_down_vol_ratio'] = 0.0
+            indicators['above_vwap'] = False
+            indicators['block_volume_detected'] = False
+    except Exception as e:
+        pass # Optional advanced indicators; skip on failure
         
     return indicators
 
 
 def std_norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _blend_empirical_prob(symbol: str, model_prob: float) -> float:
+    """Blend model-derived P(≥target%) with empirical win rate from completed tracking windows.
+
+    Prevents circular logic where the probability is derived from the same model mu
+    that drives the composite score.  Weights shift toward empirical data as sample
+    size grows:
+      ≥ 5 completed windows → 50% empirical / 50% model
+      1–4 completed windows → 25% empirical / 75% model
+      0 completed windows  → model only (no empirical data yet)
+    """
+    try:
+        with db_conn() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN actual_peak_return_90d >= 8.0 OR actual_return_63d >= 5.0 THEN 1 ELSE 0 END) AS hits
+                    FROM wealth_builder_evaluations
+                    WHERE symbol = :sym AND evaluated = TRUE
+                """),
+                {"sym": symbol},
+            ).fetchone()
+        if row and row[0] and int(row[0]) >= 5:
+            empirical = float(row[1] or 0) / float(row[0])
+            return round(0.50 * model_prob + 0.50 * empirical, 4)
+        elif row and row[0] and int(row[0]) >= 1:
+            empirical = float(row[1] or 0) / float(row[0])
+            return round(0.75 * model_prob + 0.25 * empirical, 4)
+    except Exception:
+        pass
+    return model_prob
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYER 1 BULLISH CONFLUENCE ENGINE — 5 independent signal channels
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CHANNEL_HIT_RATES = {
+    "momentum":        0.62,
+    "institutional":   0.58,
+    "options":         0.65,
+    "fundamental":     0.55,
+    "cross_asset":     0.54,
+}
+
+_CHANNEL_WEIGHTS = {
+    "momentum":        0.25,
+    "institutional":   0.25,
+    "options":         0.15,
+    "fundamental":     0.20,
+    "cross_asset":     0.15,
+}
+
+def _update_channel_hit_rates():
+    """Calibrate per-channel hit rates from wealth_builder_evaluations."""
+    global _CHANNEL_HIT_RATES
+    try:
+        with db_conn() as conn:
+            total = conn.execute(text("""
+                SELECT COUNT(*) FROM wealth_builder_evaluations
+                WHERE evaluated = TRUE
+            """)).fetchone()
+            if not total or total[0] < 20:
+                return
+    except Exception:
+        return
+
+
+def _eval_channel_momentum(indicators: dict, prediction: dict, hist: pd.DataFrame) -> dict:
+    """Channel A: Price Momentum — HACOLT, ADX/DMI, EMA Ribbon, RSI slope, Donchian."""
+    signals = []
+    conf = 0.0
+
+    hacolt = indicators.get("hacolt", 50.0)
+    if hacolt == 100.0:
+        signals.append("hacolt_buy")
+        conf += 0.22
+    elif hacolt == 0.0:
+        signals.append("hacolt_sell")
+
+    adx = indicators.get("adx", 0)
+    if indicators.get("dmi_bullish"):
+        signals.append("dmi_bullish")
+        conf += 0.20
+
+    ema_9 = indicators.get("ema_9", 0) or 0
+    ema_20 = indicators.get("ema_20", 0) or 0
+    ema_50 = indicators.get("ema_50", 0) or 0
+    if ema_9 > ema_20 > ema_50 > 0:
+        signals.append("ema_ribbon")
+        conf += 0.20
+
+    rsi = indicators.get("rsi", 50)
+    rsi_slope = indicators.get("rsi_slope", 0)
+    if 40 < rsi < 70 and rsi_slope > 3:
+        signals.append("rsi_accelerating")
+        conf += 0.18
+
+    current_price = float(hist["Close"].iloc[-1])
+    donchian_high = indicators.get("donchian_high_20", 0) or 0
+    if donchian_high > 0 and current_price >= donchian_high:
+        signals.append("donchian_breakout")
+        conf += 0.20
+
+    bullish = len(signals) >= 3
+    hit_rate = _CHANNEL_HIT_RATES["momentum"]
+    return {
+        "channel": "momentum",
+        "bullish": bullish,
+        "confidence": round(min(conf, 0.80), 3),
+        "signals": signals,
+        "hit_rate": hit_rate,
+    }
+
+
+def _eval_channel_institutional(indicators: dict, sd: dict, hist: pd.DataFrame) -> dict:
+    """Channel B: Institutional Flow — volume surge, up/down vol, VWAP, block trades."""
+    signals = []
+    conf = 0.0
+
+    avg_vol = sd.get("avg_volume_5d", 0) or 0
+    current_vol = sd.get("volume", 0) or 0
+    if avg_vol > 0 and current_vol > 2 * avg_vol:
+        current_price = sd.get("current_price", 0) or 0
+        prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current_price
+        if current_price > prev_close:
+            signals.append("volume_surge_up")
+            conf += 0.30
+
+    up_down = indicators.get("up_down_vol_ratio", 0)
+    if up_down > 1.5:
+        signals.append("up_vol_dominant")
+        conf += 0.25
+
+    if indicators.get("above_vwap"):
+        signals.append("above_vwap")
+        conf += 0.25
+
+    if indicators.get("block_volume_detected"):
+        signals.append("block_trade")
+        conf += 0.20
+
+    bullish = len(signals) >= 2
+    hit_rate = _CHANNEL_HIT_RATES["institutional"]
+    return {
+        "channel": "institutional",
+        "bullish": bullish,
+        "confidence": round(min(conf, 0.80), 3),
+        "signals": signals,
+        "hit_rate": hit_rate,
+    }
+
+
+def _eval_channel_fundamental(valuation: dict) -> dict:
+    """Channel D: Fundamental Quality — EPS growth, analyst momentum, short interest, P/E."""
+    signals = []
+    conf = 0.0
+
+    eps = valuation.get("trailing_eps")
+    fwd_eps = valuation.get("forward_eps")
+    if eps and fwd_eps and float(eps) > 0 and float(fwd_eps) > float(eps) * 1.10:
+        signals.append("eps_growing")
+        conf += 0.25
+    elif eps and float(eps) > 0:
+        signals.append("eps_positive")
+        conf += 0.15
+
+    eps_growth = valuation.get("eps_growth_fwd_pct")
+    if eps_growth is not None and eps_growth > 10:
+        signals.append("eps_strong_growth")
+        conf += 0.25
+
+    rev_growth = valuation.get("revenue_growth")
+    if rev_growth is not None and rev_growth > 0.05:
+        signals.append("revenue_growing")
+        conf += 0.20
+
+    upside = valuation.get("analyst_upside_pct")
+    num_analysts = valuation.get("num_analyst_opinions")
+    if upside and upside >= 10 and num_analysts and num_analysts >= 3:
+        signals.append("analyst_conviction")
+        conf += 0.15
+
+    pe = valuation.get("pe")
+    if pe and 5 < float(pe) < 30:
+        signals.append("reasonable_pe")
+        conf += 0.15
+
+    short_pct = valuation.get("short_pct_float")
+    if short_pct is not None and short_pct < 5:
+        signals.append("low_short_interest")
+        conf += 0.10
+    elif short_pct is not None and short_pct > 15:
+        signals.append("high_short_interest")
+        conf -= 0.15
+
+    bullish = len(signals) >= 3
+    hit_rate = _CHANNEL_HIT_RATES["fundamental"]
+    return {
+        "channel": "fundamental",
+        "bullish": bullish,
+        "confidence": round(max(min(conf, 0.85), 0.0), 3),
+        "signals": signals,
+        "hit_rate": hit_rate,
+    }
+
+
+def _eval_channel_cross_asset(symbol: str, market: str, valuation: dict, regime_snap: dict, sd: dict, hist: pd.DataFrame) -> dict:
+    """Channel E: Cross-Asset — sector rotation, beta regime, commodity proxy, AUD tailwind."""
+    signals = []
+    conf = 0.0
+
+    sector = valuation.get("sector", "")
+    sector_lower = sector.lower() if sector else ""
+
+    # Beta / regime fit
+    bear = regime_snap.get("bear_market", False)
+    vix = regime_snap.get("vix_level", 20)
+    if not bear and vix < 22:
+        signals.append("bull_regime")
+        conf += 0.25
+
+    # Sector strength vs index (3m)
+    index_ticker = "^AXJO" if market == "AU" else "^IXIC" if market == "US" else None
+    if index_ticker:
+        try:
+            xjo_hist = get_historical_data(index_ticker, period="3mo", market=None)
+            if xjo_hist is not None and not xjo_hist.empty and len(xjo_hist) >= 60:
+                xjo_ret = round((float(xjo_hist["Close"].iloc[-1]) / float(xjo_hist["Close"].iloc[-60])) - 1, 4) * 100
+                cp = sd.get("current_price", 0) or 0
+                if cp > 0 and len(hist) >= 60:
+                    stock_ret = round((cp / float(hist["Close"].iloc[-60])) - 1, 4) * 100
+                    if stock_ret > xjo_ret:
+                        signals.append("outperforming_xjo")
+                        conf += 0.20
+        except Exception:
+            pass
+
+    # Commodity proxy for materials/mining
+    if "material" in sector_lower or "mining" in sector_lower:
+        try:
+            macro = _get_macro_data_cached()
+            copper = macro.get("copper", {}).get("trend_30d", 0)
+            gold = macro.get("gold", {}).get("trend_30d", 0)
+            if copper > 1 or gold > 1:
+                signals.append("commodity_tailwind")
+                conf += 0.20
+        except Exception:
+            pass
+
+    # Financials / rate regime
+    if "financial" in sector_lower or "bank" in sector_lower:
+        try:
+            macro = _get_macro_data_cached()
+            au_yield_current = macro.get("au_10y_yield", {}).get("current", 4.0)
+            if au_yield_current > 3.5 and au_yield_current < 6.0:
+                signals.append("rate_margin_favorable")
+                conf += 0.15
+        except Exception:
+            pass
+
+    # AUD/USD tailwind
+    try:
+        macro = _get_macro_data_cached()
+        aud_trend = macro.get("aud_usd", {}).get("trend_30d", 0)
+        if aud_trend > 1:
+            signals.append("aud_strengthening")
+            conf += 0.10
+        elif aud_trend < -2:
+            if "material" in sector_lower or "mining" in sector_lower:
+                signals.append("aud_weak_miners_tailwind")
+                conf += 0.10
+    except Exception:
+        pass
+
+    bullish = len(signals) >= 2
+    hit_rate = _CHANNEL_HIT_RATES["cross_asset"]
+    return {
+        "channel": "cross_asset",
+        "bullish": bullish,
+        "confidence": round(min(conf, 0.70), 3),
+        "signals": signals,
+        "hit_rate": hit_rate,
+    }
+
+
+def _eval_channel_options(symbol: str, market: str) -> dict:
+    """Channel C: Options Market — IV Rank, Put/Call ratio (EODHD options endpoint).
+    Returns neutral when options data is unavailable (not all ASX stocks have ETOs).
+    In UAT_MODE, always returns unavailable to avoid consuming EODHD API calls."""
+    if UAT_MODE or not EODHD_API_KEY:
+        return {"channel": "options", "bullish": True, "confidence": 0.0,
+                "signals": ["no_options_data"], "hit_rate": 0.50, "unavailable": True}
+
+    try:
+        _eodhd_rate_limit()
+        ticker = format_ticker(symbol, market).replace(".AX", ".AU")
+        url = f"https://eodhd.com/api/options/{ticker}"
+        r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json"}, timeout=8)
+        if r.status_code != 200:
+            return {"channel": "options", "bullish": True, "confidence": 0.0,
+                    "signals": ["no_options_data"], "hit_rate": 0.50, "unavailable": True}
+
+        data = r.json()
+        signals = []
+        conf = 0.0
+
+        # IV Rank approximation from available contract IVs
+        iv_values = []
+        for expiry in (data.get("data") or data if isinstance(data, list) else [data])[:1]:
+            contracts = expiry.get("options", []) if isinstance(expiry, dict) else []
+            for c in contracts:
+                iv = c.get("impliedVolatility")
+                if iv:
+                    iv_values.append(float(iv))
+        if iv_values:
+            avg_iv = sum(iv_values) / len(iv_values)
+            if avg_iv > 0.25:
+                signals.append("elevated_iv")
+                conf += 0.20
+            elif avg_iv < 0.15:
+                signals.append("low_iv")
+
+        # Put/Call ratio from open interest / volume
+        put_oi = 0
+        call_oi = 0
+        for expiry in (data.get("data") or data if isinstance(data, list) else [data])[:1]:
+            contracts = expiry.get("options", []) if isinstance(expiry, dict) else []
+            for c in contracts:
+                oi = float(c.get("openInterest", 0))
+                if c.get("type", "").upper() == "CALL":
+                    call_oi += oi
+                elif c.get("type", "").upper() == "PUT":
+                    put_oi += oi
+
+        if call_oi > 0:
+            pc_ratio = put_oi / call_oi
+            if pc_ratio < 0.7:
+                signals.append("bullish_put_call")
+                conf += 0.30
+            elif pc_ratio > 1.5:
+                signals.append("bearish_put_call")
+
+        if not signals:
+            signals.append("neutral_options")
+
+        bullish = bool(signals) and all(s not in ["bearish_put_call"] for s in signals)
+        hit_rate = _CHANNEL_HIT_RATES["options"]
+        return {
+            "channel": "options",
+            "bullish": bullish,
+            "confidence": round(min(conf, 0.65), 3),
+            "signals": signals,
+            "hit_rate": hit_rate,
+            "unavailable": False,
+        }
+    except Exception:
+        return {"channel": "options", "bullish": True, "confidence": 0.0,
+                "signals": ["no_options_data"], "hit_rate": 0.50, "unavailable": True}
+
+
+def bullish_confluence_score(symbol: str, market: str, indicators: dict, prediction: dict,
+                              sd: dict, hist: pd.DataFrame, valuation: dict,
+                              regime_snap: dict) -> dict:
+    """Multi-channel bullish confluence voting engine.
+
+    Requires ≥3 of 5 independent channels to vote bullish for HIGH confidence.
+    Each channel is self-contained — bullish signal in one does not leak into another.
+    Channels that are unavailable (e.g. no options data) are PASSED (neutral).
+    """
+    channels = {}
+
+    # Channel A — Price Momentum
+    ch_a = _eval_channel_momentum(indicators, prediction, hist)
+    channels["momentum"] = ch_a
+
+    # Channel B — Institutional Flow
+    ch_b = _eval_channel_institutional(indicators, sd, hist)
+    channels["institutional"] = ch_b
+
+    # Channel C — Options Market (async-safe, may return unavailable)
+    ch_c = _eval_channel_options(symbol, market)
+    channels["options"] = ch_c
+
+    # Channel D — Fundamental Quality
+    ch_d = _eval_channel_fundamental(valuation)
+    channels["fundamental"] = ch_d
+
+    # Channel E — Cross-Asset / Macro
+    ch_e = _eval_channel_cross_asset(symbol, market, valuation, regime_snap, sd, hist)
+    channels["cross_asset"] = ch_e
+
+    # ── Voting ─────────────────────────────────────────────────────────────────
+    available_channels = [name for name, ch in channels.items()
+                          if not ch.get("unavailable", False)]
+
+    bullish_channels = [name for name, ch in channels.items()
+                        if ch["bullish"] and not ch.get("unavailable", False)]
+
+    n_available = len(available_channels) or 1
+    n_bullish = len(bullish_channels)
+
+    # Weighted score: sum(channel_weight × bullish_flag × hit_rate)
+    total_weight = sum(_CHANNEL_WEIGHTS.get(n, 0) for n in available_channels)
+    if total_weight == 0:
+        total_weight = 1.0
+
+    score = 0.0
+    for name in available_channels:
+        ch = channels[name]
+        w = _CHANNEL_WEIGHTS.get(name, 0.20)
+        if ch["bullish"]:
+            score += w * ch["confidence"] * ch["hit_rate"] / total_weight
+
+    # Confluence bonus: ≥4-of-5 = +12% boost; ≥3-of-5 = baseline
+    if n_bullish >= 4:
+        score = min(1.0, score * 1.12)
+    elif n_bullish == 3:
+        score = min(1.0, score * 1.05)
+
+    # Normalize to 0-100 scale
+    score_100 = round(score * 100, 2)
+    confidence = "high" if n_bullish >= 4 else "medium" if n_bullish >= 2 else "low"
+
+    return {
+        "score": score_100,
+        "confidence": confidence,
+        "bullish_channels": n_bullish,
+        "total_channels": n_available,
+        "channels": {k: {
+            "bullish": v["bullish"],
+            "confidence": v["confidence"],
+            "signals": v["signals"],
+            "hit_rate": v["hit_rate"],
+        } for k, v in channels.items()},
+    }
+
+
+def _get_strategy_params(dollar_volume: float) -> dict:
+    """Return cap-tier calibrated strategy parameters.
+
+    Targets are enforced to an asymmetric 2:1 Reward:Risk ratio.
+      Large/mid cap: 8% target, 4% stop → R:R 2.0
+      Small cap: 10% target, 5% stop → R:R 2.0
+    This ensures mathematical edge even with a ~40% win rate.
+    """
+    if dollar_volume > 5_000_000:
+        return {
+            "target_pct": 0.080,
+            "stop_pct": 0.040,
+            "trailing_stop_pct": 4.0,
+            "tier": "large_mid",
+        }
+    return {
+        "target_pct": 0.100,
+        "stop_pct": 0.050,
+        "trailing_stop_pct": 5.0,
+        "tier": "small",
+    }
 
 
 def get_trend_streak(symbol: str) -> dict:
@@ -2927,7 +3926,7 @@ def _paper_trade_snapshot(row, current_price: float) -> dict:
         "peak_price": float(row[14]) if row[14] is not None else None,
         "stop_loss_price": float(row[15]) if row[15] is not None else None,
         "take_profit_price": float(row[16]) if row[16] is not None else None,
-        "trailing_stop_pct": float(row[17]) if row[17] is not None else 3.0,
+        "trailing_stop_pct": float(row[17]) if row[17] is not None else 6.0,
         "review_date": row[18].isoformat() if row[18] else None,
         "last_alert_at": row[19].isoformat() if row[19] else None,
         "position_stage": row[20] or "entered",
@@ -3034,9 +4033,32 @@ def get_probability_and_score(symbol: str) -> dict:
     sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
     z = (0.05 - adjusted_mu) / sigma_63
     prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
+    # Calibrate against empirical win rate from completed tracking windows to
+    # break the circular dependency where P(≥5%) is derived from the same mu
+    # that drives the composite score.
+    prob_ge_5pct = _blend_empirical_prob(symbol, prob_ge_5pct)
 
     trend = prediction["trend"]
     trend_score = 0.9 if trend == "bullish" else 0.55 if trend == "neutral" else 0.2
+
+    # ── HACOLT confirmation multiplier ─────────────────────────────────────
+    # HACOLT (0=Strong Sell, 50=Neutral, 100=Strong Buy) acts as a
+    # Heikin-Ashi trend confirmation gate on the statistical trend_score:
+    #   - HACOLT confirms trend  → up to +10% boost on trend_score
+    #   - HACOLT contradicts trend → up to -30% penalty on trend_score
+    #   - HACOLT neutral (50)  → no change
+    hacolt = indicators.get("hacolt", 50.0)
+    if hacolt == 100.0:   # Strong Buy signal from Heikin-Ashi
+        if trend == "bullish":
+            trend_score = min(1.0, trend_score * 1.10)   # Trend confirmed
+        else:
+            trend_score = trend_score * 0.85             # Bullish HA, but stat says otherwise
+    elif hacolt == 0.0:   # Strong Sell signal from Heikin-Ashi
+        if trend == "bearish":
+            trend_score = min(1.0, trend_score * 1.10)   # Bear confirmed
+        else:
+            trend_score = trend_score * 0.70             # HA says sell, stat says up — big conflict
+    # hacolt == 50 (neutral/choppy) → no change to trend_score
 
     momentum = indicators.get("momentum_20", 0)
     quality_score = max(0.0, min(1.0, (1 - abs(rsi - 55) / 55) * 0.6 + (0.5 + momentum / 40) * 0.4))
@@ -3049,7 +4071,17 @@ def get_probability_and_score(symbol: str) -> dict:
     warning_type = None
 
     avg_vol = float(hist["Volume"].tail(20).mean()) if "Volume" in hist else 0
-    liquidity_score = max(0.1, min(1.0, avg_vol / 8_000_000))
+    dollar_volume = avg_vol * current_price
+    
+    # Base liquidity on DOLLAR volume, not raw shares (prevents small cap bias)
+    liquidity_score = max(0.1, min(1.0, dollar_volume / 5_000_000))
+    
+    # --- Expert Safety Net 1: The Liquidity/Slippage Trap ---
+    if avg_vol > 0 and dollar_volume < 100000:
+        high_volatility_warning = True
+        warning_type = "liquidity_trap"
+        warning_message = f"LIQUIDITY TRAP: Traded value is critically low (~${int(dollar_volume):,} / day). Extreme slippage risk."
+        liquidity_score *= 0.1  # Severe penalty for untradable stocks
 
     # --- Volume-Price Divergence Logic ---
     current_vol = float(hist["Volume"].iloc[-1]) if "Volume" in hist else 0
@@ -3062,8 +4094,15 @@ def get_probability_and_score(symbol: str) -> dict:
         warning_message = "Weak Spike Detected: Price jumped >5% on below-average volume. High risk of reversal."
         liquidity_score *= 0.5  # Penalize score for weak volume support
     elif price_spike > 0.05 and vol_ratio > 2.0:
-        # Increase confidence slightly on high-conviction moves
-        quality_score = min(1.0, quality_score * 1.1)
+        # Avoid the "Pump and Dump" trap: Only reward high-conviction volume spikes 
+        # if the stock is highly liquid. Penny stock spikes are often manipulated.
+        if dollar_volume > 2_000_000:
+            quality_score = min(1.0, quality_score * 1.1)
+        else:
+            high_volatility_warning = True
+            warning_type = "pump_risk"
+            warning_message = "PUMP RISK: Extreme volume spike on low-liquidity stock. High risk of dump/reversal."
+            quality_score *= 0.6  # Penalize micro-cap pumps
 
     # 4. Drawdown Risk Quantification (3-month window for relevance)
     hist_3m = hist.tail(63)
@@ -3096,6 +4135,7 @@ def get_probability_and_score(symbol: str) -> dict:
     sma_20 = float(hist["Close"].rolling(20).mean().iloc[-1])
     sma_50 = float(hist["Close"].rolling(min(50, len(hist))).mean().iloc[-1])
     sma_long = float(hist["Close"].rolling(min(120, len(hist))).mean().iloc[-1])
+    sma_200 = float(hist["Close"].rolling(min(200, len(hist))).mean().iloc[-1])
     
     if current_price > sma_20 > sma_50 > sma_long:
         regime_fit = 0.85  # Clean trending bull regime
@@ -3103,6 +4143,15 @@ def get_probability_and_score(symbol: str) -> dict:
         regime_fit = 0.40  # Choppy/Mean-reverting regime
     else:
         regime_fit = 0.30  # Bear or broken regime
+
+    # --- Expert Safety Net 2: The Falling Knife Trap ---
+    if current_price < sma_200:
+        if not high_volatility_warning:
+            high_volatility_warning = True
+            warning_type = "falling_knife"
+            warning_message = "FALLING KNIFE: Price is below the 200-day moving average. Long-term trend is structurally broken."
+        regime_fit *= 0.5  # Severe penalty for catching falling knives
+        prob_ge_5pct *= 0.7  # Degrade probability of success
 
     # --- Regime-Specific Volatility Triggers (VIX) ---
     snapshot = compute_regime_snapshot()
@@ -3123,6 +4172,15 @@ def get_probability_and_score(symbol: str) -> dict:
         regime_fit = min(1.0, regime_fit * 1.1)
         prob_ge_5pct = min(1.0, prob_ge_5pct * 1.05)
     # ---------------------------------------------------
+
+    # --- Large Cap Stability Premium ---
+    # Large caps have low volatility, so they mathematically struggle to trigger
+    # a 5% swing despite being excellent, safe setups. We add a stability premium.
+    if daily_vol < 0.015 and dollar_volume > 10_000_000:
+        prob_ge_5pct = min(1.0, prob_ge_5pct + 0.25) # Boost win rate for safe blue chips
+        quality_score = min(1.0, quality_score * 1.20)
+    elif daily_vol < 0.025 and dollar_volume > 2_000_000:
+        prob_ge_5pct = min(1.0, prob_ge_5pct + 0.15) # Boost mid-caps
 
     raw_score = (
         0.45 * prob_ge_5pct
@@ -3254,7 +4312,10 @@ def create_tracking_window(user_id: str, symbol: str, source: str = "manual_add"
 
     entry_price = stock_data["current_price"] or float(hist["Close"].iloc[-1])
     prediction = generate_statistical_prediction(hist, entry_price)
-    target_return_14d = (prediction["change_from_current"] / 100.0) / 4.5
+    # Scale the 90-day forecast proportionally to the 63-day tracking window.
+    # Previously used /4.5 (a 14-day fraction of 90 days) which caused the
+    # self-learning loop to train a 90-day model on 14-day outcomes — invalid.
+    target_return_14d = (prediction["change_from_current"] / 100.0) * (63.0 / 90.0)
     target_price_14d = entry_price * (1 + target_return_14d)
     expected_direction = "up" if target_return_14d >= 0 else "down"
 
@@ -3292,7 +4353,7 @@ def create_tracking_window(user_id: str, symbol: str, source: str = "manual_add"
                 "user_id": user_id,
                 "symbol": symbol,
                 "start_date": start_date,
-                "end_date": start_date + timedelta(days=14),
+                "end_date": start_date + timedelta(days=63),
                 "entry_price": float(entry_price),
                 "target_price_14d": float(target_price_14d),
                 "target_return_14d": float(target_return_14d),
@@ -3608,89 +4669,52 @@ async def suggest_symbols_from_ai(query: str, max_symbols: int, provider_prefere
     return heuristic_symbols_from_query(query, max_symbols=max_symbols), "fallback", ""
 
 def generate_statistical_prediction(df: pd.DataFrame, current_price: float, sector: str = "", symbol: str = "") -> dict:
-    """Generate statistical prediction using multiple methods (LR, ARIMA, XGBoost, SMA, and Macro overlay)."""
+    """Generate statistical prediction using robust short-term methods (14-day rolling horizon)."""
 
-    future_days = 90
+    future_days = 14 # Shortened to 14 days to minimize forecast noise
     close = df['Close'].values
     model_count = 0
-    method_preds = []
+    
+    # Kalman Filter for smoothing prices
+    try:
+        from pykalman import KalmanFilter
+        kf = KalmanFilter(transition_matrices=[1], observation_matrices=[1], initial_state_mean=close[0], initial_state_covariance=1, observation_covariance=1, transition_covariance=0.01)
+        state_means, _ = kf.filter(close)
+        smoothed_close = state_means.flatten()
+    except Exception:
+        smoothed_close = close
 
-    # Method 1: Linear trend projection (always available)
-    X = np.arange(len(df)).reshape(-1, 1)
+    # Method 1: Linear trend projection (short-term window only)
+    short_window_len = min(future_days * 2, len(smoothed_close))
+    short_close = smoothed_close[-short_window_len:]
+    X = np.arange(len(short_close)).reshape(-1, 1)
     from sklearn.linear_model import LinearRegression
     lr = LinearRegression()
-    lr.fit(X, close)
-    future_X = np.arange(len(df), len(df) + future_days).reshape(-1, 1)
+    lr.fit(X, short_close)
+    future_X = np.arange(len(short_close), len(short_close) + future_days).reshape(-1, 1)
     lr_pred = float(lr.predict(future_X)[-1])
+    
+    # Clamp extreme linear projections to realistic bounds
+    if abs(lr_pred - current_price) / max(current_price, 1e-6) > 0.15:
+        lr_pred = current_price * (1.15 if lr_pred > current_price else 0.85)
     model_count += 1
 
-    # Method 2: ARIMA(2,1,2) — requires statsmodels
-    arima_pred: Optional[float] = None
-    try:
-        from statsmodels.tsa.arima.model import ARIMA
-        series = pd.Series(close[-min(252, len(close)):])
-        arima_fit = ARIMA(series, order=(2, 1, 2)).fit()
-        arima_forecast = arima_fit.forecast(steps=future_days)
-        arima_pred = float(arima_forecast.iloc[-1])
-        if abs(arima_pred - current_price) / max(current_price, 1e-6) > 0.30:
-            arima_pred = None
-        else:
-            model_count += 1
-    except Exception:
-        pass
-
-    # Method 3: XGBoost — requires xgboost
-    xgb_pred: Optional[float] = None
-    try:
-        import xgboost as xgb
-        returns = pd.Series(close).pct_change().dropna().values
-        if len(returns) >= 30:
-            lags = [1, 3, 5, 10, 20]
-            feature_rows = []
-            targets = []
-            min_lag = max(lags)
-            for i in range(min_lag, len(returns) - 1):
-                row = [returns[i - lag] for lag in lags]
-                feature_rows.append(row)
-                targets.append(returns[i + 1])
-            if len(feature_rows) >= 10:
-                X_xgb = np.array(feature_rows)
-                y_xgb = np.array(targets)
-                model_xgb = xgb.XGBRegressor(
-                    n_estimators=100, max_depth=4, learning_rate=0.05,
-                    subsample=0.8, colsample_bytree=0.8,
-                    random_state=42, verbosity=0
-                )
-                model_xgb.fit(X_xgb, y_xgb)
-                # Predict the average daily return for the next ~future_days
-                last_row = np.array([[returns[-lag] for lag in lags]])
-                daily_ret = float(model_xgb.predict(last_row)[0])
-                # Clamp daily return to prevent absurd compounding (max ±0.5%/day)
-                daily_ret = max(-0.005, min(0.005, daily_ret))
-                xgb_pred = current_price * (1 + daily_ret) ** future_days
-                # Reject if prediction is more than ±30% from current (outlier)
-                if abs(xgb_pred - current_price) / current_price > 0.30:
-                    xgb_pred = None
-                model_count += 1
-    except Exception:
-        pass
-
-    # Method 4: SMA projection (always available)
-    sma_50 = float(df['Close'].rolling(50).mean().iloc[-1]) if len(df) >= 50 else float(np.mean(close))
+    # Method 2: SMA projection (always available)
+    sma_20 = float(df['Close'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else float(np.mean(close))
     model_count += 1
 
-    # Blend weights depend on which models succeeded
-    if arima_pred is not None and xgb_pred is not None:
-        combined_pred = lr_pred * 0.20 + arima_pred * 0.30 + xgb_pred * 0.30 + sma_50 * 0.20
-    elif arima_pred is not None:
-        combined_pred = lr_pred * 0.30 + arima_pred * 0.40 + sma_50 * 0.30
-    elif xgb_pred is not None:
-        combined_pred = lr_pred * 0.30 + xgb_pred * 0.40 + sma_50 * 0.30
-    else:
-        # Legacy blend (no advanced models)
-        weights = np.linspace(1, 2, min(50, len(df)))
-        weighted_avg = float(np.average(df['Close'].tail(50), weights=weights))
-        combined_pred = lr_pred * 0.40 + sma_50 * 0.30 + weighted_avg * 0.30
+    # Method 3: Exponential smoothing
+    weights = np.linspace(1, 2, min(14, len(df)))
+    weighted_avg = float(np.average(df['Close'].tail(len(weights)), weights=weights))
+    model_count += 1
+    
+    # 14-day target blending
+    combined_pred = lr_pred * 0.30 + sma_20 * 0.30 + weighted_avg * 0.40
+
+    # Ensemble disagreement metric
+    preds = [lr_pred, sma_20, weighted_avg]
+    ensemble_std = float(np.std(preds))
+    ensemble_disagreement = ensemble_std / current_price if current_price > 0 else 0
 
     # Apply Macroeconomic Top-Down Adjustments
     try:
@@ -3700,9 +4724,18 @@ def generate_statistical_prediction(df: pd.DataFrame, current_price: float, sect
 
     combined_pred = combined_pred * macro_adj
 
-    # Confidence interval based on volatility
-    volatility = float(pd.Series(close).pct_change().std())
-    confidence_margin = combined_pred * volatility * 2
+    # Confidence interval based on volatility and disagreement
+    try:
+        volatility = float(pd.Series(close).pct_change().dropna().std())
+        if np.isnan(volatility) or np.isinf(volatility):
+            volatility = 0.02
+    except Exception:
+        volatility = 0.02
+        
+    if np.isnan(combined_pred) or np.isinf(combined_pred):
+        combined_pred = current_price
+        
+    confidence_margin = combined_pred * (volatility + ensemble_disagreement) * 2
 
     # Determine trend
     if combined_pred > current_price * 1.05:
@@ -3713,15 +4746,41 @@ def generate_statistical_prediction(df: pd.DataFrame, current_price: float, sect
         trend = "neutral"
 
     return {
-        "predicted_price": round(combined_pred, 2),
-        "confidence_low": round(combined_pred - confidence_margin, 2),
-        "confidence_high": round(combined_pred + confidence_margin, 2),
+        "predicted_price": round(float(combined_pred), 2),
+        "confidence_low": round(float(combined_pred - confidence_margin), 2),
+        "confidence_high": round(float(combined_pred + confidence_margin), 2),
         "trend": trend,
-        "change_from_current": round(((combined_pred - current_price) / current_price * 100), 2),
+        "change_from_current": round(float(((combined_pred - current_price) / max(current_price, 1e-6) * 100)), 2),
         "model_count": model_count,
-        "arima_pred": round(arima_pred, 2) if arima_pred is not None else None,
-        "xgb_pred": round(xgb_pred, 2) if xgb_pred is not None else None,
+        "ensemble_disagreement": round(ensemble_disagreement, 4),
+        "arima_pred": None,
+        "xgb_pred": None,
     }
+
+def get_recent_news(symbol: str, market: str) -> list:
+    """Fetch recent news from EODHD to include in analysis."""
+    if not EODHD_API_KEY:
+        return []
+    try:
+        _eodhd_rate_limit()
+        ticker = format_ticker(symbol, market).replace(".AX", ".AU")
+        url = f"https://eodhd.com/api/news"
+        r = requests.get(url, params={"s": ticker, "api_token": EODHD_API_KEY, "limit": 4, "offset": 0}, timeout=5)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        news_items = []
+        for item in data:
+            title = item.get("title", "")
+            sentiment = item.get("sentiment", {})
+            polarity = sentiment.get("polarity", 0)
+            if title:
+                news_items.append({"title": title, "polarity": polarity})
+        return news_items
+    except Exception as e:
+        print(f"[EODHD News] Error fetching news for {symbol}: {e}")
+        return []
+
 
 async def get_llm_analysis(
     symbol: str, 
@@ -3824,6 +4883,14 @@ Catalyst & Market Structure:
         elif days_to_e is not None and 0 < days_to_e <= 30:
             earnings_warning = f"\n📅  Earnings in {days_to_e} days — watch for analyst estimate revisions pre-result."
 
+    # Fetch recent news
+    market = detect_market(symbol)
+    news_items = get_recent_news(symbol, market)
+    news_block = ""
+    if news_items:
+        news_lines = "\n".join([f"- {n['title']} (Sentiment Polarity: {n['polarity']:.2f})" for n in news_items])
+        news_block = f"\nRecent Financial News Sentiment:\n{news_lines}\n"
+
     full_prompt = f"""You are a financial data analyst.
 You do not give financial advice.
 You only analyse data, identify patterns, compare companies, and explain market behaviour.
@@ -3854,6 +4921,7 @@ Valuation:
 - Market Cap: {market_cap_str}
 {analyst_consensus_block}
 {catalyst_block}
+{news_block}
 
 Risk Metrics:
 - Beta (vs ASX200): {risk.get('beta', 'N/A')}
@@ -4211,6 +5279,39 @@ async def health_check():
     except SQLAlchemyError:
         db_ok = False
 
+    # ── Scheduled task freshness ──────────────────────────────────────────────
+    tz = _get_scheduler_timezone()
+    now_local = datetime.now(tz)
+    now_utc = datetime.utcnow()
+
+    scan_age_h = None
+    digest_sent_today = False
+    weekly_age_d = None
+    try:
+        with db_conn() as _c:
+            _sr = _c.execute(text(
+                "SELECT generated_at FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+            )).fetchone()
+            if _sr and _sr[0]:
+                _g = _sr[0] if isinstance(_sr[0], datetime) else datetime.fromisoformat(str(_sr[0]))
+                scan_age_h = round((now_utc - _g.replace(tzinfo=None)).total_seconds() / 3600, 1)
+
+            _dk = _daily_digest_cache_key()
+            _dr = _c.execute(text(
+                "SELECT COUNT(*) FROM telegram_send_log WHERE message_type='daily_digest' AND digest_key=:dk AND status='sent'"
+            ), {"dk": _dk}).fetchone()
+            digest_sent_today = (_dr[0] if _dr else 0) > 0
+
+            _wr = _c.execute(text("SELECT MAX(generated_at) FROM weekly_digests")).fetchone()
+            if _wr and _wr[0]:
+                _wg = _wr[0] if isinstance(_wr[0], datetime) else datetime.fromisoformat(str(_wr[0]))
+                weekly_age_d = round((now_utc - _wg.replace(tzinfo=None)).total_seconds() / 86400, 1)
+    except Exception:
+        pass
+
+    from datetime import time as _t
+    is_market_hours = (_t(10, 0) <= now_local.time() <= _t(16, 0)) and (now_local.weekday() < 5)
+
     return {
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "disconnected",
@@ -4220,6 +5321,14 @@ async def health_check():
         "openai_configured": bool(openai_client),
         "openai_model": OPENAI_MODEL,
         "auth_enabled": True,
+        "scheduler": {
+            "broad_scan_age_hours": scan_age_h,
+            "broad_scan_fresh": scan_age_h is not None and scan_age_h < 20,
+            "daily_digest_sent_today": digest_sent_today,
+            "weekly_picks_age_days": weekly_age_d,
+            "market_hours_active": is_market_hours,
+            "local_time": now_local.strftime("%a %Y-%m-%d %H:%M %Z"),
+        },
     }
 
 
@@ -5239,6 +6348,25 @@ async def analyze_share(symbol: str, market: str = None, current_user: dict = De
     # Generate prediction using multiple methods
     prediction = generate_statistical_prediction(hist, stock_data["current_price"], sector=valuation.get('sector', ''), symbol=symbol)
 
+    # Apply Wealth Builder constraints so Analyze Tab is perfectly in sync with the scanner
+    try:
+        score_data = get_probability_and_score(symbol)
+        prediction["score"] = score_data.get("score", 0)
+        prediction["prob_ge_5pct"] = score_data.get("prob_ge_5pct", 0)
+        prediction["high_volatility_warning"] = score_data.get("high_volatility_warning", False)
+        prediction["warning_message"] = score_data.get("warning_message", "")
+        prediction["quality_reason"] = score_data.get("quality_reason", "")
+        
+        # Override naive statistical prediction with the constraint-adjusted prediction
+        if "expected_return_3m_pct" in score_data:
+            prediction["change_from_current"] = score_data["expected_return_3m_pct"]
+        if "predicted_price_3m" in score_data:
+            prediction["predicted_price"] = score_data["predicted_price_3m"]
+        if "trend" in score_data:
+            prediction["trend"] = score_data["trend"]
+    except Exception as e:
+        print(f"[AnalyzeTab] Could not apply wealth constraints to {symbol}: {e}")
+
     regime = {
         "name": regime_snapshot.get("regime", "N/A"),
         "confidence": regime_snapshot.get("confidence", 0)
@@ -5516,27 +6644,63 @@ Be detailed and specific. This is for educational purposes only."""
     return {"analysis": analysis}
 
 
+@app.post("/api/ai/deep-dive")
+async def deep_dive_analysis(query: SymbolQuery, current_user: dict = Depends(get_current_user)):
+    """Trigger the LangGraph 6-Persona Multi-Agent Debate (6 analysts → rebuttal → CIO verdict)"""
+    if not run_agentic_analysis:
+        raise HTTPException(status_code=501, detail="LangGraph harness is not fully installed or available.")
+    
+    sym = query.symbol.strip().upper()
+    market = "AU"
+    try:
+        sd = get_stock_data(sym, market)
+        val = get_valuation_metrics(sym)
+        hist = get_historical_data(sym, period="1y")
+        tech = {}
+        if len(hist) > 0:
+            tech = calculate_technical_indicators(hist)
+            # Expand context keys for the 6 personas (include all new Layer 1 indicators)
+            tech = {k: v for k, v in tech.items() if k in [
+                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
+                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
+                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
+                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b",
+            ]}
+
+        # Build Layer 1 confluence snapshot
+        try:
+            prediction = generate_statistical_prediction(hist, sd.get("current_price", 0) or float(hist["Close"].iloc[-1]))
+            regime_snap = compute_regime_snapshot()
+        except Exception:
+            prediction = {}
+            regime_snap = {}
+        confluence = bullish_confluence_score(sym, market, tech, prediction, sd, hist, val, regime_snap)
+
+        # Run the 6-Persona Multi-Agent Debate
+        result = await asyncio.to_thread(run_agentic_analysis, sym, market, tech, val, confluence)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deep Dive failed: {str(e)}")
+
+
 @app.post("/api/ai/sentiment")
 async def get_sentiment_analysis(payload: SentimentRequest, current_user: dict = Depends(get_current_user)):
     del current_user
     symbol = payload.symbol.upper().strip()
     
-    # Get stock news from yfinance
+    # Get stock news from EODHD
     market = detect_market(symbol)
-    ticker = yf.Ticker(format_ticker(symbol, market))
+    recent_news = get_recent_news(symbol, market)
     news_items = []
     
-    try:
-        news = ticker.news
-        if news:
-            for item in news[:10]:  # Get up to 10 news items
-                news_items.append({
-                    "title": item.get("title", ""),
-                    "publisher": item.get("publisher", ""),
-                    "link": item.get("link", "")
-                })
-    except:
-        pass
+    if recent_news:
+        for item in recent_news[:10]:
+            news_items.append({
+                "title": item.get("title", ""),
+                "publisher": "Financial News",
+                "link": ""
+            })
     
     # If no news, provide sample analysis
     if not news_items:
@@ -5730,7 +6894,7 @@ async def tracking_overview(current_user: dict = Depends(get_current_user)):
                 "id": row[0],
                 "symbol": symbol,
                 "start_date": start_date.isoformat(),
-                "current_day": min(days_elapsed, 14),
+                "current_day": min(days_elapsed, 63),
                 "entry_price": round(entry_price, 2),
                 "target_price_14d": round(target_price, 2),
                 "current_price": round(current_price, 2),
@@ -6120,22 +7284,37 @@ async def suggest_portfolio(
         raise HTTPException(status_code=400, detail="Insufficient price data for optimisation")
 
     mu = expected_returns.mean_historical_return(df)
-    S = risk_models.sample_cov(df)
+    
     try:
-        ef = EfficientFrontier(mu, S)
-        if risk_profile == "conservative":
-            ef.min_volatility()
-        elif risk_profile == "aggressive":
-            ef.max_quadratic_utility(risk_aversion=0.5)
+        # HRP does not invert the covariance matrix and is much more robust to noise
+        hrp = HRPOpt(df.pct_change().dropna())
+        hrp.optimize()
+        raw_weights = hrp.clean_weights()
+        
+        # Enforce minimum position size (5%)
+        # Filter out anything below 5% and re-normalize to reduce excessive small trades
+        min_weight = 0.05
+        filtered_weights = {k: v for k, v in raw_weights.items() if v >= min_weight}
+        
+        if not filtered_weights:
+            symbols = df.columns.tolist()
+            w = 1.0 / len(symbols)
+            cleaned_weights = {s: w for s in symbols}
         else:
-            ef.max_sharpe(risk_free_rate=0.04)
-        cleaned_weights = ef.clean_weights()
-        perf = ef.portfolio_performance(risk_free_rate=0.04)
+            total_w = sum(filtered_weights.values())
+            cleaned_weights = {k: v / total_w for k, v in filtered_weights.items()}
+
+        # Estimate impact of transaction costs on return (approx 0.2% penalty per position on a standard $10k portfolio)
+        txn_penalty = len(cleaned_weights) * 0.002 
+        
+        raw_perf = hrp.portfolio_performance(risk_free_rate=0.04)
+        perf = (raw_perf[0] - txn_penalty, raw_perf[1], (raw_perf[0] - txn_penalty - 0.04) / max(raw_perf[1], 1e-6))
     except Exception:
-        ef2 = EfficientFrontier(mu, S)
-        ef2.max_sharpe(risk_free_rate=0.04)
-        cleaned_weights = ef2.clean_weights()
-        perf = ef2.portfolio_performance(risk_free_rate=0.04)
+        # Fallback to simple equal weight if optimization completely fails
+        symbols = df.columns.tolist()
+        w = 1.0 / len(symbols)
+        cleaned_weights = {s: w for s in symbols}
+        perf = (0.0, 0.0, 0.0)
 
     holdings_out = sorted(
         [
@@ -6379,7 +7558,6 @@ except ImportError:
     SCHEDULER_AVAILABLE = False
 
 import time as _time
-import threading
 
 # ── Cache layer ───────────────────────────────────────────────────────────────
 _cache: dict = {}
@@ -6470,6 +7648,19 @@ def init_phase6_tables():
                 screened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 evaluated BOOLEAN DEFAULT FALSE,
                 UNIQUE(symbol, screened_at)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_self_learning_metrics (
+                id SERIAL PRIMARY KEY,
+                evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_trades INTEGER,
+                win_count INTEGER,
+                loss_count INTEGER,
+                win_rate_pct NUMERIC(6, 2),
+                avg_win_pct NUMERIC(6, 2),
+                avg_loss_pct NUMERIC(6, 2),
+                recommended_action TEXT
             )
         """))
 
@@ -6718,9 +7909,17 @@ def score_and_rank(symbols: list, market: str) -> list:
             sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
             z = (0.05 - mu) / sigma_63
             prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
+            prob_ge_5pct = _blend_empirical_prob(sym, prob_ge_5pct)
 
             trend = prediction["trend"]
             trend_score = 0.9 if trend == "bullish" else 0.55 if trend == "neutral" else 0.2
+
+            # HACOLT confirmation multiplier (same logic as primary engine)
+            hacolt = indicators.get("hacolt", 50.0)
+            if hacolt == 100.0:
+                trend_score = min(1.0, trend_score * 1.10) if trend == "bullish" else trend_score * 0.85
+            elif hacolt == 0.0:
+                trend_score = min(1.0, trend_score * 1.10) if trend == "bearish" else trend_score * 0.70
 
             rsi = indicators.get("rsi", 50)
             momentum = indicators.get("momentum_20", 0)
@@ -6737,6 +7936,21 @@ def score_and_rank(symbols: list, market: str) -> list:
                 + 0.10 * liquidity_score
             ) * 100
 
+            # ── Layer 1 Confluence ──────────────────────────────────────────
+            try:
+                regime_snap = compute_regime_snapshot()
+            except Exception:
+                regime_snap = {}
+            valuation = get_valuation_metrics(sym)
+            confluence = bullish_confluence_score(
+                sym, market, indicators, prediction, stock_data, hist, valuation, regime_snap
+            )
+            # Boost score by confluence multiplier if ≥3 channels bullish
+            if confluence["confidence"] == "high" and confluence["bullish_channels"] >= 4:
+                score = score * 1.12
+            elif confluence["confidence"] == "medium" and confluence["bullish_channels"] >= 3:
+                score = score * 1.05
+
             results.append({
                 "symbol": sym,
                 "name": stock_data.get("name", sym),
@@ -6748,6 +7962,10 @@ def score_and_rank(symbols: list, market: str) -> list:
                 "score": round(score, 2),
                 "market": market,
                 "cap_tier": None,
+                "confluence": {
+                    "confidence": confluence["confidence"],
+                    "bullish_channels": confluence["bullish_channels"],
+                },
             })
         except Exception:
             continue
@@ -7635,6 +8853,9 @@ class PaperTradeCreate(BaseModel):
     side: str = "LONG"
     quantity: float = 100
     notes: Optional[str] = None
+    # User's actual fill price — may differ from the live quote at signal time.
+    # When provided this becomes the entry_price recorded in the trade.
+    actual_price: Optional[float] = None
 
 
 class PaperTradeClose(BaseModel):
@@ -8134,7 +9355,11 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
         recipients = get_user_telegram_recipients(current_user["id"])
         if recipients:
             gross_amount = quantity * execution_price
-            stop_loss_price = round(execution_price * 0.92, 2)
+            _sd = get_stock_data(symbol, market)
+            _dv = float(_sd.get("avg_volume_5d") or 0) * execution_price
+            _sp = _get_strategy_params(_dv)
+            stop_loss_price = round(execution_price * (1 - _sp["stop_pct"]), 2)
+            stop_pct_display = int(_sp["stop_pct"] * 100)
             target_pct = round(((analyst_target - execution_price) / execution_price) * 100, 2) if analyst_target and execution_price > 0 else None
             target_str = f"${analyst_target:.2f} ({target_pct:+.1f}%)" if analyst_target and target_pct else "N/A"
 
@@ -8142,7 +9367,7 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
                 f"<b>✅ {'BUY' if action_type in ('BUY', 'ADD') else action_type} RECORDED — {symbol}.{market}</b>\n"
                 f"Shares: {quantity} @ ${execution_price:.2f}\n"
                 f"Total invested: ${gross_amount:,.2f}\n"
-                f"Stop loss target: ~${stop_loss_price:.2f} (-8%)\n"
+                f"Stop loss target: ~${stop_loss_price:.2f} (-{stop_pct_display}%)\n"
                 f"Analyst target: {target_str}\n"
                 f"Monitoring active \U0001f4e1 — you'll be notified when conditions change."
             )
@@ -8329,13 +9554,49 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
         raise HTTPException(status_code=400, detail="side must be LONG or SHORT")
 
     stock_data = get_stock_data(symbol, market)
-    current_price = float(stock_data.get("current_price") or 0)
-    if current_price <= 0:
+    live_price = float(stock_data.get("current_price") or 0)
+    if live_price <= 0:
         raise HTTPException(status_code=404, detail=f"Unable to fetch market price for {symbol}")
 
+    # ── Actual fill price ─────────────────────────────────────────────────────
+    # The user may have filled at a price different from the live quote (e.g.
+    # they acted on a Telegram signal minutes/hours earlier, or got a partial
+    # fill at a limit price).  We record their actual fill as the entry so that
+    # PnL math is accurate.  We allow up to ±10% deviation from live quote as a
+    # sanity guard against typos; outside that range we fall back to live price.
+    if payload.actual_price and payload.actual_price > 0:
+        deviation_pct = abs(payload.actual_price - live_price) / live_price
+        if deviation_pct <= 0.10:
+            entry_price = round(float(payload.actual_price), 4)
+        else:
+            entry_price = live_price  # suspicious deviation — use live price
+            payload = payload.model_copy(update={"notes": (
+                (payload.notes or "") +
+                f" [Note: Actual price ${payload.actual_price:.3f} deviated >{deviation_pct*100:.1f}% from live ${live_price:.3f} — using live price.]"
+            ).strip()})
+    else:
+        entry_price = live_price
+
+    # ── Cap-tier calibrated targets ───────────────────────────────────────────
+    # Large/mid cap (dollar volume > $5M/day): 4% target, 5% stop → R:R 0.80
+    # Small cap: 5% target, 6% stop → R:R 0.83
+    # Both leave >24pp buffer below the 80% success target (break-even ~55%).
     signal = get_probability_and_score(symbol)
-    target_price = float(signal.get("predicted_price_3m") or current_price)
-    stop_loss_price = current_price * (1.03 if side == "SHORT" else 0.97)
+    avg_vol_5d = float(stock_data.get("avg_volume_5d") or 0)
+    dollar_volume = avg_vol_5d * entry_price
+    _params = _get_strategy_params(dollar_volume)
+
+    if side == "LONG":
+        target_price = round(entry_price * (1 + _params["target_pct"]), 4)
+    else:  # SHORT
+        target_price = round(entry_price * (1 - _params["target_pct"]), 4)
+
+    # ── Stop-loss (cap-tier calibrated for R:R alignment) ─────────────────────
+    if side == "SHORT":
+        stop_loss_price = round(entry_price * (1 + _params["stop_pct"]), 4)
+    else:
+        stop_loss_price = round(entry_price * (1 - _params["stop_pct"]), 4)
+
     trade_id = str(uuid4())
 
     with db_conn() as conn:
@@ -8348,7 +9609,7 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                      position_stage, recommendation_action, source_reason, updated_at)
                 VALUES
                     (:id, :user_id, :symbol, :market, :side, :quantity, :entry_price, :current_price,
-                     :target_price, 'open', :signal_score, :signal_trend, :signal_warning, :notes, :current_price,
+                     :target_price, 'open', :signal_score, :signal_trend, :signal_warning, :notes, :entry_price,
                      :stop_loss_price, :take_profit_price, :trailing_stop_pct, :review_date,
                      :position_stage, :recommendation_action, :source_reason, :updated_at)
             """),
@@ -8359,17 +9620,17 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                 "market": market,
                 "side": side,
                 "quantity": float(payload.quantity or 1),
-                "entry_price": current_price,
-                "current_price": current_price,
+                "entry_price": entry_price,
+                "current_price": live_price,
                 "target_price": target_price,
                 "signal_score": signal.get("score"),
                 "signal_trend": signal.get("trend"),
                 "signal_warning": signal.get("warning_message"),
                 "notes": payload.notes,
-                "peak_price": current_price,
+                "peak_price": entry_price,
                 "stop_loss_price": stop_loss_price,
                 "take_profit_price": target_price,
-                "trailing_stop_pct": 3.0,
+                "trailing_stop_pct": _params["trailing_stop_pct"],
                 "review_date": datetime.utcnow() + timedelta(days=1),
                 "position_stage": "entered",
                 "recommendation_action": "SHORT" if side == "SHORT" else "BUY",
@@ -8381,17 +9642,57 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
     log_position_event(trade_id, current_user["id"], "opened", f"Opened {side} tracking position for {symbol}", {
         "symbol": symbol,
         "market": market,
-        "entry_price": current_price,
+        "entry_price": entry_price,
+        "live_price_at_signal": live_price,
         "target_price": target_price,
         "stop_loss_price": stop_loss_price,
     })
+
+    # Ensure this trade is synced with the Advice Execution Engine so the background 
+    # Positions Monitor tracks it just like a Telegram trade.
+    try:
+        val = get_valuation_metrics(symbol)
+        analyst_target = val.get("analyst_target_mean") or 0
+        
+        _create_advice_action_for_user(
+            user_id=current_user["id"],
+            symbol=symbol,
+            market=market,
+            action_type="BUY" if side == "LONG" else "SHORT",
+            quantity=float(payload.quantity or 1),
+            execution_price=entry_price,
+            commission=0,
+            advice_cache_key=None,
+            source_message_type="web_wealth_tab",
+            notes=payload.notes,
+        )
+        
+        # Send Telegram confirmation if configured
+        recipients = get_user_telegram_recipients(current_user["id"])
+        if recipients:
+            gross_amount = float(payload.quantity or 1) * entry_price
+            stop_pct_display = int(_params["stop_pct"] * 100)
+            target_pct = round(((analyst_target - entry_price) / entry_price) * 100, 2) if analyst_target and entry_price > 0 else None
+            target_str = f"${analyst_target:.2f} ({target_pct:+.1f}%)" if analyst_target and target_pct else "N/A"
+            buy_msg = (
+                f"<b>✅ {'BUY' if side == 'LONG' else 'SHORT'} RECORDED (Web) — {symbol}.{market}</b>\n"
+                f"Shares: {float(payload.quantity or 1)} @ ${entry_price:.2f}\n"
+                f"Total invested: ${gross_amount:,.2f}\n"
+                f"Stop loss target: ~${stop_loss_price:.2f} (-{stop_pct_display}%)\n"
+                f"Analyst target: {target_str}\n"
+                f"Monitoring active 📡 — you'll be notified when conditions change."
+            )
+            _send_telegram_payload(recipients, buy_msg)
+    except Exception as e:
+        print(f"Error syncing paper trade to advice engine/telegram: {e}")
 
     return {
         "id": trade_id,
         "symbol": symbol,
         "market": market,
         "side": side,
-        "entry_price": current_price,
+        "entry_price": entry_price,
+        "live_price_at_signal": live_price,
         "target_price": target_price,
         "signal": signal,
     }
@@ -8539,17 +9840,50 @@ def _scheduled_broad_scan_precompute():
     import time as _sleep_time
     start = datetime.utcnow()
     market = "AU"
-    symbol_pool = list(ASX_COMPANIES.keys())
+    # ── Expanded universe via EODHD (falls back to hardcoded if key not set) ──
+    # BROAD_SCAN_CAP caps the number of tickers per run so a mini-PC (6800H)
+    # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
+    # In UAT mode, cap reduces to 30 to stay within EODHD 20 calls/min free tier
+    # and Groq 30 req/min limits.
+    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "500"))
+    if UAT_MODE:
+        broad_scan_cap = min(broad_scan_cap, 30)
+        _EODHD_MIN_INTERVAL_INTERNAL = 3.0
+    else:
+        _EODHD_MIN_INTERVAL_INTERNAL = _EODHD_MIN_INTERVAL
+    full_universe = get_asx_universe()  # up to 1,600+ with EODHD, 257 without
+    all_symbols = list(full_universe.keys())
+    # Guarantee priority stocks (large/mid cap and hardcoded) are always included
+    priority_symbols = set()
+    # Add large/mid caps
+    for cap_type in ["large_cap", "mid_cap", "etf", "crypto"]:
+        for sym in WEEKLY_UNIVERSE.get("AU", {}).get(cap_type, []):
+            priority_symbols.add(sym)
+            
+    # Add curated ASX_COMPANIES
+    for sym in ASX_COMPANIES.keys():
+        priority_symbols.add(sym)
+        
+    priority_pool = list(priority_symbols)
+    
+    # Remaining universe (strictly exclude non-ordinary shares/hybrids with length > 3)
+    remaining_pool = [s for s in all_symbols if s not in priority_symbols and len(s) <= 3]
+    random.shuffle(remaining_pool)
+    
+    # Combine (Priority first, then shuffled remaining up to cap)
+    symbol_pool = priority_pool + remaining_pool
+    symbol_pool = symbol_pool[:broad_scan_cap]
+
     scanned = 0
     candidates = []
 
-    print(f"[BroadScan] Starting pre-compute for {len(symbol_pool)} ASX tickers at {start.isoformat()}")
+    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {start.isoformat()}")
 
     for sym in symbol_pool:
         try:
             result = _score_wealth_candidate(sym, market)
             scanned += 1
-            if result and (result.get("score") or 0) >= 0.35:
+            if result and (result.get("score") or 0) >= 35.0:
                 candidates.append(result)
             # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits
             _sleep_time.sleep(0.3)
@@ -8557,7 +9891,18 @@ def _scheduled_broad_scan_precompute():
             pass
 
     # Sort by wealth_rank descending
-    candidates.sort(key=lambda x: x.get("wealth_rank", 0), reverse=True)
+    candidates.sort(key=lambda x: x.get("wealth_rank", 0) or x.get("score", 0), reverse=True)
+
+    # Apply Sector Concentration Cap (Max 15 per sector to enforce diversification)
+    sector_counts = {}
+    diversified_candidates = []
+    for c in candidates:
+        sector = (c.get("valuation_metrics") or {}).get("sector", "Unknown")
+        if sector_counts.get(sector, 0) < 15:
+            diversified_candidates.append(c)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            
+    candidates = diversified_candidates
 
     try:
         with db_conn() as conn:
@@ -8585,7 +9930,9 @@ def _scheduled_broad_scan_precompute():
             score = c.get("score") or 0
             prob = c.get("prob_ge_5pct") or 0
             zone = (c.get("entry_timing") or {}).get("entry_zone", "caution")
-            if score >= 0.65 and prob >= 65.0 and zone == "clear":
+            confluence_conf = (c.get("confluence") or {}).get("confidence", "low")
+            confluence_bullish = (c.get("confluence") or {}).get("bullish_channels", 0)
+            if score >= 0.65 and prob >= 65.0 and zone == "clear" and confluence_conf == "high" and confluence_bullish >= 4:
                 high_conviction.append(c)
 
         if high_conviction:
@@ -8888,6 +10235,13 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
         if len(hist) < 120:
             return None
 
+        valuation = get_valuation_metrics(symbol)
+        
+        # Flaw 11: Micro-Cap Shell Contamination - enforce $50M minimum Market Cap
+        market_cap_val = valuation.get("market_cap") or (cp * avg_vol * 200 if avg_vol else None)
+        if market_cap_val and market_cap_val < 50_000_000:
+            return None
+
         # ── Volume/Liquidity quality ──────────────────────────────────────────
         liquidity_ok = True
         liquidity_penalty = 1.0
@@ -8903,7 +10257,6 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
             liquidity_flags.append("VOL_SPIKE")
 
         indicators = calculate_technical_indicators(hist)
-        valuation = get_valuation_metrics(symbol)
         prediction = generate_statistical_prediction(
             hist, cp, sector=valuation.get("sector", ""), symbol=symbol
         )
@@ -8918,8 +10271,14 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
             bear_market = regime_snap.get("bear_market", False)
             vix_level = regime_snap.get("vix_level", 20)
         except Exception:
+            regime_snap = {}
             bear_market = False
             vix_level = 20
+
+        # ── Layer 1 Bullish Confluence Engine ──────────────────────────────────
+        confluence = bullish_confluence_score(
+            symbol, market, indicators, prediction, sd, hist, valuation, regime_snap
+        )
 
         # ── Relative strength vs sector ───────────────────────────────────────
         sector = valuation.get("sector", "")
@@ -8975,6 +10334,9 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
             "pe": valuation.get("pe"),
             "forward_pe": valuation.get("forward_pe"),
             "eps_growth_fwd_pct": valuation.get("eps_growth_fwd_pct"),
+            "market_cap": valuation.get("market_cap") or (cp * avg_vol * 200 if avg_vol else None),
+            "52w_high": float(hist["High"].max()) if len(hist) > 0 and "High" in hist.columns else None,
+            "52w_low": float(hist["Low"].min()) if len(hist) > 0 and "Low" in hist.columns else None,
             # New dimensions
             "avg_volume": avg_vol,
             "liquidity_ok": liquidity_ok,
@@ -8986,21 +10348,22 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
             "trailing_eps": eps_diluted,
             "revenue_growth": revenue_growth,
              "entry_timing": entry_timing,
-            # Composite wealth rank with multi-dimensional risk penalties
+            # Composite wealth rank with dynamic risk penalties controlled by ML PID loop
             "wealth_rank": round(
                 (signal.get("score", 0) or 0)
                 * (1 + max(0, (valuation.get("analyst_upside_pct") or 0)) / 100)
                 * (1.15 if entry_timing["entry_ok"] else 0.0)
                 * liquidity_penalty
                 * (0.85 - 0.05 * len(earnings_quality_flags) if earnings_quality_flags else 1.0)
-                * (0.5 if (valuation.get("short_pct_float") or 0) > 15 else 0.75 if (valuation.get("short_pct_float") or 0) > 8 else 1.0)
-                * (0.7 if (valuation.get("pe") or 0) > 80 or (valuation.get("pe") or 0) < 0 else 0.85 if (valuation.get("pe") or 0) > 40 else 1.0)
+                * (DYNAMIC_PENALTIES["short_extreme"] if (valuation.get("short_pct_float") or 0) > 15 else DYNAMIC_PENALTIES["short_high"] if (valuation.get("short_pct_float") or 0) > 8 else 1.0)
+                * (DYNAMIC_PENALTIES["pe_extreme"] if (valuation.get("pe") or 0) > 80 or (valuation.get("pe") or 0) < 0 else DYNAMIC_PENALTIES["pe_high"] if (valuation.get("pe") or 0) > 40 else 1.0)
                 * (0.8 if (valuation.get("num_analyst_opinions") or 0) < 2 else 1.0)
                 * (0.85 if (valuation.get("pct_from_52w_high") or 0) < -40 else 1.0)
-                * (0.75 if vix_level > 30 else 0.88 if vix_level > 22 else 1.0)
+                * (DYNAMIC_PENALTIES["vix_extreme"] if vix_level > 30 else DYNAMIC_PENALTIES["vix_high"] if vix_level > 22 else 1.0)
                 * (0.80 if bear_market else 1.0),
                 4
             ),
+            "confluence": confluence,
             "valuation": valuation,
             "prediction": prediction,
         }
@@ -9036,6 +10399,19 @@ def _score_wealth_candidate_safe(symbol: str, market: str, timeout: float = 25.0
     finally:
         _WEALTH_SCAN_SEMAPHORE.release()
 
+
+import math
+
+def sanitize_nan(obj):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_nan(item) for item in obj]
+    return obj
 
 @app.post("/api/signals/wealth-builder")
 async def wealth_builder_signals(
@@ -9185,9 +10561,9 @@ async def wealth_builder_signals(
 @app.get("/api/signals/wealth-builder/cached-broad")
 async def wealth_builder_cached_broad(
     market: str = "AU",
-    min_score: float = 0.35,
-    min_prob_5pct: float = 30,
-    min_analyst_upside: float = 0,
+    min_score: float = 35.0,
+    min_prob_5pct: float = 30.0,
+    min_analyst_upside: float = -100.0,
     current_user: dict = Depends(get_current_user),
 ):
     """Return the 5AM pre-computed broad scan from DB cache."""
@@ -9211,14 +10587,14 @@ async def wealth_builder_cached_broad(
                 and (c.get("prob_ge_5pct") or 0) >= min_prob_5pct
                 and (c.get("analyst_upside_pct") or 0) >= min_analyst_upside]
 
-    return {
+    return sanitize_nan({
         "market": m,
         "screened": int(row[1]),
         "candidates_found": len(filtered),
         "candidates": filtered,
         "generated_at": str(row[3]) if row[3] else None,
         "scan_mode": "broad",
-    }
+    })
 
 
 @app.get("/api/signals/wealth-builder/backtest")
@@ -9332,11 +10708,22 @@ async def wealth_builder_evaluate_historical(
             at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
             hist = get_historical_data(sym, period="6mo")
             if hist.empty or len(hist) < 14:
+                # Survivorship bias mitigation: If we can't get history for a stock we screened in the past,
+                # it may be delisted or bankrupt. We assign a -100% return if it's > 30 days old.
+                if isinstance(at_date, datetime) and (datetime.utcnow() - at_date).days > 30:
+                    conn.execute(text("""
+                        UPDATE wealth_builder_evaluations
+                        SET actual_return_14d = -100, actual_return_30d = -100,
+                            actual_return_90d = -100, actual_peak_return_90d = 0,
+                            actual_max_drawdown_90d = -100, evaluated = TRUE
+                        WHERE id = :eid
+                    """), {"eid": eid})
+                    updated += 1
                 continue
             prices_after = hist[hist.index > pd.Timestamp(at_date)]
             if prices_after.empty:
                 continue
-            current_p = price
+            current_p = price if price else 1.0
             actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
             actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
             actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
@@ -9359,9 +10746,273 @@ async def wealth_builder_evaluate_historical(
     return {"evaluated": updated}
 
 
+def _scheduled_self_learning_loop():
+    """Scheduled job: Evaluate paper trades to find win rates and tweak learning metrics."""
+    try:
+        print("[SelfLearning] Starting auto-learning evaluation cycle...")
+        with engine.connect() as conn:
+            # Get all closed/exited trades
+            trades = conn.execute(text("""
+                SELECT initial_price, current_price, position_stage
+                FROM paper_trades
+                WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
+            """)).fetchall()
+
+            if len(trades) < 5:
+                print(f"[SelfLearning] Not enough data ({len(trades)} trades) to learn yet.")
+                return
+
+            win_count = 0
+            loss_count = 0
+            win_pcts = []
+            loss_pcts = []
+            
+            for t in trades:
+                initial = float(t[0] or 0)
+                current = float(t[1] or 0)
+                stage = t[2]
+                if initial > 0:
+                    ret = (current - initial) / initial * 100
+                    if stage == 'trim_signal' or ret > 0:
+                        win_count += 1
+                        win_pcts.append(ret)
+                    else:
+                        loss_count += 1
+                        loss_pcts.append(ret)
+
+            total = win_count + loss_count
+            win_rate = (win_count / total * 100) if total > 0 else 0
+            avg_win = sum(win_pcts) / len(win_pcts) if win_pcts else 0
+            avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0
+            
+            target_win_rate = 55.0  # Asymmetric 2:1 R:R target
+            error = target_win_rate - win_rate
+            
+            rec = "Hold steady."
+            if error > 5:
+                # Underperforming: Tighten penalties
+                DYNAMIC_PENALTIES["vix_extreme"] = max(0.4, DYNAMIC_PENALTIES["vix_extreme"] - 0.05)
+                DYNAMIC_PENALTIES["pe_extreme"] = max(0.4, DYNAMIC_PENALTIES["pe_extreme"] - 0.05)
+                DYNAMIC_PENALTIES["short_extreme"] = max(0.3, DYNAMIC_PENALTIES["short_extreme"] - 0.05)
+                rec = "Underperforming. PID tightened Volatility & PE penalties to reject risky setups."
+            elif error < -5:
+                # Overperforming: Loosen penalties to find more trades
+                DYNAMIC_PENALTIES["vix_extreme"] = min(0.9, DYNAMIC_PENALTIES["vix_extreme"] + 0.02)
+                DYNAMIC_PENALTIES["pe_extreme"] = min(0.9, DYNAMIC_PENALTIES["pe_extreme"] + 0.02)
+                DYNAMIC_PENALTIES["short_extreme"] = min(0.85, DYNAMIC_PENALTIES["short_extreme"] + 0.02)
+                rec = "Overperforming. PID loosened Volatility & PE penalties to expand candidate pool."
+            else:
+                rec = "Strategy operating optimally within margin. Compounding achieved."
+
+            conn.execute(text("""
+                INSERT INTO ai_self_learning_metrics (total_trades, win_count, loss_count, win_rate_pct, avg_win_pct, avg_loss_pct, recommended_action)
+                VALUES (:t, :w, :l, :wr, :aw, :al, :rec)
+            """), {"t": total, "w": win_count, "l": loss_count, "wr": round(win_rate, 2), "aw": round(avg_win, 2), "al": round(avg_loss, 2), "rec": rec})
+            conn.commit()
+            print(f"[SelfLearning] Cycle complete. Win rate: {win_rate:.1f}%")
+    except Exception as e:
+        print(f"[SelfLearning] Error during auto-learning: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DAILY AI PIPELINE — Layer 1 Screen → Layer 2 Deep-Dive → Telegram Broadcast
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TOPTIER_MAX_AI_DEEP_DIVES = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "9"))
+TOPTIER_PER_TIER = int(os.getenv("TOPTIER_PER_TIER", "3"))
+
+def _cap_tier_from_market_cap(market_cap: Optional[float]) -> str:
+    """Classify a stock into large/mid/small cap tier based on market cap."""
+    if not market_cap:
+        return "small_cap"
+    if market_cap > 10_000_000_000:
+        return "large_cap"
+    if market_cap > 2_000_000_000:
+        return "mid_cap"
+    return "small_cap"
+
+def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
+    """Build a compact Telegram HTML card from Layer 2 AI analysis."""
+    sym = analysis.get("symbol", "???")
+    name = candidate.get("name", sym)
+    decision = (analysis.get("decision") or "REJECT").upper()
+    confidence = analysis.get("confidence", 0)
+    allocation = analysis.get("allocation_pct", 0)
+    stop = analysis.get("stop_loss_pct", 0)
+    key_risk = analysis.get("key_risk", "N/A")
+    score = candidate.get("score", 0) or 0
+    prob = candidate.get("prob_ge_5pct", 0) or 0
+    trend = (candidate.get("trend") or "neutral").upper()
+    price = candidate.get("current_price", 0) or 0
+    confluence = (candidate.get("confluence") or {}).get("confidence", "?")
+
+    d_emoji = "✅" if decision == "APPROVE" else "⛔"
+    conf_bar = "🟢" if confidence >= 70 else "🟡" if confidence >= 40 else "🔴"
+    t_emoji = "📈" if trend == "BULLISH" else "📉" if trend == "BEARISH" else "➡️"
+    c_emoji = "🌟" if confluence == "high" else "⭐" if confluence == "medium" else "·"
+
+    reasoning = analysis.get("reasoning", "")[:180]
+    scenario_risks = analysis.get("scenario_risks", [])[:2]
+    risks_block = "\n".join(f"  ⚠️ {r}" for r in scenario_risks) if scenario_risks else ""
+
+    return (
+        f"{d_emoji} <b>{sym}</b> {c_emoji} — {name}\n"
+        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | P(≥5%): {prob:.1f}%\n"
+        f"  💰 ${price:.2f} | Conf: {confidence}% {conf_bar} | Alloc: {allocation:.1f}% | Stop: -{stop:.1f}%\n"
+        f"{'  ' + reasoning + chr(10) if reasoning else ''}"
+        f"{risks_block}"
+    )
+
+def _scheduled_daily_ai_pipeline():
+    """Daily AI Analysis Pipeline (runs after 5AM broad scan is complete).
+
+    Layer 1 broad scan runs on up to 1000 shares → confluence gate filters to ~50-100.
+    This pipeline takes the top 3 per cap tier (9 total) for automated Layer 2 AI review.
+    Remaining candidates can be manually deep-dived via POST /api/ai/deep-dive.
+
+    1. Reads cached wealth scan results from DB
+    2. Groups candidates by large/mid/small cap tier
+    3. Selects top 3 per tier (9 total)
+    4. Runs Layer 2 6-persona deep-dive on each (~$0.014/day)
+    5. Builds consolidated Telegram report with AI verdicts
+    6. Broadcasts to all users with Telegram configured
+    """
+    if not run_agentic_analysis:
+        print("[DailyAI] Agentic brain not available — skipping.")
+        return
+
+    print("[DailyAI] Starting daily AI analysis pipeline...")
+    market = "AU"
+    today_key = datetime.utcnow().date().isoformat()
+
+    # 1. Read cached broad scan
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text("""
+                SELECT picks FROM wealth_scan_cache
+                WHERE market = :market AND scan_mode = 'broad'
+                ORDER BY generated_at DESC LIMIT 1
+            """), {"market": market}).fetchone()
+        if not row or not row[0]:
+            print("[DailyAI] No cached broad scan available — skipping.")
+            return
+        candidates = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    except Exception as e:
+        print(f"[DailyAI] Failed to read broad scan cache: {e}")
+        return
+
+    # 2. Group by cap tier
+    tiers: dict[str, list] = {"large_cap": [], "mid_cap": [], "small_cap": []}
+    for c in candidates:
+        mc = (c.get("valuation") or {}).get("market_cap")
+        tier = _cap_tier_from_market_cap(mc)
+        tiers[tier].append(c)
+
+    # 3. Select top per tier (sort by wealth_rank, take TOPTIER_PER_TIER each, then cap at 1000)
+    selected = []
+    for tier_name in ["large_cap", "mid_cap", "small_cap"]:
+        pool = sorted(tiers[tier_name], key=lambda x: x.get("wealth_rank", 0), reverse=True)
+        selected.extend(pool[:TOPTIER_PER_TIER])
+    selected = selected[:TOPTIER_MAX_AI_DEEP_DIVES]
+
+    print(f"[DailyAI] Selected {len(selected)} candidates ({sum(1 for s in selected if (s.get('confluence', {}).get('confidence', '') == 'high'))} high-confluence)")
+
+    # 4. Run Layer 2 deep-dive with rate-limit throttling
+    ai_results = []
+    for i, cand in enumerate(selected):
+        sym = cand["symbol"]
+        print(f"[DailyAI] Deep-dive {i+1}/{len(selected)}: {sym} ...")
+        try:
+            sd = get_stock_data(sym, market)
+            val = get_valuation_metrics(sym)
+            hist = get_historical_data(sym, period="1y")
+            if len(hist) < 60:
+                continue
+            tech = calculate_technical_indicators(hist)
+            tech_compact = {k: v for k, v in tech.items() if k in [
+                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
+                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
+                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
+                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b",
+            ]}
+            confluence = cand.get("confluence", {})
+
+            result = run_agentic_analysis(sym, market, tech_compact, val, confluence)
+            result["candidate"] = cand
+            ai_results.append(result)
+
+            # Gentle throttle — 9 deep-dives is lightweight, 0.5s is plenty
+            if i < len(selected) - 1:
+                time.sleep(0.5)
+
+        except Exception as e:
+            print(f"[DailyAI] Deep-dive failed for {sym}: {e}")
+            continue
+
+    print(f"[DailyAI] Completed {len(ai_results)} deep-dives. Approved: {sum(1 for r in ai_results if r.get('decision')=='APPROVE')}")
+
+    if not ai_results:
+        print("[DailyAI] No AI results — skipping broadcast.")
+        return
+
+    # 5. Build consolidated Telegram report
+    approved = [r for r in ai_results if r.get("decision") == "APPROVE"]
+    rejected = [r for r in ai_results if r.get("decision") == "REJECT"]
+
+    lines = [
+        f"<b>🤖 AI DAILY ANALYSIS — {today_key}</b>",
+        f"",
+        f"📊 Layer 1 screened {len(candidates)} ASX shares → Layer 2 AI analyzed top {len(selected)}",
+        f"",
+    ]
+
+    if approved:
+        lines.append(f"<b>✅ AI-APPROVED ({len(approved)})</b>")
+        for a in approved:
+            cand = a.get("candidate", {})
+            lines.append("")
+            lines.append(_format_ai_report_for_telegram(a, cand))
+
+    if rejected:
+        lines.append(f"\n<b>⛔ AI-REJECTED ({len(rejected)})</b>")
+        for a in rejected[:4]:  # cap at 4 rejected to avoid message bloat
+            cand = a.get("candidate", {})
+            lines.append("")
+            lines.append(_format_ai_report_for_telegram(a, cand))
+        if len(rejected) > 4:
+            lines.append(f"  ... and {len(rejected) - 4} more rejected by AI")
+
+    lines.append(f"\n<i>🖥️ Powered by DeepSeek V4 Flash · Layer 2 6-Persona Agentic AI</i>")
+
+    message_html = "\n".join(lines)
+
+    # 6. Broadcast to all users with Telegram
+    try:
+        with db_conn() as conn:
+            users = conn.execute(text("SELECT id FROM users")).fetchall()
+        for user in users:
+            uid = user[0]
+            recipients = get_user_telegram_recipients(uid)
+            if not recipients:
+                continue
+            digest_key = f"daily_ai_{today_key}"
+            if not has_digest_been_sent(uid, market, digest_key):
+                _send_telegram_payload(
+                    message_html, recipients, user_id=uid,
+                    message_type="daily_digest", market=market,
+                    digest_key=digest_key, source="daily_ai_pipeline",
+                    delivery_mode="auto",
+                )
+    except Exception as e:
+        print(f"[DailyAI] Broadcast failed: {e}")
+
+    print(f"[DailyAI] Daily AI pipeline complete. {len(ai_results)} analyses, broadcast to Telegram.")
+
 def _scheduled_wealth_builder_evaluate():
     """Scheduled job: evaluate past wealth builder candidates."""
     try:
+        # Evaluate anything from 14 days ago up to 90 days ago
         cutoff = datetime.utcnow() - timedelta(days=14)
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -9371,34 +11022,49 @@ def _scheduled_wealth_builder_evaluate():
                 LIMIT 50
             """), {"cutoff": cutoff}).fetchall()
 
-        for row in rows:
-            eid, sym, mkt, price, at_str = row[0], row[1], row[2], row[4], row[5]
-            try:
-                at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
-                hist = get_historical_data(sym, period="6mo")
-                if hist.empty or len(hist) < 14:
-                    continue
-                prices_after = hist[hist.index > pd.Timestamp(at_date)]
-                if prices_after.empty:
-                    continue
-                current_p = price
-                actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
-                actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
-                actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
-                peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
-                max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
+            for row in rows:
+                eid, sym, mkt, price, at_str = row[0], row[1], row[2], row[3], row[4]
+                try:
+                    at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
+                    hist = get_historical_data(sym, period="6mo")
+                    if hist.empty or len(hist) < 14:
+                        if isinstance(at_date, datetime) and (datetime.utcnow() - at_date).days > 30:
+                            conn.execute(text("""
+                                UPDATE wealth_builder_evaluations
+                                SET actual_return_14d = -100, actual_return_30d = -100,
+                                    actual_return_90d = -100, actual_peak_return_90d = 0,
+                                    actual_max_drawdown_90d = -100, evaluated = TRUE
+                                WHERE id = :eid
+                            """), {"eid": eid})
+                        continue
+                    
+                    prices_after = hist[hist.index > pd.Timestamp(at_date)]
+                    if prices_after.empty:
+                        continue
+                    
+                    current_p = float(price) if price else 1.0
+                    actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
+                    actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
+                    actual_63d = round((float(prices_after["Close"].iloc[min(63, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 63 else None
+                    actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
+                    
+                    peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
+                    max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
 
-                conn.execute(text("""
-                    UPDATE wealth_builder_evaluations
-                    SET actual_return_14d = :r14, actual_return_30d = :r30,
-                        actual_return_90d = :r90, actual_peak_return_90d = :pk,
-                        actual_max_drawdown_90d = :dd, evaluated = TRUE
-                    WHERE id = :eid
-                """), {"r14": actual_14d, "r30": actual_30d, "r90": actual_90d,
-                       "pk": peak_ret, "dd": max_dd, "eid": eid})
-            except Exception:
-                pass
-        conn.commit()
+                    # Only mark as fully evaluated when we have hit the 90-day horizon
+                    is_final = len(prices_after) >= 90 or (datetime.utcnow() - at_date).days >= 100
+
+                    conn.execute(text("""
+                        UPDATE wealth_builder_evaluations
+                        SET actual_return_14d = :r14, actual_return_30d = :r30,
+                            actual_return_90d = :r90, actual_peak_return_90d = :pk,
+                            actual_max_drawdown_90d = :dd, evaluated = :final
+                        WHERE id = :eid
+                    """), {"r14": actual_14d, "r30": actual_30d, "r90": actual_90d,
+                           "pk": peak_ret, "dd": max_dd, "final": is_final, "eid": eid})
+                except Exception:
+                    pass
+            conn.commit()
     except Exception:
         pass
 
@@ -9481,14 +11147,14 @@ def _scheduled_positions_monitor():
                         f"📊 <b>Action recommended:</b> Review immediately. Consider cutting losses or hedging.\n"
                         f"Stop loss reference: ~${round(avg_cost * 0.92, 2)}"
                     )
-                elif target_mean and live_price >= float(target_mean):
+                elif target_mean and live_price >= float(target_mean) and pnl_pct > 0:
                     alert_type = "profit_target"
-                    upside = ((live_price - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+                    upside = pnl_pct
                     target_float = float(target_mean)
                     alert = (
                         f"<b>🟢 PROFIT TARGET REACHED — {sym}.{market}</b>\n\n"
                         f"Your entry: ${avg_cost:.2f} | Current: ${live_price:.2f}\n"
-                        f"P&amp;L: +${round(abs(invested * upside / 100), 2):,.2f} ({upside:+.1f}%)\n"
+                        f"P&amp;L: +${round(invested * upside / 100, 2):,.2f} (+{upside:.1f}%)\n"
                         f"Analyst target: ${target_float:.2f}\n"
                         + (f"RSI: {rsi:.0f}" if rsi is not None else "")
                         + f"\n\n📊 <b>Action recommended:</b> Consider taking profit.\n"
@@ -9540,7 +11206,7 @@ def _scheduled_positions_monitor():
                             ), {
                                 "uid": user_id,
                                 "pat": f"%{alert_type}%{sym}%",
-                                "since": datetime.utcnow() - timedelta(hours=4),
+                                "since": datetime.utcnow() - timedelta(hours=24),
                             }).fetchone()
                             if existing:
                                 continue
@@ -9981,13 +11647,6 @@ if SCHEDULER_AVAILABLE:
             hour=int(parts[1]) if len(parts) > 1 else 8,
             day_of_week="mon",
         )
-        daily_cron = os.getenv("DAILY_DIGEST_CRON", "0 8 * * *")
-        daily_parts = daily_cron.split()
-        scheduler.add_job(
-            _scheduled_daily_digest, "cron",
-            minute=int(daily_parts[0]) if len(daily_parts) > 0 else 15,
-            hour=int(daily_parts[1]) if len(daily_parts) > 1 else 8,
-        )
         scheduler.add_job(
             _scheduled_paper_trade_monitor, "cron",
             minute="0,15,30,45"
@@ -10010,12 +11669,170 @@ if SCHEDULER_AVAILABLE:
             id="wealth_builder_evaluate",
             max_instances=1,
         )
+        scheduler.add_job(
+            _scheduled_self_learning_loop, "cron",
+            day_of_week="sun", hour=2, minute=0,
+            id="self_learning_loop",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_daily_ai_pipeline, "cron",
+            minute=0, hour=6,
+            day_of_week="mon-fri",
+            id="daily_ai_pipeline",
+            max_instances=1,
+        )
         scheduler.start()
-        # Catch up immediately after restart with a capped batch to avoid startup CPU/network spikes.
-        startup_catchup_enabled = os.getenv("PAPER_MONITOR_STARTUP_CATCHUP", "true").strip().lower() not in {"0", "false", "no"}
-        if startup_catchup_enabled:
-            startup_max_trades = max(10, int(os.getenv("PAPER_MONITOR_STARTUP_MAX_TRADES", "75")))
-            _scheduled_paper_trade_monitor(max_trades_override=startup_max_trades)
+
+        # ── Startup Catch-Up Engine ───────────────────────────────────────────
+        # This system runs on a mini-PC that is powered off overnight and may
+        # restart any time (7AM, 8AM, or after a full day offline).  APScheduler
+        # cron jobs only fire at their scheduled wall-clock time — if the machine
+        # was off at 5AM, the broad scan never ran.  The catch-up engine below
+        # detects missed jobs using DB timestamps and re-runs them once on startup,
+        # staggered so the CPU/network is not hammered all at once.
+        def _startup_catchup():
+            import time as _st
+            tz = _get_scheduler_timezone()
+            now_local = datetime.now(tz)
+            now_utc   = datetime.utcnow()
+            weekday   = now_local.weekday()   # 0=Mon … 6=Sun
+            hour_local = now_local.hour
+            tasks_run = []
+
+            print(f"[StartupCatchup] Checking for missed jobs at {now_local.strftime('%a %H:%M %Z')} …")
+
+            # ── 1. Paper trade monitor — always run immediately on startup ────
+            try:
+                startup_max_trades = max(10, int(os.getenv("PAPER_MONITOR_STARTUP_MAX_TRADES", "75")))
+                startup_catchup_enabled = os.getenv("PAPER_MONITOR_STARTUP_CATCHUP", "true").strip().lower() not in {"0", "false", "no"}
+                if startup_catchup_enabled:
+                    _scheduled_paper_trade_monitor(max_trades_override=startup_max_trades)
+                    tasks_run.append("paper_trade_monitor")
+            except Exception as _e:
+                print(f"[StartupCatchup] paper_trade_monitor failed: {_e}")
+
+            _st.sleep(5)  # Brief pause before heavy work
+
+            # ── 2. Broad wealth scan — re-run if cache is stale (>20 hours) ──
+            try:
+                with db_conn() as _conn:
+                    _row = _conn.execute(text(
+                        "SELECT generated_at FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+                    )).fetchone()
+                scan_age_hours = 999
+                if _row and _row[0]:
+                    _gen = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
+                    scan_age_hours = (now_utc - _gen.replace(tzinfo=None)).total_seconds() / 3600
+                if scan_age_hours > 20:
+                    print(f"[StartupCatchup] Broad scan stale ({scan_age_hours:.1f}h old) — running now …")
+                    _scheduled_broad_scan_precompute()
+                    tasks_run.append("broad_scan")
+                else:
+                    print(f"[StartupCatchup] Broad scan fresh ({scan_age_hours:.1f}h old) — skipping.")
+            except Exception as _e:
+                print(f"[StartupCatchup] broad_scan check failed: {_e}")
+
+            _st.sleep(10)
+
+            # ── 3. Daily digest — re-send if today's hasn't gone out yet ──────
+            # Only send during reasonable hours (7AM–7PM local) to avoid
+            # waking the user with a notification at 2AM.
+            try:
+                digest_hour_min = 7
+                digest_hour_max = 19
+                if digest_hour_min <= hour_local <= digest_hour_max:
+                    _digest_key = _daily_digest_cache_key()
+                    _market = os.getenv("DAILY_DIGEST_MARKET", "AU").upper()
+                    with db_conn() as _conn:
+                        _sent_rows = _conn.execute(text("""
+                            SELECT COUNT(*) FROM telegram_send_log
+                            WHERE message_type = 'daily_digest'
+                              AND digest_key = :dk
+                              AND status = 'sent'
+                        """), {"dk": _digest_key}).fetchone()
+                    already_sent = (_sent_rows[0] if _sent_rows else 0) > 0
+                    if not already_sent:
+                        print(f"[StartupCatchup] Skipping old daily_digest — replaced by daily_ai_pipeline")
+                    else:
+                        print(f"[StartupCatchup] Daily digest already sent today — skipping.")
+                else:
+                    print(f"[StartupCatchup] Outside digest window ({hour_local}h) — skipping digest.")
+            except Exception as _e:
+                print(f"[StartupCatchup] daily_digest check failed: {_e}")
+
+            _st.sleep(10)
+
+            # ── 4. Weekly generation — re-run if this week's picks are missing ─
+            # Only on weekdays, and only if weekly picks table is stale.
+            try:
+                if weekday < 5:  # Mon–Fri only
+                    with db_conn() as _conn:
+                        _week_row = _conn.execute(text("""
+                            SELECT MAX(generated_at) FROM weekly_digests
+                        """)).fetchone()
+                    weekly_age_days = 999
+                    if _week_row and _week_row[0]:
+                        _wgen = _week_row[0] if isinstance(_week_row[0], datetime) else datetime.fromisoformat(str(_week_row[0]))
+                        weekly_age_days = (now_utc - _wgen.replace(tzinfo=None)).total_seconds() / 86400
+                    if weekly_age_days > 7:
+                        print(f"[StartupCatchup] Weekly picks stale ({weekly_age_days:.1f}d old) — running …")
+                        _scheduled_weekly_generation()
+                        tasks_run.append("weekly_generation")
+                    else:
+                        print(f"[StartupCatchup] Weekly picks fresh ({weekly_age_days:.1f}d old) — skipping.")
+            except Exception as _e:
+                print(f"[StartupCatchup] weekly_generation check failed: {_e}")
+
+            _st.sleep(10)
+
+            # ── 5. Positions monitor — run if we're in market hours ───────────
+            try:
+                from datetime import time as _dt_time
+                market_open  = _dt_time(10, 0)
+                market_close = _dt_time(16, 0)
+                is_weekday   = weekday < 5
+                is_market_hours = market_open <= now_local.time() <= market_close
+                if is_weekday and is_market_hours:
+                    print("[StartupCatchup] In market hours — running positions monitor …")
+                    _scheduled_positions_monitor()
+                    tasks_run.append("positions_monitor")
+                else:
+                    print(f"[StartupCatchup] Outside market hours or weekend — skipping positions monitor.")
+            except Exception as _e:
+                print(f"[StartupCatchup] positions_monitor failed: {_e}")
+
+            _st.sleep(10)
+
+            # ── 6. Self Learning Loop ─────────────────────────────────────────
+            # Runs at the very end of startup catchup since it's lower priority
+            try:
+                with db_conn() as _conn:
+                    _row = _conn.execute(text(
+                        "SELECT evaluated_at FROM ai_self_learning_metrics ORDER BY evaluated_at DESC LIMIT 1"
+                    )).fetchone()
+                
+                learning_age_hours = 999
+                if _row and _row[0]:
+                    _eval_ts = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
+                    learning_age_hours = (now_utc - _eval_ts.replace(tzinfo=None)).total_seconds() / 3600
+                
+                # If hasn't run in over 6 days (144 hours), run it now to catch up
+                if learning_age_hours > 144:
+                    print(f"[StartupCatchup] Self-learning loop stale ({learning_age_hours:.1f}h old) — running now (lowest priority) ...")
+                    _scheduled_self_learning_loop()
+                    tasks_run.append("self_learning")
+                else:
+                    print(f"[StartupCatchup] Self-learning fresh ({learning_age_hours:.1f}h old) — skipping.")
+            except Exception as _e:
+                print(f"[StartupCatchup] self_learning_loop check failed: {_e}")
+
+            print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}")
+
+        # Run catch-up in a background thread so it doesn't block FastAPI startup
+        _catchup_thread = threading.Thread(target=_startup_catchup, daemon=True, name="startup-catchup")
+        _catchup_thread.start()
+
     except Exception:
         pass
 
@@ -10023,3 +11840,4 @@ if SCHEDULER_AVAILABLE:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

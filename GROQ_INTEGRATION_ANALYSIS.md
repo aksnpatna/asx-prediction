@@ -14,7 +14,7 @@ Groq is **integrated into the ASX Backend** as a **fallback LLM provider** for f
 
 ### Environment Variables (.env)
 ```env
-GROQ_API_KEY=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
+GROQ_API_KEY=gsk_***REDACTED***
 GROQ_MODEL=llama-3.3-70b-versatile
 LLM_PROVIDER_ORDER=local,groq,openai
 ```

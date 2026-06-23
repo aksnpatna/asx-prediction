@@ -49,7 +49,11 @@ services:
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://ollama:11434/v1}
       LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:7b}
-      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-groq,local,openai}
+      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-deepseek,nvidia,groq,local,openai}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_MODEL: ${NVIDIA_MODEL:-meta/llama-3.3-70b-instruct}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-env}
       JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
       FRED_API_KEY: ${FRED_API_KEY:-55689724e13717f08cb5c36bf7d20921}
@@ -63,6 +67,10 @@ services:
       PAPER_MONITOR_MAX_TRADES: ${PAPER_MONITOR_MAX_TRADES:-250}
       PAPER_MONITOR_STARTUP_CATCHUP: ${PAPER_MONITOR_STARTUP_CATCHUP:-true}
       PAPER_MONITOR_STARTUP_MAX_TRADES: ${PAPER_MONITOR_STARTUP_MAX_TRADES:-75}
+      EODHD_API_KEY: ${EODHD_API_KEY:-}
+      BROAD_SCAN_CAP: ${BROAD_SCAN_CAP:-500}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      ENV: ${ENV:-production}
     ports:
       - "8000:8000"
     healthcheck:

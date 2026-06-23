@@ -4,6 +4,7 @@ import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
 import DiscoverTab from './DiscoverTab'
+import NewsSentimentMonitor from './NewsSentimentMonitor'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
@@ -27,7 +28,7 @@ class ErrorBoundary extends Component {
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
 
-const EXCHANGE_LABELS = { AU: 'ASX 200', US: 'NASDAQ', IN: 'BSE/NSE' }
+const EXCHANGE_LABELS = { AU: 'ASX Broad Market', US: 'NASDAQ', IN: 'BSE/NSE' }
 const MARKET_FLAGS = { AU: '🇦🇺', US: '🇺🇸', IN: '🇮🇳' }
 
 // ─── Portfolio Tab Component ───────────────────────────────────────────────────
@@ -371,7 +372,7 @@ function PortfolioTab({ token, preferredMarket }) {
                 value={addForm.symbol} onChange={e => setAddForm(p => ({ ...p, symbol: e.target.value }))} />
               <select className="provider-select" value={addForm.market}
                 onChange={e => setAddForm(p => ({ ...p, market: e.target.value }))}>
-                <option value="AU">AU (ASX 200)</option>
+                <option value="AU">AU (ASX Broad Market)</option>
                 <option value="US">US (NASDAQ)</option>
                 <option value="IN">IN (BSE/NSE)</option>
               </select>
@@ -630,9 +631,9 @@ function WealthBuilderTab({
 
   const [form, setForm] = React.useState({
     market: preferredMarket || 'AU',
-    min_analyst_upside: 5,
-    min_score: 0.45,
-    min_prob_5pct: 40,
+    min_analyst_upside: -100,
+    min_score: 45.0,
+    min_prob_5pct: 40.0,
     max_symbols: 20,
     send_telegram: false,
     scan_mode: 'top',
@@ -670,7 +671,7 @@ function WealthBuilderTab({
         cachedScanLoading={cacheLoading}
         fetchCachedWealthScan={loadCached}
         setBuyModal={setBuyModal}
-        EXCHANGE_LABELS={{ AU: 'ASX 200', US: 'NASDAQ', IN: 'BSE/NSE' }}
+        EXCHANGE_LABELS={{ AU: 'ASX Broad Market', US: 'NASDAQ', IN: 'BSE/NSE' }}
         topUniverse={topUniverse}
         rankedItems={rankedItems}
         rankLoading={rankLoading}
@@ -696,20 +697,20 @@ function WealthBuilderTab({
       {buyModal && (
         <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setBuyModal(null) }}>
           <div className="modal" style={{ maxWidth: 520 }}>
-            <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 20px', background: '#0f172a', borderBottom: '2px solid #334155' }}>
+            <div className="modal-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 20px', background: 'var(--text-primary)', borderBottom: '2px solid var(--border-strong)' }}>
               <div>
-                <h2 style={{ margin: 0, color: '#f1f5f9', fontSize: 17, fontWeight: 800 }}>📈 Buy {buyModal.symbol}</h2>
+                <h2 style={{ margin: 0, color: 'var(--bg-tertiary)', fontSize: 17, fontWeight: 800 }}>📈 Buy {buyModal.symbol}</h2>
                 <p style={{ margin: '2px 0 0', color: '#64748b', fontSize: 11 }}>{buyModal.name || 'Paper Trade'}</p>
               </div>
-              <button className="close-btn" onClick={() => setBuyModal(null)} style={{ background: '#1e293b', borderColor: '#475569', color: '#94a3b8' }}>×</button>
+              <button className="close-btn" onClick={() => setBuyModal(null)} style={{ background: 'var(--text-primary)', borderColor: 'var(--text-secondary)', color: '#94a3b8' }}>×</button>
             </div>
-            <div className="modal-body" style={{ padding: 20, background: '#fff' }}>
+            <div className="modal-body" style={{ padding: 20, background: 'var(--bg-secondary)' }}>
               {/* Current price badge */}
               {buyModal.current_price && (
-                <div style={{ display: 'flex', gap: 10, marginBottom: 16, padding: '10px 14px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8 }}>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 16, padding: '10px 14px', background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', borderRadius: 8 }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', letterSpacing: 1 }}>Market Price</div>
-                    <div style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', fontFamily: 'monospace' }}>${Number(buyModal.current_price).toFixed(3)}</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: 'var(--text-primary)', fontFamily: 'monospace' }}>${Number(buyModal.current_price).toFixed(3)}</div>
                   </div>
                   {buyModal.analyst_target && (
                     <div style={{ flex: 1 }}>
@@ -722,12 +723,12 @@ function WealthBuilderTab({
 
               {/* Smart sizing tip */}
               {buyModal.smart_sizing && (
-                <div style={{ marginBottom: 14, padding: 10, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, fontSize: 12, color: '#166534', fontWeight: 600 }}>
+                <div style={{ marginBottom: 14, padding: 10, background: 'rgba(0, 210, 135, 0.1)', border: '1px solid rgba(0, 210, 135, 0.3)', borderRadius: 6, fontSize: 12, color: 'var(--ig-gain)', fontWeight: 600 }}>
                   💡 {buyModal.smart_sizing}
                 </div>
               )}
               {buyModal.budget_note && (
-                <div style={{ marginBottom: 14, padding: 10, background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11, color: '#1e40af' }}>
+                <div style={{ marginBottom: 14, padding: 10, background: 'rgba(0, 163, 255, 0.1)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, fontSize: 11, color: 'var(--ig-blue-accent)' }}>
                   💰 {buyModal.budget_note}
                 </div>
               )}
@@ -735,49 +736,49 @@ function WealthBuilderTab({
               {/* Form */}
               <div style={{ display: 'grid', gap: 12 }}>
                 <div>
-                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Quantity *</label>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Quantity *</label>
                   <input type="number" step="1" min="1"
                     value={buyModal.quantity}
                     onChange={e => setBuyModal(m => ({ ...m, quantity: e.target.value }))}
                     placeholder="e.g. 100"
-                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid var(--border-color)', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
                   />
                 </div>
                 <div>
-                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>
                     Execution Price <span style={{ fontWeight: 400, color: '#94a3b8' }}>(leave blank to use live price)</span>
                   </label>
                   <input type="number" step="0.001" min="0"
                     value={buyModal.execution_price || ''}
                     onChange={e => setBuyModal(m => ({ ...m, execution_price: e.target.value }))}
                     placeholder={buyModal.current_price ? `Market: $${Number(buyModal.current_price).toFixed(3)}` : 'e.g. 4.50'}
-                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid var(--border-color)', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
                   />
                 </div>
                 <div>
-                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Commission (optional)</label>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Commission (optional)</label>
                   <input type="number" step="0.01" min="0"
                     value={buyModal.commission || ''}
                     onChange={e => setBuyModal(m => ({ ...m, commission: e.target.value }))}
                     placeholder="e.g. 9.50 (CommSec default)"
-                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid var(--border-color)', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
                   />
                 </div>
                 <div>
-                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Notes (optional)</label>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>Notes (optional)</label>
                   <input type="text"
                     value={buyModal.notes || ''}
                     onChange={e => setBuyModal(m => ({ ...m, notes: e.target.value }))}
                     placeholder="e.g. Following AI signal on discovery tab"
-                    style={{ width: '100%', padding: '10px 12px', border: '2px solid #e2e8f0', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
+                    style={{ width: '100%', padding: '10px 12px', border: '2px solid var(--border-color)', borderRadius: 6, fontSize: 14, fontFamily: 'inherit', outline: 'none' }}
                   />
                 </div>
               </div>
 
               {/* Total estimate */}
               {buyModal.quantity && buyModal.current_price && (
-                <div style={{ marginTop: 12, padding: '8px 12px', background: '#f1f5f9', borderRadius: 6, fontSize: 12, color: '#475569' }}>
-                  📊 Estimated total: <strong style={{ color: '#0f172a' }}>
+                <div style={{ marginTop: 12, padding: '8px 12px', background: 'var(--bg-tertiary)', borderRadius: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+                  📊 Estimated total: <strong style={{ color: 'var(--text-primary)' }}>
                     ${(Number(buyModal.quantity) * Number(buyModal.execution_price || buyModal.current_price)).toFixed(2)}
                   </strong>
                   {buyModal.commission ? ` + $${Number(buyModal.commission).toFixed(2)} commission` : ''}
@@ -785,10 +786,10 @@ function WealthBuilderTab({
               )}
 
               {/* Action buttons */}
-              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border-color)' }}>
                 <button
                   onClick={() => setBuyModal(null)}
-                  style={{ padding: '10px 20px', background: '#fff', border: '2px solid #e2e8f0', borderRadius: 6, fontWeight: 700, fontSize: 13, cursor: 'pointer', color: '#475569' }}
+                  style={{ padding: '10px 20px', background: 'var(--bg-secondary)', border: '2px solid var(--border-color)', borderRadius: 6, fontWeight: 700, fontSize: 13, cursor: 'pointer', color: 'var(--text-secondary)' }}
                 >
                   Cancel
                 </button>
@@ -811,7 +812,7 @@ function WealthBuilderTab({
                       alert(`❌ ${e.response?.data?.detail || 'Failed to log paper trade. Please try again.'}`)
                     }
                   }}
-                  style={{ padding: '10px 24px', background: 'linear-gradient(135deg, #00a854, #00c96e)', border: 'none', borderRadius: 6, fontWeight: 800, fontSize: 13, cursor: 'pointer', color: '#fff', letterSpacing: 0.3 }}
+                  style={{ padding: '10px 24px', background: 'linear-gradient(135deg, #00a854, #00c96e)', border: 'none', borderRadius: 6, fontWeight: 800, fontSize: 13, cursor: 'pointer', color: 'var(--bg-secondary)', letterSpacing: 0.3 }}
                 >
                   ✅ Execute Paper Trade
                 </button>
@@ -829,8 +830,8 @@ function TelegramBotGuide() {
   const [open, setOpen] = React.useState(false)
   return (
     <div style={{
-      background: 'linear-gradient(135deg,#f0f7ff 0%,#e8f3ff 100%)',
-      border: '1px solid #c3daff',
+      background: 'rgba(0, 163, 255, 0.05)',
+      border: '1px solid rgba(0, 163, 255, 0.2)',
       borderRadius: 10,
       marginBottom: 14,
       overflow: 'hidden',
@@ -840,23 +841,23 @@ function TelegramBotGuide() {
         style={{
           width: '100%', background: 'none', border: 'none', cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '12px 16px', fontWeight: 600, fontSize: 14, color: '#1a3a6b',
+          padding: '12px 16px', fontWeight: 600, fontSize: 14, color: 'var(--ig-blue-accent)',
         }}
       >
         <span>📱 Telegram Bot Commands — text your bot to update your portfolio</span>
-        <span style={{ fontSize: 12, color: '#5a80b0' }}>{open ? '▲ Hide' : '▼ Show'}</span>
+        <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{open ? '▲ Hide' : '▼ Show'}</span>
       </button>
       {open && (
         <div style={{ padding: '0 16px 16px', display: 'grid', gap: 10 }}>
-          <p style={{ margin: 0, fontSize: 13, color: '#3a5580' }}>
+          <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
             Text your Telegram bot to record trades, check your portfolio, or manage watchlist items.
             Every trade command automatically starts position monitoring with alerts.
           </p>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
-              <tr style={{ background: '#d6e9ff' }}>
-                <th style={{ padding: '6px 10px', textAlign: 'left' }}>What to send</th>
-                <th style={{ padding: '6px 10px', textAlign: 'left' }}>What happens</th>
+              <tr style={{ background: 'rgba(0, 163, 255, 0.15)' }}>
+                <th style={{ padding: '6px 10px', textAlign: 'left', color: 'var(--text-primary)' }}>What to send</th>
+                <th style={{ padding: '6px 10px', textAlign: 'left', color: 'var(--text-primary)' }}>What happens</th>
               </tr>
             </thead>
             <tbody>
@@ -871,9 +872,9 @@ function TelegramBotGuide() {
                 ['TRACK BHP', 'Adds BHP to your watchlist without recording a trade'],
                 ['HELP', 'Shows the full command reference'],
               ].map(([cmd, desc], i) => (
-                <tr key={i} style={{ background: i % 2 === 0 ? '#fff' : '#f7faff' }}>
-                  <td style={{ padding: '5px 10px', fontFamily: 'monospace', color: '#0062cc', whiteSpace: 'nowrap' }}>{cmd}</td>
-                  <td style={{ padding: '5px 10px', color: '#445' }}>{desc}</td>
+                <tr key={i} style={{ background: i % 2 === 0 ? 'var(--bg-secondary)' : 'var(--bg-tertiary)' }}>
+                  <td style={{ padding: '5px 10px', fontFamily: 'monospace', color: 'var(--ig-blue-accent)', whiteSpace: 'nowrap' }}>{cmd}</td>
+                  <td style={{ padding: '5px 10px', color: 'var(--text-secondary)' }}>{desc}</td>
                 </tr>
               ))}
             </tbody>
@@ -1946,26 +1947,19 @@ function App() {
               <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Stocks Tracked</span><span className="stat-value">{executionSnapshot.holdingsTracked}</span></div></div>
               <div className="stat-card green"><div className="stat-content"><span className="stat-title">Decisions (30d)</span><span className="stat-value">{executionSnapshot.decisions}</span></div></div>
               <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Weekly Digest</span><span className="stat-value" style={{ fontSize: 13 }}>100+ ASX stocks</span></div></div>
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Wealth Scan</span><span className="stat-value" style={{ fontSize: 13 }}>Top 40 / Broad 200+</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Wealth Scan</span><span className="stat-value" style={{ fontSize: 13 }}>Broad Market Mode</span></div></div>
             </section>
 
-            <div style={{ background: 'linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)', border: '1px solid #bbf7d0', borderRadius: 8, padding: '14px 18px', marginBottom: 14, fontSize: 13, color: '#166534', lineHeight: 1.7 }}>
-              <strong>📊 Diversification Health:</strong> The weekly digest scans <strong>100+ ASX stocks across 8 sectors</strong> — not just the top 40. 
-              The Wealth Builder now offers a <strong>"Broad 200+" universe mode</strong> that screens 200+ ASX-listed companies including mid-caps, 
-              small-caps, ETFs, and gold miners. Use the weekly picks as a discovery layer, then validate candidates through both 
-              the <strong>Analyze</strong> tab (AI deep analysis) and the <strong>Wealth Builder</strong> (multi-factor scoring). 
-              This ensures your watchlist isn't just the usual suspects (BHP, CBA, etc.) but includes genuine 
-              high-conviction opportunities from the full exchange.
-            </div>
+
 
             {/* ── Investment Budget Widget ──────────────────────────────── */}
-            <section className="panel" style={{ marginBottom: 14, background: 'linear-gradient(135deg, #fefce8 0%, #fef9c3 100%)', borderColor: '#fde047' }}>
+            <section className="panel" style={{ marginBottom: 14, background: 'linear-gradient(135deg, rgba(255, 184, 0, 0.1) 0%, rgba(255, 184, 0, 0.1) 100%)', borderColor: 'rgba(255, 184, 0, 0.3)' }}>
               <div className="section-header" style={{ flexWrap: 'wrap', gap: 8 }}>
                 <h2>💰 Investment Budget</h2>
                 {budgetInfo?.budget_set && (
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, fontWeight: 600 }}>
-                    <span style={{ color: '#166534' }}>Deployed: ${budgetInfo.deployed_capital?.toLocaleString()}</span>
-                    <span style={{ color: '#0369a1' }}>Available: ${budgetInfo.remaining_capital?.toLocaleString()}</span>
+                    <span style={{ color: 'var(--ig-gain)' }}>Deployed: ${budgetInfo.deployed_capital?.toLocaleString()}</span>
+                    <span style={{ color: 'var(--ig-blue-accent)' }}>Available: ${budgetInfo.remaining_capital?.toLocaleString()}</span>
                     <span style={{ color: '#9333ea' }}>{budgetInfo.utilization_pct?.toFixed(0)}% used</span>
                   </div>
                 )}
@@ -1973,16 +1967,16 @@ function App() {
               {budgetInfo?.budget_set ? (
                 <div>
                   {/* Budget progress bar */}
-                  <div style={{ marginBottom: 12, padding: '8px 12px', background: '#fffbeb', borderRadius: 6, border: '1px solid #fde68a' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4, color: '#92400e' }}>
+                  <div style={{ marginBottom: 12, padding: '8px 12px', background: 'rgba(255, 184, 0, 0.1)', borderRadius: 6, border: '1px solid rgba(255, 184, 0, 0.3)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4, color: 'var(--ig-warning)' }}>
                       <span>Total: ${budgetInfo.total_budget?.toLocaleString()} {budgetInfo.currency}</span>
                       <span>Max/Position: ${budgetInfo.max_per_position?.toLocaleString()} ({budgetInfo.max_position_pct}%)</span>
                     </div>
-                    <div style={{ width: '100%', height: 10, background: '#fef3c7', borderRadius: 5, overflow: 'hidden' }}>
+                    <div style={{ width: '100%', height: 10, background: 'rgba(255, 184, 0, 0.1)', borderRadius: 5, overflow: 'hidden' }}>
                       <div style={{
                         width: `${Math.min(budgetInfo.utilization_pct || 0, 100)}%`,
                         height: '100%',
-                        background: budgetInfo.utilization_pct > 90 ? '#ef4444' : budgetInfo.utilization_pct > 70 ? '#f59e0b' : '#22c55e',
+                        background: budgetInfo.utilization_pct > 90 ? 'var(--ig-red)' : budgetInfo.utilization_pct > 70 ? '#f59e0b' : '#22c55e',
                         borderRadius: 5,
                         transition: 'width 0.5s ease',
                       }} />
@@ -1994,9 +1988,9 @@ function App() {
                       {budgetInfo.position_weights.map(pw => (
                         <span key={pw.symbol} style={{
                           padding: '3px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600,
-                          background: pw.over_limit ? '#fef2f2' : '#f0fdf4',
-                          border: `1px solid ${pw.over_limit ? '#fca5a5' : '#bbf7d0'}`,
-                          color: pw.over_limit ? '#dc2626' : '#166534',
+                          background: pw.over_limit ? 'rgba(255, 51, 51, 0.1)' : 'rgba(0, 210, 135, 0.1)',
+                          border: `1px solid ${pw.over_limit ? 'rgba(255, 51, 51, 0.3)' : 'rgba(0, 210, 135, 0.3)'}`,
+                          color: pw.over_limit ? 'var(--ig-red)' : 'var(--ig-gain)',
                         }}>
                           {pw.symbol}: {pw.weight_pct}%{pw.over_limit ? ' ⚠️' : ''}
                         </span>
@@ -2004,7 +1998,7 @@ function App() {
                     </div>
                   )}
                   {budgetInfo.over_limit_count > 0 && (
-                    <p style={{ fontSize: 11, color: '#dc2626', margin: '0 0 8px' }}>
+                    <p style={{ fontSize: 11, color: 'var(--ig-red)', margin: '0 0 8px' }}>
                       ⚠️ {budgetInfo.over_limit_count} position(s) exceed {budgetInfo.max_position_pct}% limit
                     </p>
                   )}
@@ -2100,17 +2094,17 @@ function App() {
                   {/* Flags */}
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
                     {hedgeSuggestions.regime?.safe_haven_flag && (
-                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#fef2f2', color: '#dc2626', border: '1px solid #fca5a5' }}>
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: 'rgba(255, 51, 51, 0.1)', color: 'var(--ig-red)', border: '1px solid rgba(255, 51, 51, 0.3)' }}>
                         ⚠️ Safe Haven Active
                       </span>
                     )}
                     {hedgeSuggestions.regime?.usd_headwind_flag && (
-                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a' }}>
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: 'rgba(255, 184, 0, 0.1)', color: 'var(--ig-warning)', border: '1px solid rgba(255, 184, 0, 0.3)' }}>
                         💵 USD Headwind
                       </span>
                     )}
                     {hedgeSuggestions.regime?.divergence_flag && (
-                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: '#f0f9ff', color: '#0369a1', border: '1px solid #bae6fd' }}>
+                      <span style={{ padding: '4px 10px', borderRadius: 16, fontSize: 11, fontWeight: 700, background: 'rgba(0, 163, 255, 0.1)', color: 'var(--ig-blue-accent)', border: '1px solid rgba(0, 163, 255, 0.3)' }}>
                         📊 Divergence Detected
                       </span>
                     )}
@@ -2121,8 +2115,8 @@ function App() {
                       {hedgeSuggestions.suggestions.map((s, i) => (
                         <div key={i} style={{
                           padding: 14, borderRadius: 8,
-                          background: s.urgency === 'high' ? 'linear-gradient(135deg, #fef2f2, #fee2e2)' : s.urgency === 'medium' ? 'linear-gradient(135deg, #fffbeb, #fef3c7)' : 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
-                          border: `1px solid ${s.urgency === 'high' ? '#fca5a5' : s.urgency === 'medium' ? '#fde68a' : '#bbf7d0'}`,
+                          background: s.urgency === 'high' ? 'linear-gradient(135deg, rgba(255, 51, 51, 0.1), #fee2e2)' : s.urgency === 'medium' ? 'linear-gradient(135deg, rgba(255, 184, 0, 0.1), rgba(255, 184, 0, 0.1))' : 'linear-gradient(135deg, rgba(0, 210, 135, 0.1), #dcfce7)',
+                          border: `1px solid ${s.urgency === 'high' ? 'rgba(255, 51, 51, 0.3)' : s.urgency === 'medium' ? 'rgba(255, 184, 0, 0.3)' : 'rgba(0, 210, 135, 0.3)'}`,
                         }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                             <strong style={{ fontSize: 14 }}>
@@ -2131,15 +2125,15 @@ function App() {
                             </strong>
                             <span style={{
                               padding: '2px 8px', borderRadius: 10, fontSize: 10, fontWeight: 700, textTransform: 'uppercase',
-                              background: s.urgency === 'high' ? '#dc2626' : s.urgency === 'medium' ? '#f59e0b' : '#22c55e',
-                              color: '#fff',
+                              background: s.urgency === 'high' ? 'var(--ig-red)' : s.urgency === 'medium' ? '#f59e0b' : '#22c55e',
+                              color: 'var(--bg-secondary)',
                             }}>
                               {s.urgency}
                             </span>
                           </div>
-                          <p style={{ margin: '0 0 6px', fontSize: 12, color: '#475569', lineHeight: 1.5 }}>{s.reason}</p>
+                          <p style={{ margin: '0 0 6px', fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{s.reason}</p>
                           {s.suggested_amount > 0 && (
-                            <p style={{ margin: 0, fontSize: 11, color: '#6b7280' }}>
+                            <p style={{ margin: 0, fontSize: 11, color: 'var(--text-secondary)' }}>
                               Suggested allocation: ~{s.suggested_allocation_pct}% (${s.suggested_amount?.toLocaleString()})
                             </p>
                           )}
@@ -2147,7 +2141,7 @@ function App() {
                       ))}
                     </div>
                   ) : (
-                    <p style={{ fontSize: 12, color: '#166534', background: '#f0fdf4', padding: 10, borderRadius: 6, border: '1px solid #bbf7d0' }}>
+                    <p style={{ fontSize: 12, color: 'var(--ig-gain)', background: 'rgba(0, 210, 135, 0.1)', padding: 10, borderRadius: 6, border: '1px solid rgba(0, 210, 135, 0.3)' }}>
                       ✅ No urgent hedge actions needed. Market conditions are favourable for your current positions.
                     </p>
                   )}
@@ -2155,117 +2149,11 @@ function App() {
               )}
             </section>
 
-            {/* ── News Sentiment Scanner ──────────────────────────────── */}
-            <section className="panel" style={{ marginBottom: 14 }}>
-              <div className="section-header">
-                <h2>📰 News Sentiment Monitor</h2>
-                <button className="btn-secondary" onClick={fetchSentimentScan} disabled={sentimentLoading} style={{ fontSize: 12 }}>
-                  {sentimentLoading ? 'Scanning...' : '🔍 Scan News Sentiment'}
-                </button>
-              </div>
-              {!sentimentScan && !sentimentLoading && (
-                <p className="section-note">Click "Scan News Sentiment" to analyse recent news for all your held positions. Negative news will generate sell alerts with profit-at-risk calculations.</p>
-              )}
-              {sentimentScan && (
-                <div>
-                  {/* Summary bar */}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10, marginBottom: 12 }}>
-                    <div className="stat-card blue"><div className="stat-content"><span className="stat-title">Scanned</span><span className="stat-value">{sentimentScan.scanned}</span></div></div>
-                    <div className={`stat-card ${sentimentScan.high_urgency_count > 0 ? 'red' : 'green'}`}>
-                      <div className="stat-content"><span className="stat-title">⚠️ High Alerts</span><span className="stat-value">{sentimentScan.high_urgency_count}</span></div>
-                    </div>
-                    <div className={`stat-card ${sentimentScan.medium_urgency_count > 0 ? '' : 'green'}`} style={{ background: sentimentScan.medium_urgency_count > 0 ? '#fef3c7' : undefined }}>
-                      <div className="stat-content"><span className="stat-title">🟡 Watch</span><span className="stat-value">{sentimentScan.medium_urgency_count}</span></div>
-                    </div>
-                  </div>
-                  <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 12 }}>
-                    {sentimentScan.summary} • Scanned at {new Date(sentimentScan.scanned_at).toLocaleTimeString()}
-                  </p>
 
-                  {/* Sell Alerts */}
-                  {sentimentScan.alerts?.filter(a => a.urgency === 'high').map((alert, i) => (
-                    <div key={i} style={{
-                      padding: 16, marginBottom: 10, borderRadius: 8,
-                      background: 'linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%)',
-                      border: '2px solid #fca5a5',
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                        <strong style={{ fontSize: 15, color: '#dc2626' }}>⚠️ NEGATIVE NEWS — {alert.symbol}</strong>
-                        <span style={{ padding: '2px 8px', borderRadius: 10, fontSize: 10, fontWeight: 700, background: '#dc2626', color: '#fff' }}>REVIEW SELL</span>
-                      </div>
-                      {alert.headline && <p style={{ margin: '0 0 8px', fontSize: 13, color: '#1e293b', fontStyle: 'italic' }}>"{alert.headline}"</p>}
-                      <p style={{ margin: '0 0 8px', fontSize: 12, color: '#475569' }}>{alert.reason}</p>
-                      {alert.themes?.length > 0 && (
-                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
-                          {alert.themes.map((t, j) => (
-                            <span key={j} style={{ padding: '2px 8px', borderRadius: 12, fontSize: 10, background: '#fef2f2', border: '1px solid #fca5a5', color: '#b91c1c' }}>{t}</span>
-                          ))}
-                        </div>
-                      )}
-                      {alert.profit_at_risk && Object.keys(alert.profit_at_risk).length > 0 && (
-                        <div style={{ padding: 10, background: '#fff', borderRadius: 6, border: '1px solid #e5e7eb', marginBottom: 8 }}>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8, fontSize: 12 }}>
-                            <div><span style={{ color: '#6b7280' }}>Avg Cost: </span><strong>${alert.profit_at_risk.avg_cost?.toFixed(2)}</strong></div>
-                            <div><span style={{ color: '#6b7280' }}>Live: </span><strong>${alert.profit_at_risk.live_price?.toFixed(2)}</strong></div>
-                            <div><span style={{ color: alert.profit_at_risk.unrealized_profit >= 0 ? '#166534' : '#dc2626' }}>P&L: </span>
-                              <strong style={{ color: alert.profit_at_risk.unrealized_profit >= 0 ? '#166534' : '#dc2626' }}>
-                                {alert.profit_at_risk.unrealized_profit >= 0 ? '+' : ''}${alert.profit_at_risk.unrealized_profit?.toFixed(2)} ({alert.profit_at_risk.unrealized_pct?.toFixed(1)}%)
-                              </strong>
-                            </div>
-                            <div>
-                              <span style={{ color: '#6b7280' }}>Risk if 5% drop: </span>
-                              <strong style={{ color: '#dc2626' }}>-${alert.profit_at_risk.potential_loss_at_risk_pct?.toFixed(2)}</strong>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      <p style={{ fontSize: 10, color: '#94a3b8', margin: 0, fontStyle: 'italic' }}>
-                        ⚖️ Use this as decision support, not an automatic trade signal. Always verify with your own research.
-                      </p>
-                    </div>
-                  ))}
-
-                  {/* Medium alerts */}
-                  {sentimentScan.alerts?.filter(a => a.urgency === 'medium').map((alert, i) => (
-                    <div key={i} style={{
-                      padding: 12, marginBottom: 8, borderRadius: 6,
-                      background: '#fffbeb', border: '1px solid #fde68a',
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <strong style={{ fontSize: 13, color: '#92400e' }}>🟡 {alert.symbol} — Monitor</strong>
-                        <span style={{ fontSize: 11, color: '#92400e' }}>Score: {alert.sentiment_score?.toFixed(2)}</span>
-                      </div>
-                      {alert.headline && <p style={{ margin: '4px 0 0', fontSize: 12, color: '#475569' }}>{alert.headline}</p>}
-                    </div>
-                  ))}
-
-                  {/* Sentiment grid for all positions */}
-                  {sentimentScan.sentiment_results?.length > 0 && (
-                    <div style={{ marginTop: 12 }}>
-                      <p style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 8 }}>Sentiment by Position:</p>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                        {sentimentScan.sentiment_results.map(sr => (
-                          <div key={sr.symbol} style={{
-                            padding: '6px 12px', borderRadius: 8, fontSize: 12, fontWeight: 600,
-                            background: sr.sentiment === 'positive' ? '#f0fdf4' : sr.sentiment === 'negative' ? '#fef2f2' : '#f8fafc',
-                            border: `1px solid ${sr.sentiment === 'positive' ? '#bbf7d0' : sr.sentiment === 'negative' ? '#fca5a5' : '#e2e8f0'}`,
-                            color: sr.sentiment === 'positive' ? '#166534' : sr.sentiment === 'negative' ? '#dc2626' : '#475569',
-                          }}>
-                            {sr.sentiment === 'positive' ? '🟢' : sr.sentiment === 'negative' ? '🔴' : '⚪'} {sr.symbol}
-                            <span style={{ marginLeft: 4, fontWeight: 400, fontSize: 11 }}>({sr.score?.toFixed(2)})</span>
-                            {sr.cached && <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.6 }}>cached</span>}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </section>
 
             <TelegramBotGuide />
 
-            <section className="panel" style={{ background: 'linear-gradient(135deg, #f6fbff 0%, #eef5ff 100%)', borderColor: '#d4e3ff' }}>
+            <section className="panel" style={{ background: 'linear-gradient(135deg, rgba(0, 163, 255, 0.1) 0%, rgba(0, 163, 255, 0.1) 100%)', borderColor: 'rgba(0, 163, 255, 0.3)' }}>
               <div className="section-header" style={{ alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                 <h2>AI Investment Strategy Blueprint</h2>
                 <div style={{ display: 'flex', gap: 8 }}>
@@ -2281,25 +2169,36 @@ function App() {
                 This is the strategy cockpit: regime context, stage filters, allocation policy, risk budget, and execution loop.
                 Discovery and rank tables live in the Candidates workspace.
               </p>
+              
+              <div style={{ padding:'14px 18px', background:'rgba(0, 210, 135, 0.1)', border:'1px solid rgba(0, 210, 135, 0.3)', borderRadius:8, marginBottom:20 }}>
+                <h3 style={{ margin:'0 0 10px 0', color:'var(--ig-gain)', fontSize:15, fontWeight:800 }}>📈 The "Base-Hit" Compounding Strategy (Active)</h3>
+                <p style={{ margin:0, color:'var(--ig-gain)', fontSize:13, lineHeight:1.6 }}>
+                  <strong>Goal:</strong> Target an 18% annual return by executing disciplined, compounding 2-3 month cycles.<br/>
+                  <strong>Rules of Engagement (Auto-Enforced by AI):</strong><br/>
+                  • <strong>Take Profit: +4.5%</strong>. We do not get greedy. The AI automatically triggers a Trim/Exit to lock in the compounding cycle.<br/>
+                  • <strong>Stop Loss: -3.0%</strong>. We cut losers instantly. Protecting the 80% win-rate edge is paramount.<br/>
+                  • <strong>Capital Parking:</strong> When the market lacks &gt;65 score setups, uninvested capital defaults to GOLD.AX or core indices.
+                </p>
+              </div>
               {activeStrategyDashboard ? (
                 <>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10, marginBottom: 10 }}>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Confidence</strong>
                       <div style={{ fontSize: 18, marginTop: 4 }}>{activeStrategyDashboard.confidence || 'n/a'}</div>
                     </div>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Average Score</strong>
                       <div style={{ fontSize: 18, marginTop: 4 }}>{Number(activeStrategyDashboard.avg_score || 0).toFixed(2)}</div>
                     </div>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Qualified / Analysed</strong>
                       <div style={{ fontSize: 18, marginTop: 4 }}>
                         {Number(activeStrategyDashboard.filters?.qualified_count || 0)} /
                         {' '}{Number(activeStrategyDashboard.filters?.analyzed_count || 0)}
                       </div>
                     </div>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Action Mix</strong>
                       <div style={{ marginTop: 4, fontSize: 13 }}>
                         BUY {Number(activeStrategyDashboard.action_mix?.buy || 0)}
@@ -2310,7 +2209,7 @@ function App() {
                     </div>
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 10 }}>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Portfolio Mix Target</strong>
                       <div style={{ marginTop: 6, fontSize: 13 }}>
                         Growth {Number(activeStrategyDashboard.portfolio_mix?.growth_pct || 0)}%
@@ -2318,13 +2217,13 @@ function App() {
                         {' '}· Defensive/Cash {Number(activeStrategyDashboard.portfolio_mix?.defensive_cash_pct || 0)}%
                       </div>
                     </div>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Practical Risk Controls</strong>
                       <div style={{ marginTop: 6, fontSize: 13 }}>
                         {(activeStrategyDashboard.risk_controls || []).join(' · ') || 'No risk controls returned yet'}
                       </div>
                     </div>
-                    <div style={{ background: '#fff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 10 }}>
+                    <div style={{ background: 'var(--bg-secondary)', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 10 }}>
                       <strong>Execution Risk Budget</strong>
                       <div style={{ marginTop: 6, fontSize: 13 }}>
                         Net deployed ${executionSnapshot.netDeployed.toFixed(2)} ·
@@ -2335,7 +2234,7 @@ function App() {
                   </div>
                 </>
               ) : (
-                <div style={{ background: '#fff', border: '1px dashed #bcd0ff', borderRadius: 6, padding: 12 }}>
+                <div style={{ background: 'var(--bg-secondary)', border: '1px dashed rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 12 }}>
                   <p style={{ margin: 0, fontSize: 13 }}>
                     Generate an advice or digest preview to populate the live strategy blueprint cards.
                   </p>
@@ -2350,7 +2249,7 @@ function App() {
             <section className="tab-grid">
               <div className="panel">
                 <div className="section-header"><h2>Top ASX Set (Default)</h2></div>
-                <p className="section-note">Preloaded top ASX names from ASX200 context. Click Add to track directly.</p>
+                <p className="section-note">Preloaded top ASX names from Broad Market context. Click Add to track directly.</p>
                 <div className="chips-grid">
                   {topUniverse.map(item => (
                     <div key={item.symbol} className="chip-card">
@@ -2466,16 +2365,6 @@ function App() {
                   <div style={{ marginTop: 4 }}>{trackingOverview.length}</div>
                 </div>
               </div>
-              <details>
-                <summary style={{ cursor: 'pointer', fontWeight: 600, marginBottom: 10 }}>Advanced: 14-Day signal diagnostics</summary>
-                {loading ? <p>Loading...</p> : (
-                  <div className="table-wrap"><table className="data-table"><thead><tr><th>Symbol</th><th>Start</th><th>Day</th><th>Entry</th><th>Target 14D</th><th>Current</th><th>Progress</th><th>Expected</th><th>Actual</th><th>Status</th><th>Bucket</th></tr></thead><tbody>
-                    {trackingOverview.map(row => (
-                      <tr key={row.id}><td><strong>{row.symbol}</strong></td><td>{new Date(row.start_date).toLocaleDateString()}</td><td>D+{row.current_day}</td><td>${row.entry_price.toFixed(2)}</td><td>${row.target_price_14d.toFixed(2)}</td><td>${row.current_price.toFixed(2)}</td><td>{row.progress_to_target.toFixed(1)}%</td><td>{row.expected_direction}</td><td>{row.actual_direction}</td><td>{row.status}</td><td>{row.bucket || '-'}</td></tr>
-                    ))}
-                  </tbody></table></div>
-                )}
-              </details>
             </section>
             )}
           </>
@@ -2542,7 +2431,7 @@ function App() {
                   </button>
                 </div>
                 {telegramAdvice?.delivery?.error && (
-                  <div style={{ background: '#fff2f0', border: '1px solid #f2b8b5', color: '#8a1c14', borderRadius: 4, padding: 12, marginBottom: 12 }}>
+                  <div style={{ background: 'var(--bg-secondary)2f0', border: '1px solid #f2b8b5', color: '#8a1c14', borderRadius: 4, padding: 12, marginBottom: 12 }}>
                     {telegramAdvice.delivery.error}
                   </div>
                 )}
@@ -2552,7 +2441,7 @@ function App() {
                   </div>
                 )}
                 {telegramAdvice?.strategy_dashboard && (
-                  <div style={{ background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 6, padding: 12, marginBottom: 12 }}>
+                  <div style={{ background: '#f6f9ff', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 6, padding: 12, marginBottom: 12 }}>
                     <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>Strategy Dashboard (Live)</h3>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, fontSize: 12 }}>
                       <div><strong>Confidence</strong><div>{telegramAdvice.strategy_dashboard.confidence || 'n/a'}</div></div>
@@ -2576,7 +2465,7 @@ function App() {
                             <strong style={{ fontSize: 16 }}>{item.symbol}</strong>
                             <div style={{ color: 'var(--ig-muted)', fontSize: 12 }}>{item.name || 'Ranked opportunity'}</div>
                           </div>
-                          <span style={{ padding: '4px 8px', borderRadius: 999, background: item.action === 'BUY' ? '#e8f5ec' : item.action === 'REDUCE' ? '#fff2f0' : '#f5f5f5', color: item.action === 'BUY' ? '#1e6b36' : item.action === 'REDUCE' ? '#8a1c14' : '#555', fontSize: 11, fontWeight: 700 }}>
+                          <span style={{ padding: '4px 8px', borderRadius: 999, background: item.action === 'BUY' ? '#e8f5ec' : item.action === 'REDUCE' ? 'var(--bg-secondary)2f0' : '#f5f5f5', color: item.action === 'BUY' ? '#1e6b36' : item.action === 'REDUCE' ? '#8a1c14' : '#555', fontSize: 11, fontWeight: 700 }}>
                             {item.action}
                           </span>
                         </div>
@@ -2592,7 +2481,7 @@ function App() {
                         <div style={{ fontSize: 12, marginBottom: 8 }}><strong>Sell trigger:</strong> {item.sell_trigger}</div>
                         <div style={{ fontSize: 12, marginBottom: 12 }}><strong>Invalidation:</strong> {item.invalidation}</div>
                         {item.held_quantity > 0 && (
-                          <div style={{ fontSize: 12, marginBottom: 10, background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 4, padding: 8 }}>
+                          <div style={{ fontSize: 12, marginBottom: 10, background: '#f6f9ff', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 4, padding: 8 }}>
                             <strong>Current holding:</strong> {Number(item.held_quantity).toFixed(2)} shares @ ${Number(item.held_avg_cost || 0).toFixed(2)}
                             {item.held_unrealized_pct != null && (
                               <span style={{ marginLeft: 6, color: item.held_unrealized_pct >= 0 ? 'var(--ig-gain)' : 'var(--ig-red)' }}>
@@ -2652,7 +2541,7 @@ function App() {
                   </p>
                 )}
                 {telegramDigest?.delivery?.error && (
-                  <div style={{ background: '#fff8e6', border: '1px solid #f0d48a', color: '#7a5a00', borderRadius: 4, padding: 12, marginTop: 12 }}>
+                  <div style={{ background: 'var(--bg-secondary)8e6', border: '1px solid #f0d48a', color: '#7a5a00', borderRadius: 4, padding: 12, marginTop: 12 }}>
                     {telegramDigest.delivery.error}
                   </div>
                 )}
@@ -2700,7 +2589,7 @@ function App() {
                       <table className="data-table">
                         <thead><tr><th>When</th><th>Type</th><th>Chat</th><th>Status</th><th>Mode</th><th>Error</th></tr></thead>
                         <tbody>
-                          {telegramHistory.slice(0, 10).map(item => (
+                          {telegramHistory.slice(0, 3).map(item => (
                             <tr key={item.id}>
                               <td>{item.created_at ? new Date(item.created_at).toLocaleString() : '-'}</td>
                               <td>{item.message_type}</td>
@@ -2733,7 +2622,7 @@ function App() {
                       Executed actions logged: <strong>{adviceActions.length}</strong>
                     </div>
                     {adviceHoldings.slice(0, 4).map((holding) => (
-                      <div key={holding.symbol} style={{ background: '#f6f9ff', border: '1px solid #dbe7ff', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
+                      <div key={holding.symbol} style={{ background: '#f6f9ff', border: '1px solid rgba(0, 163, 255, 0.3)', borderRadius: 4, padding: '8px 10px', fontSize: 12 }}>
                         <strong>{holding.symbol}</strong> {Number(holding.quantity || 0).toFixed(2)} @ ${Number(holding.avg_cost || 0).toFixed(2)}
                       </div>
                     ))}
@@ -2763,6 +2652,12 @@ function App() {
                     <p className="section-note" style={{ marginBottom: 18 }}>No executed advice actions logged yet.</p>
                   )}
 
+                  <div style={{ padding:'10px 12px', background:'#fee2e2', border:'1px solid rgba(255, 51, 51, 0.3)', borderRadius:6, marginBottom:16 }}>
+                    <p style={{ margin:0, color:'var(--ig-red)', fontSize:11, fontWeight:700, lineHeight: 1.5 }}>
+                      🚨 CRITICAL SYSTEM GUARDRAIL CHECK: 
+                      <span style={{fontWeight:500}}> If you are holding any of these shares, you MUST manually verify them weekly for upcoming Earnings Reports and Stock Splits/Dividends. The algorithmic agent is blind to these binary corporate actions and cannot warn you of a sudden fundamental drop!</span>
+                    </p>
+                  </div>
                   <div className="section-header" style={{ marginBottom: 10 }}>
                     <h3 style={{ margin: 0 }}>Paper Trades</h3>
                     <button className="btn-secondary" onClick={fetchPaperTrades} disabled={paperTradeLoading} style={{ padding: '5px 10px', fontSize: 11 }}>
@@ -2881,17 +2776,23 @@ function App() {
         )}
 
         {activeTab === 'market' && (
-          !marketPulse ? (
-            <section className="panel">
-              <div className="section-header"><h2>Market Pulse</h2></div>
-              <p className="section-note">⏳ Loading market data…
-                <button className="btn-secondary" style={{ marginLeft: 12 }} onClick={fetchMarketPulse}>Retry</button>
-              </p>
-            </section>
+          <>
+            <NewsSentimentMonitor 
+              sentimentScan={sentimentScan} 
+              sentimentLoading={sentimentLoading} 
+              fetchSentimentScan={fetchSentimentScan} 
+            />
+            {!marketPulse ? (
+              <section className="panel">
+                <div className="section-header"><h2>Market Pulse</h2></div>
+                <p className="section-note">⏳ Loading market data…
+                  <button className="btn-secondary" style={{ marginLeft: 12 }} onClick={fetchMarketPulse}>Retry</button>
+                </p>
+              </section>
           ) : (
           <>
             <section className="stats-grid">
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">ASX200 Daily</span><span className="stat-value">{(marketPulse.metrics.asx200_ret ?? 0).toFixed(2)}%</span></div></div>
+              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">ASX Benchmark</span><span className="stat-value">{(marketPulse.metrics.asx200_ret ?? 0).toFixed(2)}%</span></div></div>
               <div className="stat-card blue"><div className="stat-content"><span className="stat-title">S&amp;P 500 Daily</span><span className="stat-value">{(marketPulse.metrics.sp500_ret ?? 0).toFixed(2)}%</span></div></div>
               <div className="stat-card green"><div className="stat-content"><span className="stat-title">Gold Daily</span><span className="stat-value">{(marketPulse.metrics.gold_ret ?? 0).toFixed(2)}%</span></div></div>
               <div className="stat-card red"><div className="stat-content"><span className="stat-title">DXY Daily</span><span className="stat-value">{(marketPulse.metrics.dxy_ret ?? 0).toFixed(2)}%</span></div></div>
@@ -2914,7 +2815,8 @@ function App() {
                 : <p className="section-note">Click refresh to get AI-powered market analysis</p>}
             </section>
           </>
-          )
+          )}
+          </>
         )}
 
         {activeTab === 'explain' && (
@@ -3053,7 +2955,7 @@ function App() {
                             }}
                             options={{
                               responsive: true, maintainAspectRatio: false,
-                              plugins: { legend: { display: true, labels: { color: 'var(--ig-medium)' } }, tooltip: { backgroundColor: 'rgba(0,0,0,0.85)', titleColor: '#fff', bodyColor: '#ccc', borderColor: '#333', borderWidth: 1, callbacks: { label: ctx => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(2)}` } } },
+                              plugins: { legend: { display: true, labels: { color: 'var(--ig-medium)' } }, tooltip: { backgroundColor: 'rgba(0,0,0,0.85)', titleColor: 'var(--bg-secondary)', bodyColor: '#ccc', borderColor: '#333', borderWidth: 1, callbacks: { label: ctx => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(2)}` } } },
                               scales: { x: { grid: { color: '#eee' }, ticks: { color: 'var(--ig-medium)' } }, y: { grid: { color: '#eee' }, ticks: { color: 'var(--ig-medium)' } } }
                             }}
                           />
@@ -3113,6 +3015,19 @@ function App() {
                   {analyzeData.llm_analysis && (
                     <section className="panel" style={{ marginBottom: 20 }}>
                       <div className="section-header"><h2>🤖 AI Analysis</h2></div>
+                      
+                      <div style={{ background:'var(--bg-secondary)1f2', borderLeft:'4px solid #e11d48', padding:'12px 16px', marginBottom:16, borderRadius:'0 6px 6px 0' }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:8, color:'#e11d48', fontWeight:700, marginBottom:4 }}>
+                          <span>🛑 STRICT RISK MANAGEMENT</span>
+                        </div>
+                        <div style={{ fontSize:13, color:'#881337', lineHeight:1.5 }}>
+                          Do not fall in love with the AI narrative. If you enter this trade, the algorithmic model <strong>REQUIRES</strong> a strict stop loss to maintain its mathematical edge:<br/>
+                          • Large/Mid Cap (&gt;$5M volume): <strong>-5.0% Stop</strong><br/>
+                          • Small Cap (&lt;$5M volume): <strong>-6.0% Stop</strong><br/>
+                          If it breaches these levels, exit immediately.
+                        </div>
+                      </div>
+
                       <div className="ai-analysis"><p style={{ lineHeight: 1.8, fontSize: 15 }}>{analyzeData.llm_analysis}</p></div>
                     </section>
                   )}

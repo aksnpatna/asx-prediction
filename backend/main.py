@@ -9878,10 +9878,19 @@ def _scheduled_broad_scan_precompute():
 
     This runs in a background thread so the main API isn't blocked.
     The broad scan hits 200+ tickers sequentially to avoid overwhelming yfinance.
+
+    Position entry is gated by WFO capital state — if INSUFFICIENT_DATA or RED,
+    the scan still runs (to accumulate data for future WFO evaluation) but new
+    positions are blocked by _wfo_position_gate().
     """
     import time as _sleep_time
     start = datetime.utcnow()
     market = "AU"
+
+    wfo = get_current_wfo_state()
+    wfo_state = wfo["state"]
+    gate = _wfo_position_gate()
+    print(f"[BroadScan] WFO gate: {wfo_state} — {gate['reason']}")
     # ── Expanded universe via EODHD (falls back to hardcoded if key not set) ──
     # BROAD_SCAN_CAP caps the number of tickers per run so a mini-PC (6800H)
     # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
@@ -11057,6 +11066,138 @@ def _scheduled_daily_ai_pipeline():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WFO CAPITAL DEPLOYMENT GATES — what each state mechanically controls
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WFO_CAPITAL_RULES = {
+    "INSUFFICIENT_DATA": {
+        "max_positions": 0,
+        "max_single_position_pct": 0,
+        "max_sector_pct": 0,
+        "allow_new_positions": False,
+        "description": "Paper only. No live capital deployed. Evaluate OOS Sharpe before sizing.",
+    },
+    "RED": {
+        "max_positions": 0,
+        "max_single_position_pct": 0,
+        "max_sector_pct": 0,
+        "allow_new_positions": False,
+        "description": "No edge. Halve existing positions. No new entries. Manual review required.",
+    },
+    "RED_MANUAL_REVIEW": {
+        "max_positions": 0,
+        "max_single_position_pct": 0,
+        "max_sector_pct": 0,
+        "allow_new_positions": False,
+        "description": "Manual review in progress. Hold existing positions, no new entries.",
+    },
+    "AMBER": {
+        "max_positions": 6,
+        "max_single_position_pct": 8,
+        "max_sector_pct": 30,
+        "allow_new_positions": True,
+        "description": "Edge unproven. Max 6 positions, single position ≤8%, sector ≤30%.",
+    },
+    "GREEN": {
+        "max_positions": 12,
+        "max_single_position_pct": 12,
+        "max_sector_pct": 40,
+        "allow_new_positions": True,
+        "description": "Edge confirmed (95% CI lower bound ≥ 0). Max 12 positions, single position ≤12%, sector ≤40%.",
+    },
+}
+
+_WFO_STATE_KEY = "wfo_capital_state"
+
+def get_current_wfo_state() -> dict:
+    """Return the most restrictive WFO capital state across all 3 horizons.
+
+    Priority: RED > RED_MANUAL_REVIEW > INSUFFICIENT_DATA > AMBER > GREEN.
+    Returns the state name AND the mechanical limits it enforces.
+    """
+    _ensure_wfo_table()
+    states = []
+
+    for horizon_days in _WFO_HORIZON_DAYS:
+        try:
+            with db_conn() as conn:
+                row = conn.execute(text("""
+                    SELECT notes FROM wfo_metrics
+                    WHERE horizon_window_days = :hd
+                    ORDER BY run_at DESC LIMIT 1
+                """), {"hd": horizon_days}).fetchone()
+            if row and row[0]:
+                notes = row[0]
+                if "RED_MANUAL_REVIEW" in notes:
+                    states.append("RED_MANUAL_REVIEW")
+                elif "RED" in notes and "MANUAL" not in notes:
+                    states.append("RED")
+                elif "AMBER" in notes:
+                    states.append("AMBER")
+                elif "GREEN" in notes:
+                    states.append("GREEN")
+                elif "INSUFFICIENT_DATA" in notes:
+                    states.append("INSUFFICIENT_DATA")
+        except Exception:
+            pass
+
+    # Priority order: worst state wins
+    for candidate in ["RED", "RED_MANUAL_REVIEW", "INSUFFICIENT_DATA", "AMBER", "GREEN"]:
+        if candidate in states:
+            return {"state": candidate, "rules": _WFO_CAPITAL_RULES[candidate]}
+
+    return {"state": "INSUFFICIENT_DATA", "rules": _WFO_CAPITAL_RULES["INSUFFICIENT_DATA"]}
+
+
+def _wfo_position_gate(user_id: str = None) -> dict:
+    """Enforce WFO capital deployment limits before opening a new position.
+
+    Returns:
+        {"allowed": bool, "max_positions": int, "max_pct": int, "reason": str}
+    """
+    wfo = get_current_wfo_state()
+    state = wfo["state"]
+    rules = wfo["rules"]
+
+    if not rules["allow_new_positions"]:
+        return {
+            "allowed": False,
+            "max_positions": 0,
+            "max_single_pct": 0,
+            "max_sector_pct": 0,
+            "reason": f"WFO state {state}: {rules['description']}",
+        }
+
+    # Count current open model-driven positions
+    open_count = 0
+    try:
+        with db_conn() as conn:
+            count_row = conn.execute(text(
+                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open' AND source LIKE 'wealth_builder%'"
+            )).fetchone()
+            open_count = count_row[0] if count_row else 0
+    except Exception:
+        pass
+
+    if open_count >= rules["max_positions"]:
+        return {
+            "allowed": False,
+            "max_positions": rules["max_positions"],
+            "max_single_pct": rules["max_single_position_pct"],
+            "max_sector_pct": rules["max_sector_pct"],
+            "reason": f"WFO state {state}: {open_count}/{rules['max_positions']} positions open. Max reached.",
+        }
+
+    return {
+        "allowed": True,
+        "max_positions": rules["max_positions"],
+        "max_single_pct": rules["max_single_position_pct"],
+        "max_sector_pct": rules["max_sector_pct"],
+        "reason": f"WFO state {state}: {open_count}/{rules['max_positions']} positions. Entry allowed.",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # WALK-FORWARD OOS VALIDATION ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -11900,6 +12041,7 @@ async def walk_forward_oos_metrics(current_user: dict = Depends(get_current_user
             h for h in [30, 63, 90]
             if latest[h] and (latest[h].get("notes") or "").startswith("INSUFFICIENT_DATA")
         ],
+        "capital_gate": get_current_wfo_state(),
     }
 
 
@@ -12156,20 +12298,24 @@ async def telegram_bot_webhook(request: Request):
             notes=f"Telegram: {text}",
         )
 
-        # Auto-create paper trade monitor on BUY/ADD
+        # Auto-create paper trade monitor on BUY/ADD (gated by WFO capital state)
         trade_id = None
         monitoring_msg = ""
         if action in {"BUY", "ADD"}:
-            trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
-            if trade_id:
-                stop = round(price * 0.92, 2)
-                target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
-                monitoring_msg = (
-                    f"\n\n<b>Monitoring started</b>\n"
-                    f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
-                    f"Target: model forecast | Trailing stop: 3%\n"
-                    f"You'll get alerts if price hits stop, target, or goes flat 30 days."
-                )
+            gate = _wfo_position_gate(user_id)
+            if not gate["allowed"]:
+                monitoring_msg = f"\n\n<b>⛔ Position BLOCKED by WFO gate:</b> {gate['reason']}"
+            else:
+                trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
+                if trade_id:
+                    stop = round(price * 0.92, 2)
+                    target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
+                    monitoring_msg = (
+                        f"\n\n<b>Monitoring started</b>\n"
+                        f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
+                        f"Target: model forecast | Trailing stop: 3%\n"
+                        f"You'll get alerts if price hits stop, target, or goes flat 30 days."
+                    )
 
         # Auto-close paper trade monitor on SELL/REDUCE
         closed_id = None

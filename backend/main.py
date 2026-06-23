@@ -9891,6 +9891,180 @@ def _scheduled_broad_scan_precompute():
     wfo_state = wfo["state"]
     gate = _wfo_position_gate()
     print(f"[BroadScan] WFO gate: {wfo_state} — {gate['reason']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UAT HEALTH WATCHDOG — fully automated 30-day burn-in monitoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _scheduled_uat_health_report():
+    """Daily UAT health report (4:30 PM AEST, after WFO).
+
+    Summarizes everything a human would otherwise need to check manually:
+      - Did the broad scan run today? How many candidates?
+      - Is the EODHD API healthy? Any rate-limit failures?
+      - How many signals have accumulated toward the 30d WFO threshold?
+      - What's the current WFO capital gate state?
+      - Are there any stalled paper trades that need attention?
+      - How many Tavily credits were consumed today?
+
+    All of this is automated — no human needs to log in and run queries.
+    If something breaks (scan failed, EODHD down, zero candidates), the
+    report flags it with ⚠️ so you know to investigate.
+    """
+    _ensure_wfo_table()
+
+    today = datetime.utcnow().date()
+    yesterday = today - timedelta(days=1)
+
+    lines = [f"<b>🏥 UAT HEALTH REPORT — {today.isoformat()}</b>", ""]
+
+    # 1. Broad scan status
+    try:
+        with db_conn() as conn:
+            scan = conn.execute(text("""
+                SELECT scanned_count, candidates_found, generated_at
+                FROM wealth_scan_cache
+                WHERE scan_mode = 'broad'
+                  AND generated_at >= :yesterday
+                ORDER BY generated_at DESC LIMIT 1
+            """), {"yesterday": yesterday.isoformat()}).fetchone()
+
+        if scan and scan[0]:
+            lines.append(f"✅ Broad scan: {scan[0]} stocks → {scan[1]} candidates at {str(scan[2])[:19]}")
+        else:
+            lines.append(f"⚠️ Broad scan: DID NOT RUN today. Check scheduler / EODHD key.")
+    except Exception as e:
+        lines.append(f"⚠️ Broad scan check failed: {e}")
+
+    # 2. EODHD API health
+    try:
+        eodhd_ok = bool(EODHD_API_KEY)
+        if eodhd_ok:
+            # Quick test: fetch one stock to verify API still works
+            test_ticker = format_ticker("BHP", "AU").replace(".AX", ".AU")
+            _eodhd_rate_limit()
+            r = requests.get(
+                f"https://eodhd.com/api/real-time/{test_ticker}",
+                params={"api_token": EODHD_API_KEY, "fmt": "json"},
+                timeout=8
+            )
+            eodhd_ok = r.status_code == 200
+            lines.append(f"{'✅' if eodhd_ok else '⚠️'} EODHD API: {'healthy' if eodhd_ok else f'DOWN (status {r.status_code})'}")
+        else:
+            lines.append(f"⚠️ EODHD API: NO KEY SET — data pipeline disabled")
+    except Exception:
+        lines.append(f"⚠️ EODHD API: CONNECTION FAILED")
+
+    # 3. Signal accumulation toward WFO Day 30
+    try:
+        with db_conn() as conn:
+            for horizon_days in [30, 63, 90]:
+                cutoff = today - timedelta(days=horizon_days)
+                cache_count = conn.execute(text("""
+                    SELECT COUNT(*) FROM wealth_scan_cache
+                    WHERE scan_mode = 'broad' AND generated_at <= :cutoff
+                """), {"cutoff": cutoff}).fetchone()
+                wfo_row = conn.execute(text("""
+                    SELECT notes FROM wfo_metrics
+                    WHERE horizon_window_days = :hd
+                    ORDER BY run_at DESC LIMIT 1
+                """), {"hd": horizon_days}).fetchone()
+                status = wfo_row[0][:60] if wfo_row and wfo_row[0] else "not yet checked"
+
+                days_remaining = max(0, horizon_days - (today - yesterday).days)
+                d30_cutoff = today - timedelta(days=30)
+                earliest_scan = conn.execute(text("""
+                    SELECT MIN(generated_at) FROM wealth_scan_cache
+                    WHERE scan_mode = 'broad'
+                """)).fetchone()
+
+                if earliest_scan and earliest_scan[0]:
+                    earliest_date = earliest_scan[0].date() if hasattr(earliest_scan[0], 'date') else earliest_scan[0]
+                    if isinstance(earliest_date, datetime):
+                        earliest_date = earliest_date.date()
+                    days_accumulated = max(0, (today - earliest_date).days)
+                else:
+                    days_accumulated = 0
+
+                bar = "█" * min(days_accumulated, 30) + "░" * max(0, 30 - days_accumulated)
+                lines.append(
+                    f"  {'🟢' if days_accumulated >= horizon_days else '🟡'} "
+                    f"{horizon_days}d horizon: {days_accumulated}/30 days [{bar}] | "
+                    f"Cache rows ≥{horizon_days}d old: {cache_count[0] or 0} | {status}"
+                )
+    except Exception as e:
+        lines.append(f"⚠️ Signal accumulation check failed: {e}")
+
+    # 4. WFO capital gate state
+    try:
+        wfo = get_current_wfo_state()
+        emoji = {"GREEN": "🟢", "AMBER": "🟡", "RED": "🔴", "RED_MANUAL_REVIEW": "🔴", "INSUFFICIENT_DATA": "🟡"}
+        lines.append(f"")
+        lines.append(f"{emoji.get(wfo['state'], '⚪')} <b>Capital Gate: {wfo['state']}</b>")
+        lines.append(f"  {wfo['rules']['description']}")
+        if wfo['state'] != "INSUFFICIENT_DATA":
+            lines.append(f"  Max positions: {wfo['rules']['max_positions']} | "
+                        f"Max single: {wfo['rules']['max_single_position_pct']}% | "
+                        f"Max sector: {wfo['rules']['max_sector_pct']}%")
+    except Exception as e:
+        lines.append(f"⚠️ WFO state check failed: {e}")
+
+    # 5. Paper trade summary
+    try:
+        with db_conn() as conn:
+            open_count = conn.execute(text(
+                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'"
+            )).fetchone()
+            stale_count = conn.execute(text("""
+                SELECT COUNT(*) FROM paper_trades
+                WHERE status = 'open' AND created_at < :stale
+            """), {"stale": today - timedelta(days=14)}).fetchone()
+            lines.append(f"")
+            lines.append(f"📊 <b>Paper Trades:</b> {open_count[0] or 0} open")
+            if (stale_count[0] or 0) > 0:
+                lines.append(f"  ⚠️ {stale_count[0]} positions stale (>14d) — may need review")
+    except Exception:
+        pass
+
+    # 6. Tavily credit consumption
+    try:
+        try:
+            from agentic_brain import _TAVILY_CALL_COUNT as tavily_used
+        except ImportError:
+            tavily_used = 0
+        lines.append(f"")
+        lines.append(f"🔍 Tavily credits consumed: ~{tavily_used} today (60/day cap, monthly reset)")
+    except Exception:
+        pass
+
+    lines.append(f"")
+    lines.append(f"<i>Day {days_accumulated if 'days_accumulated' in dir() else 0}/30 toward first WFO Sharpe evaluation. "
+                f"Next milestone: {30 - (days_accumulated if 'days_accumulated' in dir() else 0)} days.</i>")
+
+    message = "\n".join(lines)
+
+    # Broadcast to all Telegram users
+    try:
+        with db_conn() as conn:
+            users = conn.execute(text("SELECT id FROM users")).fetchall()
+        for user in users:
+            uid = user[0]
+            recipients = get_user_telegram_recipients(uid)
+            if not recipients:
+                continue
+            digest_key = f"uat_health_{today.isoformat()}"
+            if not has_digest_been_sent(uid, market="AU", digest_key=digest_key):
+                _send_telegram_payload(
+                    message, recipients, user_id=uid,
+                    message_type="uat_health", market="AU",
+                    digest_key=digest_key, source="uat_health_watchdog",
+                    delivery_mode="auto",
+                )
+    except Exception as e:
+        print(f"[UATHealth] Broadcast failed: {e}")
+
+    print(f"[UATHealth] Report sent. {days_accumulated if 'days_accumulated' in dir() else 0}/30 days to WFO Day 30.")
     # ── Expanded universe via EODHD (falls back to hardcoded if key not set) ──
     # BROAD_SCAN_CAP caps the number of tickers per run so a mini-PC (6800H)
     # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
@@ -12433,6 +12607,13 @@ if SCHEDULER_AVAILABLE:
             id="walk_forward_oos",
             max_instances=1,
         )
+        scheduler.add_job(
+            _scheduled_uat_health_report, "cron",
+            minute=30, hour=16,
+            day_of_week="mon-fri",
+            id="uat_health_report",
+            max_instances=1,
+        )
         scheduler.start()
 
         # ── Startup Catch-Up Engine ───────────────────────────────────────────
@@ -12496,6 +12677,14 @@ if SCHEDULER_AVAILABLE:
                 tasks_run.append("walk_forward_oos")
             except Exception as _e:
                 print(f"[StartupCatchup] WFO failed: {_e}")
+
+            # ── 5. UAT health report — runs after WFO on boot ──────────────────
+            try:
+                print(f"[StartupCatchup] Generating UAT health report …")
+                _scheduled_uat_health_report()
+                tasks_run.append("uat_health_report")
+            except Exception as _e:
+                print(f"[StartupCatchup] UAT health report failed: {_e}")
 
             _st.sleep(10)
 

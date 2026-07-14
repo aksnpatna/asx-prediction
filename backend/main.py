@@ -1397,19 +1397,8 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
         except Exception as e:
             print(f"[EODHD RealTime] Error fetching live price for {s}: {e}")
         
-    # 2. Fallback to End-Of-Day 5d charts if live price fails
+    # 2. Fallback to End-Of-Day 5d charts from EODHD if live price fails
     hist = _eodhd_historical_data(s, "5d", market)
-    
-    if hist.empty:
-        ticker_str = format_ticker(s, market)
-        stock = yf.Ticker(ticker_str)
-        try:
-            hist = stock.history(period="5d")
-            # Fallback: if empty and not already trying ASX, retry as ASX
-            if hist.empty and market != "AU":
-                hist = yf.Ticker(format_ticker(s, "AU")).history(period="5d")
-        except Exception:
-            pass
             
     try:
         # Staleness check: reject if last data point is older than 5 calendar days
@@ -1721,14 +1710,19 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
     is_donchian_breakout = (current_price >= donchian_high) and (donchian_high > 0)
     
     # We require either strong EMA momentum, a breakout, or solid MACD/SMA confirmation
+    stoch_k = indicators.get('stoch_rsi_k', 50)
+    stoch_d = indicators.get('stoch_rsi_d', 50)
+    stoch_bullish = stoch_k > stoch_d
+    
     technical_confirmed = (
         (current_price > sma50 > 0)
-        and (rsi < 72)
+        and (rsi < 72 or indicators.get('kde_rsi_prob', 1.0) < 0.90)
         and (momentum_20 > -5)
         and (
             ema_ribbon_bullish 
             or is_donchian_breakout 
             or (macd_hist > -0.05 * abs(sma50) * 0.001)
+            or (stoch_bullish and rsi > 50) # Fallback confirmation for exact timing
         )
     )
 
@@ -1740,7 +1734,7 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
         analyst_ok = False
         analyst_reason = "Lack of analyst coverage for small cap is an elevated risk factor."
     else:
-        analyst_ok = (upside is None) or (upside >= 5.0)
+        analyst_ok = (upside is None) or (upside >= 3.0)
         analyst_reason = f"Analyst consensus target offers only {upside:.1f}% upside — risk/reward marginal." if upside is not None else "No analyst target."
 
     # ── Combine ───────────────────────────────────────────────────────────────
@@ -1827,7 +1821,7 @@ def _build_wealth_signal_message(symbol: str, name: str, signal: dict, valuation
         f"🎯 <b>Current Price (Max Entry):</b> {cp_str}\n"
         f"🎯 <b>AI Target Price (Exit):</b> {pred_p_str} (+{pred_chg:.1f}%)\n\n"
         f"{trend_emoji} <b>90-Day Forecast:</b> {trend}\n"
-        f"📊 <b>Score:</b> {score:.2f} | <b>P(≥5%):</b> {signal.get('prob_ge_5pct', 0):.1f}%\n\n"
+        f"📊 <b>Score:</b> {score:.2f} | <b>P(≥3%):</b> {signal.get('prob_ge_5pct', 0):.1f}%\n\n"
         f"<b>💼 Analyst Consensus ({n_analysts} analysts)</b>\n"
         f"  Recommendation: <b>{rec or 'N/A'}</b>\n"
         f"  Target (consensus): ${valuation.get('analyst_target_mean') or 'N/A'}\n"
@@ -1902,7 +1896,11 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     }
 
 def _eodhd_historical_data(symbol: str, period: str, market: str) -> pd.DataFrame:
-    """Fetch historical EOD data from EODHD"""
+    """Fetch historical EOD data from EODHD. Returns empty DataFrame on failure.
+    
+    If EODHD returns 200 with an empty list, the ticker likely has no data at all
+    (delisted / dead). In that case, don't bother falling back to yfinance —
+    return a single-row NaN DataFrame so callers can detect it as skip-worthy."""
     if not EODHD_API_KEY:
         return pd.DataFrame()
         
@@ -1926,7 +1924,11 @@ def _eodhd_historical_data(symbol: str, period: str, market: str) -> pd.DataFram
         r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json", "from": from_date}, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if data and isinstance(data, list):
+            if data is None:
+                return pd.DataFrame({"Close": [0.0]})  # definitive dead — don't retry
+            if isinstance(data, list):
+                if not data:
+                    return pd.DataFrame({"Close": [0.0]})  # definitive dead — don't retry
                 df = pd.DataFrame(data)
                 if not df.empty:
                     df["Date"] = pd.to_datetime(df["date"])
@@ -1940,26 +1942,26 @@ def _eodhd_historical_data(symbol: str, period: str, market: str) -> pd.DataFram
                         "adjusted_close": "Close"
                     }, inplace=True)
                     return df
-    except Exception as e:
-        print(f"[EODHD] Error fetching history for {ticker}: {e}")
+        elif r.status_code == 404:
+            # EODHD confirmed ticker doesn't exist — don't fall back to yfinance
+            return pd.DataFrame({"Close": [0.0]})
+    except Exception:
+        pass
         
     return pd.DataFrame()
 
 
 def get_historical_data(symbol: str, period: str = "1y", market: str = None) -> pd.DataFrame:
-    """Get historical price data for any market. Tries EODHD first, falls back to yfinance."""
+    """Get historical price data from EODHD only. No yfinance fallback."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
         market = detect_market(s)
         
     df = _eodhd_historical_data(s, period, market)
-    if not df.empty:
+    if df.empty:
         return df
-        
-    df = yf.Ticker(format_ticker(s, market)).history(period=period)
-    # If empty and market wasn't explicitly AU, retry as ASX
-    if df.empty and market != "AU":
-        df = yf.Ticker(format_ticker(s, "AU")).history(period=period)
+    if "Close" in df.columns and len(df) == 1 and df["Close"].iloc[0] == 0.0:
+        return pd.DataFrame()
     return df
 
 def calculate_technical_indicators(df: pd.DataFrame) -> dict:
@@ -1991,7 +1993,26 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
-    indicators['rsi'] = float(100 - (100 / (1 + rs)).iloc[-1])
+    rsi_series = 100 - (100 / (1 + rs))
+    indicators['rsi'] = float(rsi_series.iloc[-1])
+    
+    # ── KDE RSI (Historical Probability Density) ─────────────
+    # Adds a statistical probability of reversal based on historical context,
+    # preventing false "overbought" signals during strong trends.
+    try:
+        from scipy.stats import gaussian_kde
+        valid_rsi = rsi_series.dropna()
+        if len(valid_rsi) > 30:
+            kde = gaussian_kde(valid_rsi)
+            current_rsi = float(valid_rsi.iloc[-1])
+            # Probability that historically RSI has been at or above the current RSI
+            prob_higher = kde.integrate_box_1d(current_rsi, 100)
+            # The closer to 1.0, the more extreme (overbought) it is relative to its own history
+            indicators['kde_rsi_prob'] = float(1.0 - prob_higher)
+        else:
+            indicators['kde_rsi_prob'] = 0.5
+    except Exception:
+        indicators['kde_rsi_prob'] = 0.5
     
     # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -2154,6 +2175,41 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
             indicators['up_down_vol_ratio'] = 0.0
             indicators['above_vwap'] = False
             indicators['block_volume_detected'] = False
+            
+        # ── 1. TTM Squeeze ────────────────────────────────────────────
+        if indicators.get('bb_upper') and indicators.get('atr') and indicators.get('sma_20'):
+            kc_upper = indicators['sma_20'] + (1.5 * indicators['atr'])
+            kc_lower = indicators['sma_20'] - (1.5 * indicators['atr'])
+            squeeze_on = (indicators['bb_upper'] < kc_upper) and (indicators['bb_lower'] > kc_lower)
+            indicators['ttm_squeeze_on'] = squeeze_on
+            indicators['ttm_squeeze_fired_long'] = (not squeeze_on) and (indicators.get('momentum_20', 0) > 0)
+            
+        # ── 2. OBV (On-Balance Volume) ────────────────────────────────
+        if 'Volume' in df.columns:
+            obv = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+            obv_sma20 = obv.rolling(20).mean()
+            indicators['obv'] = float(obv.iloc[-1])
+            indicators['obv_sma20'] = float(obv_sma20.iloc[-1])
+            indicators['obv_bullish'] = float(obv.iloc[-1]) > float(obv_sma20.iloc[-1])
+            
+        # ── 3. Chaikin Money Flow (CMF) ───────────────────────────────
+        if 'Volume' in df.columns:
+            mf_multiplier = ((df['Close'] - df['Low']) - (df['High'] - df['Close'])) / (df['High'] - df['Low'] + 1e-9)
+            mf_volume = mf_multiplier * df['Volume']
+            cmf = mf_volume.rolling(20).sum() / (df['Volume'].rolling(20).sum() + 1e-9)
+            indicators['cmf'] = float(cmf.iloc[-1])
+            indicators['cmf_bullish'] = indicators['cmf'] > 0.10
+            
+        # ── 4. Stochastic RSI ─────────────────────────────────────────
+        rsi_s = 100 - (100 / (1 + rs))
+        rsi_min = rsi_s.rolling(14).min()
+        rsi_max = rsi_s.rolling(14).max()
+        stoch_rsi = (rsi_s - rsi_min) / (rsi_max - rsi_min + 1e-9)
+        stoch_rsi_k = stoch_rsi.rolling(3).mean() * 100
+        stoch_rsi_d = stoch_rsi_k.rolling(3).mean()
+        indicators['stoch_rsi_k'] = float(stoch_rsi_k.iloc[-1])
+        indicators['stoch_rsi_d'] = float(stoch_rsi_d.iloc[-1])
+            
     except Exception as e:
         pass # Optional advanced indicators; skip on failure
         
@@ -2169,7 +2225,7 @@ def _blend_empirical_prob(symbol: str, model_prob: float) -> float:
 
     Tracks hit rates separately for 63d and 90d horizons.  If one horizon consistently
     outperforms the other (higher hit rate), its weight increases via PID logic.
-    Model-derived P(≥5%) enters at a baseline 0.40 weight; empirical evidence takes
+    Model-derived P(≥3%) enters at a baseline 0.40 weight; empirical evidence takes
     the remaining 0.60, split between 63d and 90d observations.
 
     Over the long run this means the system self-corrects: if the model's 90d
@@ -2181,8 +2237,8 @@ def _blend_empirical_prob(symbol: str, model_prob: float) -> float:
                 text("""
                     SELECT
                         COUNT(*) AS total,
-                        SUM(CASE WHEN actual_return_63d >= 5.0 THEN 1 ELSE 0 END) AS hits_63,
-                        SUM(CASE WHEN actual_peak_return_90d >= 8.0 THEN 1 ELSE 0 END) AS hits_90
+                        SUM(CASE WHEN actual_return_63d >= 3.0 THEN 1 ELSE 0 END) AS hits_63,
+                        SUM(CASE WHEN actual_peak_return_90d >= 5.0 THEN 1 ELSE 0 END) AS hits_90
                     FROM wealth_builder_evaluations
                     WHERE symbol = :sym AND evaluated = TRUE
                 """),
@@ -2275,7 +2331,9 @@ def _eval_channel_momentum(indicators: dict, prediction: dict, hist: pd.DataFram
 
     rsi = indicators.get("rsi", 50)
     rsi_slope = indicators.get("rsi_slope", 0)
-    if 40 < rsi < 70 and rsi_slope > 3:
+    kde_rsi_prob = indicators.get("kde_rsi_prob", 0.5)
+    
+    if (40 < rsi < 70 and rsi_slope > 3) or (rsi >= 70 and rsi_slope > 3 and kde_rsi_prob < 0.90):
         signals.append("rsi_accelerating")
         conf += 0.18
 
@@ -2284,6 +2342,10 @@ def _eval_channel_momentum(indicators: dict, prediction: dict, hist: pd.DataFram
     if donchian_high > 0 and current_price >= donchian_high:
         signals.append("donchian_breakout")
         conf += 0.20
+
+    if indicators.get("ttm_squeeze_fired_long"):
+        signals.append("ttm_squeeze_breakout")
+        conf += 0.25
 
     bullish = len(signals) >= 3
     hit_rate = _CHANNEL_HIT_RATES["momentum"]
@@ -2323,7 +2385,15 @@ def _eval_channel_institutional(indicators: dict, sd: dict, hist: pd.DataFrame) 
         signals.append("block_trade")
         conf += 0.20
 
-    bullish = len(signals) >= 2
+    if indicators.get("obv_bullish"):
+        signals.append("obv_divergence")
+        conf += 0.25
+
+    if indicators.get("cmf_bullish"):
+        signals.append("cmf_accumulation")
+        conf += 0.25
+
+    bullish = len(signals) >= 3
     hit_rate = _CHANNEL_HIT_RATES["institutional"]
     return {
         "channel": "institutional",
@@ -2623,21 +2693,21 @@ def _get_strategy_params(dollar_volume: float) -> dict:
     """Return cap-tier calibrated strategy parameters.
 
     Targets are enforced to an asymmetric 2:1 Reward:Risk ratio.
-      Large/mid cap: 8% target, 4% stop → R:R 2.0
-      Small cap: 10% target, 5% stop → R:R 2.0
-    This ensures mathematical edge even with a ~40% win rate.
+      Large/mid cap: 4% target, 2% stop → R:R 2.0
+      Small cap: 5% target, 2.5% stop → R:R 2.0
+    Aligned for 3-4% per-cycle compound strategy (12-13% annualised).
     """
     if dollar_volume > 5_000_000:
         return {
-            "target_pct": 0.080,
-            "stop_pct": 0.040,
-            "trailing_stop_pct": 4.0,
+            "target_pct": 0.040,
+            "stop_pct": 0.020,
+            "trailing_stop_pct": 2.5,
             "tier": "large_mid",
         }
     return {
-        "target_pct": 0.100,
-        "stop_pct": 0.050,
-        "trailing_stop_pct": 5.0,
+        "target_pct": 0.050,
+        "stop_pct": 0.025,
+        "trailing_stop_pct": 3.0,
         "tier": "small",
     }
 
@@ -3394,7 +3464,7 @@ def _recommend_action(item: dict) -> tuple[str, str]:
     if expected:
         reasons.append(f"{expected:+.2f}% 3M return")
     if item.get("prob_ge_5pct") is not None:
-        reasons.append(f"P(≥5%) {float(item['prob_ge_5pct']):.1f}%")
+        reasons.append(f"P(≥3%) {float(item['prob_ge_5pct']):.1f}%")
     if item.get("streak_label"):
         reasons.append(str(item["streak_label"]))
     if item.get("warning_message"):
@@ -4031,13 +4101,14 @@ def get_probability_and_score(symbol: str) -> dict:
     mu = prediction["change_from_current"] / 100.0
     
     # --- Constraint Model Layer ---
-    # 1. Cap astronomical returns based on reality
-    max_allowable_return = 0.12 # Max 12% swing in a 3 month window for standard tracking
+    # 1. Cap returns to realistic 2-3 month cycle band (3-4% target per cycle)
+    max_allowable_return = 0.06 # Max 6% — anything beyond is speculative noise for compound cycles
     adjusted_mu = max(-max_allowable_return, min(max_allowable_return, mu))
 
     # 2. Mean Reversion Penalty (Overbought check)
     rsi = indicators.get("rsi", 50)
-    if rsi > 70:
+    kde_rsi_prob = indicators.get("kde_rsi_prob", 0.5)
+    if rsi > 70 and kde_rsi_prob >= 0.90:
         adjusted_mu -= 0.03  # Shave 3% off expected return if overbought
     elif rsi < 30:
         adjusted_mu += 0.01  # Small boost for oversold bounce potential
@@ -4047,13 +4118,13 @@ def get_probability_and_score(symbol: str) -> dict:
         prediction["change_from_current"] = adjusted_mu * 100.0
         prediction["predicted_price"] = current_price * (1 + adjusted_mu)
 
-    # 3. Calculate capped probability
+    # 3. Calculate probability of ≥3% return (aligned with 3-4% per-cycle compound target)
     daily_vol = float(hist["Close"].pct_change().dropna().std())
     sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
-    z = (0.05 - adjusted_mu) / sigma_63
+    z = (0.03 - adjusted_mu) / sigma_63
     prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
     # Calibrate against empirical win rate from completed tracking windows to
-    # break the circular dependency where P(≥5%) is derived from the same mu
+    # break the circular dependency where P(≥3%) is derived from the same mu
     # that drives the composite score.
     prob_ge_5pct = _blend_empirical_prob(symbol, prob_ge_5pct)
 
@@ -4194,7 +4265,7 @@ def get_probability_and_score(symbol: str) -> dict:
 
     # --- Large Cap Stability Premium ---
     # Large caps have low volatility, so they mathematically struggle to trigger
-    # a 5% swing despite being excellent, safe setups. We add a stability premium.
+    # a 3% swing despite being excellent, safe compound-cycle setups. We add a stability premium.
     if daily_vol < 0.015 and dollar_volume > 10_000_000:
         prob_ge_5pct = min(1.0, prob_ge_5pct + 0.25) # Boost win rate for safe blue chips
         quality_score = min(1.0, quality_score * 1.20)
@@ -4212,14 +4283,14 @@ def get_probability_and_score(symbol: str) -> dict:
     # 6. Cap maximum composite score
     score = max(0.0, min(0.92, raw_score))
     
-    # 7. Minimum quality gate — flag stocks unlikely to deliver 5% in 2-3 months
+    # 7. Minimum quality gate — flag stocks unlikely to deliver 3% in 2-3 months
     quality_reason = None
     if score < 0.45:
-        if prob_ge_5pct < 0.30:
-            quality_reason = f"Low probability of 5% return ({prob_ge_5pct*100:.0f}%)"
+        if prob_ge_5pct < 0.55:
+            quality_reason = f"Low probability of 3% return ({prob_ge_5pct*100:.0f}%) — need ≥55% for 2:1 R:R"
         elif drawdown_pct > 0.15:
             quality_reason = f"High drawdown risk ({drawdown_pct*100:.0f}%)"
-        elif rsi > 70:
+        elif rsi > 70 and indicators.get("kde_rsi_prob", 0.5) >= 0.90:
             quality_reason = "Overbought with mean reversion risk"
         else:
             quality_reason = "Composite score below quality threshold"
@@ -4254,14 +4325,14 @@ def get_probability_and_score(symbol: str) -> dict:
     # 8. Flag severe anomalies for the user
     # Warning flags initialized early for Volume & Drawdown logic
     if not high_volatility_warning:
-        if mu > 0.20 or mu < -0.20:
+        if adjusted_mu > 0.05 or adjusted_mu < -0.05:
             high_volatility_warning = True
             warning_type = "extreme_projection"
             warning_message = "Extreme statistical projection detected. Guardrails applied to bound targets."
-        elif rsi > 70:
+        elif rsi > 70 and indicators.get("kde_rsi_prob", 0.5) >= 0.90:
             high_volatility_warning = True
             warning_type = "overbought"
-            warning_message = "Stock is highly overbought (RSI > 70). High risk of immediate mean reversion."
+            warning_message = "Stock is highly overbought (RSI > 70 and KDE). High risk of immediate mean reversion."
     # ------------------------------
 
     result = {
@@ -4756,10 +4827,10 @@ def generate_statistical_prediction(df: pd.DataFrame, current_price: float, sect
         
     confidence_margin = combined_pred * (volatility + ensemble_disagreement) * 2
 
-    # Determine trend
-    if combined_pred > current_price * 1.05:
+    # Determine trend — thresholds aligned for 3-4% compound cycle targets
+    if combined_pred > current_price * 1.03:
         trend = "bullish"
-    elif combined_pred < current_price * 0.95:
+    elif combined_pred < current_price * 0.97:
         trend = "bearish"
     else:
         trend = "neutral"
@@ -4954,7 +5025,7 @@ Forecast (90 days, {prediction.get('model_count', 1)}-model ensemble):
 - Expected Change: {prediction['change_from_current']:.1f}%{model_note}
 
 Model Confidence:
-- Probability of ≥5%: {prediction.get('prob_ge_5pct', 'N/A')}%
+- Probability of ≥3%: {prediction.get('prob_ge_5pct', 'N/A')}%
 - Composite Score: {prediction.get('score', 'N/A')}
 
 Market Regime:
@@ -5182,11 +5253,20 @@ def get_weekly_data(symbol: str) -> List[dict]:
 
 def get_daily_return(ticker: str) -> float:
     try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if len(hist) < 2:
+        period_map = {"^AXJO": ("AXJO", "AU"), "^GSPC": ("GSPC", "US"),
+                       "^NSEI": ("NSEI", "IN"), "^BSESN": ("BSESN", "IN"),
+                       "GC=F": ("GC=F", "COMMODITY"), "DX-Y.NYB": ("DX-Y.NYB", "COMMODITY")}
+        if ticker in period_map:
+            sym, mkt = period_map[ticker]
+            df = _eodhd_historical_data(sym, "5d", mkt)
+            if df.empty:
+                return 0.0
+        else:
             return 0.0
-        prev_close = float(hist["Close"].iloc[-2])
-        last_close = float(hist["Close"].iloc[-1])
+        if len(df) < 2:
+            return 0.0
+        prev_close = float(df["Close"].iloc[-2])
+        last_close = float(df["Close"].iloc[-1])
         if prev_close == 0 or math.isnan(prev_close) or math.isnan(last_close):
             return 0.0
         return ((last_close - prev_close) / prev_close) * 100.0
@@ -5210,16 +5290,15 @@ def compute_regime_snapshot() -> dict:
     dxy_ret = get_daily_return("DX-Y.NYB")
     
     try:
-        import yfinance as yf
-        vix_data = yf.Ticker("^VIX").history(period="5d")
-        vix_level = float(vix_data["Close"].iloc[-1]) if not vix_data.empty else 20.0
+        vix_df = _eodhd_historical_data("VIX", "5d", "US")
+        vix_level = float(vix_df["Close"].iloc[-1]) if not vix_df.empty else 20.0
     except:
         vix_level = 20.0
 
-    # Bear market detection: 200-day SMA check on ASX200
+    # Bear market detection: 200-day SMA check on ASX200 via EODHD
     bear_market = False
     try:
-        asx200_hist = yf.Ticker("^AXJO").history(period="1y")
+        asx200_hist = _eodhd_historical_data("AXJO", "1y", "AU")
         if not asx200_hist.empty and len(asx200_hist) >= 200:
             sma_200 = float(asx200_hist["Close"].rolling(200).mean().iloc[-1])
             current_asx = float(asx200_hist["Close"].iloc[-1])
@@ -6416,7 +6495,7 @@ async def analyze_share(symbol: str, market: str = None, current_user: dict = De
         if (recipients
                 and entry_timing["entry_ok"]
                 and entry_timing["entry_zone"] == "clear"
-                and (score_val >= 0.65 or prob_val >= 65)):
+                and (score_val >= 0.65 or prob_val >= 75)):
             signal_msg = _build_wealth_signal_message(
                 symbol,
                 stock_data["name"],
@@ -7949,7 +8028,7 @@ def score_and_rank(symbols: list, market: str) -> list:
             mu = prediction["change_from_current"] / 100.0
             daily_vol = float(hist["Close"].pct_change().dropna().std())
             sigma_63 = max(daily_vol * math.sqrt(63), 1e-6)
-            z = (0.05 - mu) / sigma_63
+            z = (0.03 - mu) / sigma_63
             prob_ge_5pct = max(0.0, min(1.0, 1.0 - std_norm_cdf(z)))
             prob_ge_5pct = _blend_empirical_prob(sym, prob_ge_5pct)
 
@@ -9620,9 +9699,9 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
         entry_price = live_price
 
     # ── Cap-tier calibrated targets ───────────────────────────────────────────
-    # Large/mid cap (dollar volume > $5M/day): 4% target, 5% stop → R:R 0.80
-    # Small cap: 5% target, 6% stop → R:R 0.83
-    # Both leave >24pp buffer below the 80% success target (break-even ~55%).
+    # Large/mid cap: 4% target, 2% stop → R:R 2.0
+    # Small cap: 5% target, 2.5% stop → R:R 2.0
+    # Aligned for 3-4% per-cycle compound strategy (12-13% annualised).
     signal = get_probability_and_score(symbol)
     avg_vol_5d = float(stock_data.get("avg_volume_5d") or 0)
     dollar_volume = avg_vol_5d * entry_price
@@ -9962,9 +10041,9 @@ def _scheduled_uat_health_report():
             for horizon_days in [30, 63, 90]:
                 cutoff = today - timedelta(days=horizon_days)
                 cache_count = conn.execute(text("""
-                    SELECT COUNT(*) FROM wealth_scan_cache
-                    WHERE scan_mode = 'broad' AND generated_at <= :cutoff
-                """), {"cutoff": cutoff}).fetchone()
+                    SELECT COUNT(DISTINCT DATE(screened_at)) FROM wealth_builder_evaluations
+                    WHERE screened_at <= :cutoff
+                """), {"cutoff": cutoff.isoformat()}).fetchone()
                 wfo_row = conn.execute(text("""
                     SELECT notes FROM wfo_metrics
                     WHERE horizon_window_days = :hd
@@ -9972,26 +10051,30 @@ def _scheduled_uat_health_report():
                 """), {"hd": horizon_days}).fetchone()
                 status = wfo_row[0][:60] if wfo_row and wfo_row[0] else "not yet checked"
 
-                days_remaining = max(0, horizon_days - (today - yesterday).days)
-                d30_cutoff = today - timedelta(days=30)
                 earliest_scan = conn.execute(text("""
-                    SELECT MIN(generated_at) FROM wealth_scan_cache
-                    WHERE scan_mode = 'broad'
+                    SELECT MIN(screened_at) FROM wealth_builder_evaluations
                 """)).fetchone()
 
                 if earliest_scan and earliest_scan[0]:
                     earliest_date = earliest_scan[0].date() if hasattr(earliest_scan[0], 'date') else earliest_scan[0]
                     if isinstance(earliest_date, datetime):
                         earliest_date = earliest_date.date()
-                    days_accumulated = max(0, (today - earliest_date).days)
+                    elif isinstance(earliest_date, str):
+                        try:
+                            earliest_date = datetime.strptime(earliest_date.split(' ')[0], '%Y-%m-%d').date()
+                        except ValueError:
+                            pass
+                    days_accumulated = max(0, (today - earliest_date).days) if hasattr(earliest_date, 'year') else 0
                 else:
                     days_accumulated = 0
 
-                bar = "█" * min(days_accumulated, 30) + "░" * max(0, 30 - days_accumulated)
+                ratio = min(1.0, days_accumulated / horizon_days) if horizon_days > 0 else 0
+                filled = int(30 * ratio)
+                bar = "█" * filled + "░" * (30 - filled)
                 lines.append(
                     f"  {'🟢' if days_accumulated >= horizon_days else '🟡'} "
-                    f"{horizon_days}d horizon: {days_accumulated}/30 days [{bar}] | "
-                    f"Cache rows ≥{horizon_days}d old: {cache_count[0] or 0} | {status}"
+                    f"{horizon_days}d horizon: {days_accumulated}/{horizon_days} days [{bar}] | "
+                    f"Eval rows ≥{horizon_days}d old: {cache_count[0] or 0} | {status}"
                 )
     except Exception as e:
         lines.append(f"⚠️ Signal accumulation check failed: {e}")
@@ -10034,13 +10117,15 @@ def _scheduled_uat_health_report():
         except ImportError:
             tavily_used = 0
         lines.append(f"")
-        lines.append(f"🔍 Tavily credits consumed: ~{tavily_used} today (60/day cap, monthly reset)")
+        lines.append(f"🔍 Tavily credits consumed: ~{tavily_used} today (250/day cap, monthly reset)")
     except Exception:
         pass
 
     lines.append(f"")
-    lines.append(f"<i>Day {days_accumulated if 'days_accumulated' in dir() else 0}/30 toward first WFO Sharpe evaluation. "
-                f"Next milestone: {30 - (days_accumulated if 'days_accumulated' in dir() else 0)} days.</i>")
+    da = days_accumulated if 'days_accumulated' in dir() else 0
+    next_milestone = next((m for m in [30, 63, 90] if da < m), 90)
+    lines.append(f"<i>Day {da}/{next_milestone} toward WFO Sharpe evaluation. "
+                f"Next milestone: {max(0, next_milestone - da)} days.</i>")
     lines.append(f"")
     lines.append(f"<b>🔄 Safe shutdown window: 5:00 PM – 4:30 AM AEST</b>")
     lines.append(f"   After today's 4:30 PM health report, safe to power off until 4:30 AM tomorrow.")
@@ -10102,7 +10187,9 @@ def _scheduled_uat_health_report():
     # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
     # In UAT mode, cap reduces to 30 to stay within EODHD 20 calls/min free tier
     # and Groq 30 req/min limits.
-    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "500"))
+    import time as _sleep_time
+    market = "AU"
+    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "0"))
     if UAT_MODE:
         broad_scan_cap = min(broad_scan_cap, 30)
         _EODHD_MIN_INTERVAL_INTERNAL = 3.0
@@ -10110,6 +10197,9 @@ def _scheduled_uat_health_report():
         _EODHD_MIN_INTERVAL_INTERNAL = _EODHD_MIN_INTERVAL
     full_universe = get_asx_universe()  # up to 1,600+ with EODHD, 257 without
     all_symbols = list(full_universe.keys())
+    # BROAD_SCAN_CAP=0 means unlimited — scan full universe
+    if broad_scan_cap <= 0:
+        broad_scan_cap = len(all_symbols)
     # Guarantee priority stocks (large/mid cap and hardcoded) are always included
     priority_symbols = set()
     # Add large/mid caps
@@ -10131,21 +10221,44 @@ def _scheduled_uat_health_report():
     symbol_pool = priority_pool + remaining_pool
     symbol_pool = symbol_pool[:broad_scan_cap]
 
+    # Skip tickers known to have no yfinance price data (delisted / no history)
+    _yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
+    yfinance_dead = set()
+    if os.path.exists(_yf_dead_path):
+        with open(_yf_dead_path) as _f:
+            yfinance_dead = set(line.strip() for line in _f if line.strip())
+    symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
+    if yfinance_dead:
+        print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")
+
     scanned = 0
     candidates = []
 
-    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {start.isoformat()}")
+    scan_start = datetime.utcnow()
+    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
 
+    new_dead = set()
     for sym in symbol_pool:
         try:
             result = _score_wealth_candidate(sym, market)
             scanned += 1
-            if result and (result.get("score") or 0) >= 35.0:
-                candidates.append(result)
-            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits
+            if result:
+                if (result.get("score") or 0) >= 35.0:
+                    candidates.append(result)
+            else:
+                new_dead.add(sym)
+            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits.
+            # At ~1,600 stocks this takes ~8 min — well under Yahoo's ~2,000/hr threshold.
             _sleep_time.sleep(0.3)
         except Exception:
-            pass
+            new_dead.add(sym)
+
+    # Persist dead tickers so next scan skips them
+    if new_dead:
+        yfinance_dead |= new_dead
+        with open(_yf_dead_path, "w") as _f:
+            _f.write("\n".join(sorted(yfinance_dead)) + "\n")
+        print(f"[BroadScan] {len(new_dead)} additional tickers failed — cached for future skip")
 
     # Sort by wealth_rank descending
     candidates.sort(key=lambda x: x.get("wealth_rank", 0) or x.get("score", 0), reverse=True)
@@ -10230,7 +10343,7 @@ def _scheduled_uat_health_report():
     except Exception as e:
         print(f"[BroadScan] Auto-alerting failed: {e}")
 
-    duration = (datetime.utcnow() - start).total_seconds()
+    duration = (datetime.utcnow() - scan_start).total_seconds()
     print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s. Sent auto-alerts if any.")
 
 
@@ -10468,9 +10581,9 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
 
 class WealthBuilderRequest(BaseModel):
     market: str = "AU"
-    min_analyst_upside: float = 5.0       # % upside to analyst consensus target
+    min_analyst_upside: float = 3.0       # % upside to analyst consensus target (aligned for 3-4% compound cycles)
     min_score: float = 0.45               # composite score threshold
-    min_prob_5pct: float = 40.0           # probability ≥5% 3-month return
+    min_prob_5pct: float = 50.0           # probability ≥3% 2-3 month return (55%+ required for 2:1 R:R positive edge)
     max_symbols: int = 20                 # candidates to scan (capped at 100)
     send_telegram: bool = False
     scan_mode: str = "top"                # "top" = top 40, "broad" = full ASX_COMPANIES pool
@@ -10605,19 +10718,41 @@ def _score_wealth_candidate(symbol: str, market: str) -> Optional[dict]:
             "trailing_eps": eps_diluted,
             "revenue_growth": revenue_growth,
              "entry_timing": entry_timing,
-            # Composite wealth rank with dynamic risk penalties controlled by ML PID loop
-            "wealth_rank": round(
-                (signal.get("score", 0) or 0)
-                * (1 + max(0, (valuation.get("analyst_upside_pct") or 0)) / 100)
-                * (1.15 if entry_timing["entry_ok"] else 0.0)
-                * liquidity_penalty
-                * (0.85 - 0.05 * len(earnings_quality_flags) if earnings_quality_flags else 1.0)
-                * (DYNAMIC_PENALTIES["short_extreme"] if (valuation.get("short_pct_float") or 0) > 15 else DYNAMIC_PENALTIES["short_high"] if (valuation.get("short_pct_float") or 0) > 8 else 1.0)
-                * (DYNAMIC_PENALTIES["pe_extreme"] if (valuation.get("pe") or 0) > 80 or (valuation.get("pe") or 0) < 0 else DYNAMIC_PENALTIES["pe_high"] if (valuation.get("pe") or 0) > 40 else 1.0)
-                * (0.8 if (valuation.get("num_analyst_opinions") or 0) < 2 else 1.0)
-                * (0.85 if (valuation.get("pct_from_52w_high") or 0) < -40 else 1.0)
-                * (DYNAMIC_PENALTIES["vix_extreme"] if vix_level > 30 else DYNAMIC_PENALTIES["vix_high"] if vix_level > 22 else 1.0)
-                * (0.80 if bear_market else 1.0),
+            # Weighted-sum wealth rank with Layer 2 confluence integration.
+            # Hard veto gates (zero the rank) on structural risks before scoring.
+            # Weighted components discriminate between moderate and high conviction
+            # instead of collapsing both into near-zero (multiplicative trap).
+            #
+            # Veto gates: any single one = wealth_rank 0 (excluded from picks)
+            "wealth_rank": 0.0 if (
+                bool(not entry_timing["entry_ok"])                                       # entry timing veto
+                or bool(not liquidity_ok)                                                # liquidity veto
+                or bool(entry_timing.get("earnings_risk") == "high")                     # binary event risk
+                or bool((valuation.get("short_pct_float") or 0) > 15)                   # extreme short interest
+                or bool((valuation.get("pe") or 0) > 80 or (valuation.get("pe") or 0) < 0)  # extreme PE
+                or bool(confluence.get("confidence") == "low" and confluence.get("bullish_channels", 0) <= 1)  # Layer 2 rejection
+            ) else round(
+                # ── Base conviction (Layer 1 score, 40% weight) ─────────────────
+                0.40 * (signal.get("score", 0) or 0)
+                # ── Analyst consensus upside (10% weight) ────────────────────────
+                + 0.10 * min(max(0, (valuation.get("analyst_upside_pct") or 0) / 5.0), 1.0) * 100
+                # ── Confluence score (Layer 2, 15% weight) ───────────────────────
+                + 0.15 * (confluence.get("score", 0) or 0)
+                # ── Dividend yield bonus (5% weight) ─────────────────────────────
+                + 0.05 * min(max(0, (valuation.get("dividend_yield") or 0) / 5.0), 1.0) * 100
+                # ── Liquidity quality (10% weight) ───────────────────────────────
+                + 0.10 * liquidity_penalty * 100
+                # ── Earnings quality (8% weight) ─────────────────────────────────
+                + 0.08 * max(0, (100 - 20 * len(earnings_quality_flags)))
+                # ── Analyst coverage (5% weight) ─────────────────────────────────
+                + 0.05 * (100 if (valuation.get("num_analyst_opinions") or 0) >= 2 else 50)
+                # ── Drawdown position (7% weight) ────────────────────────────────
+                + 0.07 * (100 if (valuation.get("pct_from_52w_high") or 0) > -40 else 50)
+                # ── Deductions ───────────────────────────────────────────────────
+                - (30 if (valuation.get("short_pct_float") or 0) > 8 else 0)         # moderate short interest
+                - (20 if (valuation.get("pe") or 0) > 40 else 0)                      # moderate PE
+                - (30 if vix_level > 30 else 10 if vix_level > 22 else 0)            # VIX regime
+                - (20 if bear_market else 0),                                          # bear market penalty
                 4
             ),
             "confluence": confluence,
@@ -10755,7 +10890,7 @@ async def wealth_builder_signals(
             dte_str = f"{n_e}d" if n_e is not None else "N/A"
             lines.append(
                 f"<b>#{i} {c['symbol']}</b> — {c['name']}\n"
-                f"  Score: {c.get('score', 0):.2f} | P(≥5%): {c.get('prob_ge_5pct', 0):.1f}%\n"
+                f"  Score: {c.get('score', 0):.2f} | P(≥3%): {c.get('prob_ge_5pct', 0):.1f}%\n"
                 f"  Analyst: {rec} | Upside: {upside_str}\n"
                 f"  Earnings: {c.get('next_earnings_date', 'N/A')} ({dte_str})\n"
                 f"  Entry: {zone_e} {(c.get('entry_timing') or {}).get('entry_zone', 'N/A').upper()}\n"
@@ -10819,8 +10954,8 @@ async def wealth_builder_signals(
 async def wealth_builder_cached_broad(
     market: str = "AU",
     min_score: float = 35.0,
-    min_prob_5pct: float = 30.0,
-    min_analyst_upside: float = -100.0,
+    min_prob_5pct: float = 50.0,
+    min_analyst_upside: float = 3.0,
     current_user: dict = Depends(get_current_user),
 ):
     """Return the 5AM pre-computed broad scan from DB cache."""
@@ -11079,8 +11214,8 @@ def _scheduled_self_learning_loop():
 # DAILY AI PIPELINE — Layer 1 Screen → Layer 2 Deep-Dive → Telegram Broadcast
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TOPTIER_MAX_AI_DEEP_DIVES = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "9"))
-TOPTIER_PER_TIER = int(os.getenv("TOPTIER_PER_TIER", "3"))
+TOPTIER_MAX_AI_DEEP_DIVES = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "0"))
+TOPTIER_PER_TIER = int(os.getenv("TOPTIER_PER_TIER", "12"))
 
 def _cap_tier_from_market_cap(market_cap: Optional[float]) -> str:
     """Classify a stock into large/mid/small cap tier based on market cap."""
@@ -11118,7 +11253,7 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
 
     return (
         f"{d_emoji} <b>{sym}</b> {c_emoji} — {name}\n"
-        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | P(≥5%): {prob:.1f}%\n"
+        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | P(≥3%): {prob:.1f}%\n"
         f"  💰 ${price:.2f} | Conf: {confidence}% {conf_bar} | Alloc: {allocation:.1f}% | Stop: -{stop:.1f}%\n"
         f"{'  ' + reasoning + chr(10) if reasoning else ''}"
         f"{risks_block}"
@@ -11127,16 +11262,15 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
 def _scheduled_daily_ai_pipeline():
     """Daily AI Analysis Pipeline (runs after 5AM broad scan is complete).
 
-    Layer 1 broad scan runs on up to 1000 shares → confluence gate filters to ~50-100.
-    This pipeline takes the top 3 per cap tier (9 total) for automated Layer 2 AI review.
-    Remaining candidates can be manually deep-dived via POST /api/ai/deep-dive.
+    Layer 1 broad scan runs on full ASX universe (~1,600 shares) → confluence gate filters to ~50-100.
+    This pipeline deep-dives ALL Layer 1 candidates (TOPTIER_MAX_AI_DEEP_DIVES=0 = unlimited).
+    Set TOPTIIER_MAX_AI_DEEP_DIVES > 0 to impose a cap.
 
     1. Reads cached wealth scan results from DB
-    2. Groups candidates by large/mid/small cap tier
-    3. Selects top 3 per tier (9 total)
-    4. Runs Layer 2 6-persona deep-dive on each (~$0.014/day)
-    5. Builds consolidated Telegram report with AI verdicts
-    6. Broadcasts to all users with Telegram configured
+    2. Groups candidates by large/mid/small cap tier (sorted by wealth_rank)
+    3. Deep-dives all candidates with 6-persona agentic analysis
+    4. Builds consolidated Telegram report with AI verdicts
+    5. Broadcasts to all users with Telegram configured
     """
     if not run_agentic_analysis:
         print("[DailyAI] Agentic brain not available — skipping.")
@@ -11169,12 +11303,21 @@ def _scheduled_daily_ai_pipeline():
         tier = _cap_tier_from_market_cap(mc)
         tiers[tier].append(c)
 
-    # 3. Select top per tier (sort by wealth_rank, take TOPTIER_PER_TIER each, then cap at 1000)
+    # 3. Select all Layer 1 candidates for AI deep-dive
+    #    Apply mechanical gate: P(>=5%) must be >= 55.0% to justify API credits
+    MAX_AI = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "0"))
     selected = []
-    for tier_name in ["large_cap", "mid_cap", "small_cap"]:
-        pool = sorted(tiers[tier_name], key=lambda x: x.get("wealth_rank", 0), reverse=True)
-        selected.extend(pool[:TOPTIER_PER_TIER])
-    selected = selected[:TOPTIER_MAX_AI_DEEP_DIVES]
+    tier_order = ["large_cap", "mid_cap", "small_cap"]
+    for tier_name in tier_order:
+        # Filter out low probability trades before sorting
+        valid_candidates = [c for c in tiers.get(tier_name, []) if (c.get("prob_ge_5pct") or 0) >= 55.0]
+        pool = sorted(
+            valid_candidates,
+            key=lambda x: x.get("wealth_rank", 0), reverse=True
+        )
+        selected.extend(pool)
+    if MAX_AI > 0:
+        selected = selected[:MAX_AI]
 
     print(f"[DailyAI] Selected {len(selected)} candidates ({sum(1 for s in selected if (s.get('confluence', {}).get('confidence', '') == 'high'))} high-confluence)")
 
@@ -11203,7 +11346,7 @@ def _scheduled_daily_ai_pipeline():
             result["candidate"] = cand
             ai_results.append(result)
 
-            # Gentle throttle — 9 deep-dives is lightweight, 0.5s is plenty
+            # Gentle throttle — full-coverage deep-dives, 0.5s between calls
             if i < len(selected) - 1:
                 time.sleep(0.5)
 
@@ -12610,12 +12753,14 @@ if SCHEDULER_AVAILABLE:
         scheduler.add_job(
             _scheduled_broad_scan_precompute, "cron",
             minute=0, hour=5,
+            day_of_week="mon-fri",
             id="broad_scan_5am",
             max_instances=1,
         )
         scheduler.add_job(
             _scheduled_wealth_builder_evaluate, "cron",
             minute=30, hour=8,
+            day_of_week="mon-fri",
             id="wealth_builder_evaluate",
             max_instances=1,
         )
@@ -12627,7 +12772,7 @@ if SCHEDULER_AVAILABLE:
         )
         scheduler.add_job(
             _scheduled_daily_ai_pipeline, "cron",
-            minute=0, hour=6,
+            minute=0, hour=7,
             day_of_week="mon-fri",
             id="daily_ai_pipeline",
             max_instances=1,

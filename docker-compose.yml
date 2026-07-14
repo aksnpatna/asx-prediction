@@ -68,7 +68,9 @@ services:
       PAPER_MONITOR_STARTUP_CATCHUP: ${PAPER_MONITOR_STARTUP_CATCHUP:-true}
       PAPER_MONITOR_STARTUP_MAX_TRADES: ${PAPER_MONITOR_STARTUP_MAX_TRADES:-75}
       EODHD_API_KEY: ${EODHD_API_KEY:-}
-      BROAD_SCAN_CAP: ${BROAD_SCAN_CAP:-500}
+      BROAD_SCAN_CAP: ${BROAD_SCAN_CAP:-0}
+      TOPTIER_PER_TIER: ${TOPTIER_PER_TIER:-12}
+      TOPTIER_MAX_AI_DEEP_DIVES: ${TOPTIER_MAX_AI_DEEP_DIVES:-0}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       ENV: ${ENV:-production}
     ports:
@@ -262,6 +264,7 @@ services:
       - education_default
       - home_assistant_default
       - myslack_default
+      - realestate_default
 
 networks:
   default:
@@ -274,6 +277,8 @@ networks:
   home_assistant_default:
     external: true
   myslack_default:
+    external: true
+  realestate_default:
     external: true
 
 volumes:

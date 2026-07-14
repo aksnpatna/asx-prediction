@@ -31,4 +31,6 @@ ingress:
     service: http://host.docker.internal:7880
   - hostname: huddle-turn.akstest.win
     service: tcp://host.docker.internal:53472
+  - hostname: realestate.akstest.win
+    service: http://realestate-engine:80
   - service: http_status:404

@@ -47,7 +47,7 @@ def _nvidia_rate_limit():
 # ── Tavily Rate Limiter (1,000 credits/month free tier) ─────────────────────
 _TAVILY_CALL_COUNT = 0
 _TAVILY_MONTH = 0
-_TAVILY_MAX_PER_DAY = 60  # 60/day × 5 trading days = 300/week, 1200/month — burns free tier but intentional for iteration
+_TAVILY_MAX_PER_DAY = 250  # full-coverage: ~50-100 deep-dives/day, each 1 Tavily call
 
 def _tavily_rate_limit():
     global _TAVILY_CALL_COUNT, _TAVILY_MONTH
@@ -168,19 +168,47 @@ News: {state.get('news_context', 'No news available')}"""
 # AUTO-CONSENSUS: Pattern-match persona theses for objective vote count
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Bullish signal phrases (order matters — more specific first) ─────────────
 _BULLISH_PATTERNS = [
-    "buy candidate", "bullish", "poised for", "strong buy", "accumulation",
-    "uptrend", "breakout", "support a buy", "favorable", "tailwind",
-    "recommend buy", "entry point", "upside", "undervalued", "approve",
-    "growth potential", "positive", "likely to", "should perform",
-]
-_BEARISH_PATTERNS = [
-    "not bullish", "bearish", "sell", "downtrend", "overvalued",
-    "headwind", "risk", "decline", "avoid", "reject", "not recommend",
-    "not support", "not poised", "negative", "caution",
+    "strong buy", "buy candidate", "recommend buy", "support a buy",
+    "bullish", "poised for", "accumulation", "uptrend", "breakout",
+    "favorable", "tailwind", "entry point", "upside", "undervalued",
+    "approve", "growth potential", "should perform", "likely to outperform",
+    "compliant",  # tax agent uses COMPLIANT as a positive verdict
 ]
 
+# ── Bearish signal phrases ───────────────────────────────────────────────────
+# NOTE: "risk" is intentionally EXCLUDED — the RiskController agent always
+# mentions the word "risk" by design. Including it would penalise every
+# risk thesis regardless of its actual direction.
+_BEARISH_PATTERNS = [
+    "not bullish", "not a buy", "not recommend", "not poised", "not support",
+    "bearish", "sell", "downtrend", "overvalued", "excessive valuation",
+    "headwind", "decline", "deteriorating", "avoid", "reject",
+    "negative outlook", "caution advised", "high concern", "significant concern",
+]
+
+# ── Negation prefixes — if any bullish phrase is preceded by these, it flips
+_NEGATION_PREFIXES = (
+    "not ", "no ", "isn't ", "is not ", "doesn't ", "does not ",
+    "cannot ", "can't ", "fails to ", "unlikely to ", "no longer ",
+)
+
 def _count_bullish_votes(state: AgentState) -> int:
+    """
+    Objectively count how many of the 6 persona theses recommend BUY.
+
+    Scoring per thesis:
+      - For each bullish phrase found, check if it is immediately preceded
+        by a negation prefix (e.g. "not bullish" → does NOT count as bullish).
+      - For each bearish phrase found, count it as a bear signal.
+      - net = bullish_hits - bearish_hits; vote=1 if net > 0, else 0.
+
+    This correctly handles:
+      - "not bullish"          → bearish_hit=1, bullish_hit=0  (net=-1 → 0 vote)
+      - "strong bullish trend" → bullish_hit=1, bearish_hit=0  (net=+1 → 1 vote)
+      - "risk is manageable"   → bearish_hit=0 ("risk" excluded by design)
+    """
     theses = [
         state.get("technical_thesis", ""),
         state.get("macro_thesis", ""),
@@ -192,10 +220,34 @@ def _count_bullish_votes(state: AgentState) -> int:
     votes = 0
     for thesis in theses:
         t = thesis.lower()
-        bulls = sum(1 for p in _BULLISH_PATTERNS if p in t)
-        bears = sum(1 for p in _BEARISH_PATTERNS if p in t)
-        if bulls > bears:
+        bull_hits = 0
+        bear_hits = 0
+
+        # Count bullish phrases — subtract any that are negated
+        for phrase in _BULLISH_PATTERNS:
+            idx = 0
+            while True:
+                pos = t.find(phrase, idx)
+                if pos == -1:
+                    break
+                # Check the 15 characters before the phrase for a negation prefix
+                prefix_window = t[max(0, pos - 15): pos]
+                negated = any(prefix_window.endswith(neg) or prefix_window.rstrip().endswith(neg.rstrip())
+                              for neg in _NEGATION_PREFIXES)
+                if negated:
+                    bear_hits += 1   # negated bullish = effectively bearish signal
+                else:
+                    bull_hits += 1
+                idx = pos + len(phrase)
+
+        # Count bearish phrases (these do not need negation inversion)
+        for phrase in _BEARISH_PATTERNS:
+            if phrase in t:
+                bear_hits += 1
+
+        if bull_hits > bear_hits:
             votes += 1
+
     return votes
 
 

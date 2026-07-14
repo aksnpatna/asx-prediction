@@ -178,7 +178,21 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
-    indicators['rsi'] = float(100 - (100 / (1 + rs)).iloc[-1])
+    rsi_series = 100 - (100 / (1 + rs))
+    indicators['rsi'] = float(rsi_series.iloc[-1])
+    
+    try:
+        from scipy.stats import gaussian_kde
+        valid_rsi = rsi_series.dropna()
+        if len(valid_rsi) > 30:
+            kde = gaussian_kde(valid_rsi)
+            current_rsi = float(valid_rsi.iloc[-1])
+            prob_higher = kde.integrate_box_1d(current_rsi, 100)
+            indicators['kde_rsi_prob'] = float(1.0 - prob_higher)
+        else:
+            indicators['kde_rsi_prob'] = 0.5
+    except Exception:
+        indicators['kde_rsi_prob'] = 0.5
     
     # MACD
     exp1 = close.ewm(span=12, adjust=False).mean()

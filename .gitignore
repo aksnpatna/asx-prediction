@@ -50,3 +50,12 @@ bc2b54c5-*.json
 # Large binary packages
 *.deb
 graphify-out/
+.agents/
+.kilo/plugins/
+.opencode/
+fix_css.py
+fix_ui.py
+fix_ui_discover.py
+scratch.py
+test.json
+latest_scan*.json

@@ -1787,139 +1787,6 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
     }
 
 
-def _enrich_candidates_with_tiers(candidates: list):
-    """Compute 41-feature model score and assign target tier to each candidate.
-
-    Called before DB write so the picks JSON stored in wealth_scan_cache
-    includes tier labels for the 7AM AI pipeline to read.
-    """
-    try:
-        from model_training import get_latest_weights, FEATURE_COLS as ML_FEATURES
-        _weights = get_latest_weights()
-    except Exception:
-        _weights = {}
-
-    for c in candidates:
-        indicators = c.get("indicators") or {}
-        prediction = c.get("prediction") or {}
-        valuation = c.get("valuation") or {}
-        confluence = c.get("confluence") or {}
-
-        feat = {
-            "sma_cross_20_50": 1.0 if indicators.get("sma_cross_20_50", False) else 0.0,
-            "sma_cross_50_200": 1.0 if indicators.get("sma_cross_50_200", False) else 0.0,
-            "rsi": float(indicators.get("rsi", 50)),
-            "rsi_slope": float(indicators.get("rsi_slope", 0)),
-            "kde_rsi_prob": float(indicators.get("kde_rsi_prob", 0.5)),
-            "macd_hist": float(indicators.get("macd_histogram", 0)),
-            "momentum_20d": float(indicators.get("momentum_20d", 0)),
-            "momentum_63d": float(indicators.get("momentum_63d", 0)),
-            "donchian_breakout": 1.0 if indicators.get("donchian_breakout", False) else 0.0,
-            "volume_spike": float(indicators.get("volume_spike", 1)),
-            "volume_ratio": float(indicators.get("volume_ratio", 0)),
-            "obv_bullish": 1.0 if indicators.get("obv_bullish", False) else 0.0,
-            "cmf": float(indicators.get("cmf", 0)),
-            "cmf_bullish": 1.0 if indicators.get("cmf_bullish", False) else 0.0,
-            "atr_pct": float(indicators.get("atr_pct", 0)),
-            "bb_width": float(indicators.get("bb_width", 0.05)),
-            "bb_position": float(indicators.get("bb_position", 0.5)),
-            "hv_20d": float(indicators.get("hv_20d", 0)),
-            "adx": float(indicators.get("adx", 20)),
-            "adx_trend": 1.0 if indicators.get("adx_trend", False) else 0.0,
-            "ema_ribbon": 1.0 if indicators.get("ema_ribbon", False) else 0.0,
-            "ttm_squeeze_on": 1.0 if indicators.get("ttm_squeeze_on", False) else 0.0,
-            "ttm_squeeze_fired": 1.0 if indicators.get("ttm_squeeze_fired", False) else 0.0,
-        }
-        feat["signal_cluster"] = sum([
-            feat.get("sma_cross_20_50",0), feat.get("sma_cross_50_200",0),
-            (1 if feat.get("rsi",50) < 40 else 0) * 0.5,
-            (1 if feat.get("macd_hist",0) > 0 else 0),
-            feat.get("ema_ribbon",0), feat.get("cmf_bullish",0),
-            feat.get("obv_bullish",0),
-        ])
-        feat["trend_strength"] = abs(feat.get("momentum_20d",0)) * feat.get("adx",20) / 100
-        feat["rsi_vol_adj"] = feat.get("rsi",50) / (feat.get("hv_20d",0.2) + 1)
-        feat["mom_per_vol"] = feat.get("momentum_20d",0) / (feat.get("hv_20d",0.2) + 1e-9)
-        feat["dist_from_sma50"] = 0
-        feat["rsi_macd_div"] = 0
-        feat["vol_confirm"] = feat.get("volume_spike",1) * (1 if feat.get("momentum_20d",0) > 0 else -1)
-        feat["bb_squeeze_ratio"] = feat.get("bb_width",0.05) / (feat.get("atr_pct",0.01) + 1e-9)
-        feat["fund_pe_inv"] = float(valuation.get("pe_inv", 0) or 0)
-        feat["fund_forward_pe_inv"] = float(valuation.get("forward_pe_inv", 0) or 0)
-        feat["fund_market_cap_log"] = float(valuation.get("market_cap_log", 0) or 0)
-        feat["fund_div_yield"] = float(valuation.get("dividend_yield", 0) or 0)
-        upside = float(valuation.get("analyst_upside_pct", 0) or 0)
-        feat["fund_analyst_upside"] = upside
-        rec_map = {"strong_buy":5,"buy":4,"hold":3,"underperform":2,"sell":1}
-        feat["fund_analyst_rec_score"] = float(rec_map.get(str(valuation.get("analyst_recommendation","")).lower(), 3))
-        feat["fund_earnings_growth"] = float(valuation.get("earnings_growth_pct", 0) or 0)
-        feat["fund_revenue_growth"] = float(valuation.get("revenue_growth_pct", 0) or 0)
-        feat["fund_beta"] = float(valuation.get("beta", 1) or 1)
-        feat["fund_pct_from_52w_high"] = float(valuation.get("pct_from_52w_high", 0) or 0)
-
-        model_score = 0.0
-        if _weights:
-            model_score = sum(float(_weights.get(k, 0)) * float(v) for k, v in feat.items())
-        c["_model_score"] = round(model_score, 2)
-
-        if model_score >= 91:
-            c["_target_tier"] = "5pct"
-            c["_tier_label"] = "🎯 5% TARGET TIER"
-        elif model_score >= 16:
-            c["_target_tier"] = "3pct"
-            c["_tier_label"] = "📈 3% COMPOUND TIER"
-        else:
-            c["_target_tier"] = "watch"
-            c["_tier_label"] = "⏳ WATCH"
-
-
-def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: dict,
-                               prediction: dict, entry_timing: dict,
-                               tier_label: str = "📈 TIER") -> str:
-    """Build tiered Telegram HTML message with model-predicted target tier."""
-    score = signal.get('score', 0) or 0
-    trend = (prediction.get('trend') or 'neutral').upper()
-    upside = valuation.get('analyst_upside_pct')
-    rec = (valuation.get('analyst_recommendation') or '').upper()
-    n_analysts = valuation.get('num_analyst_opinions') or '?'
-    model_score = signal.get('_model_score', 0)
-
-    zone_emoji = {"clear": "🟢", "caution": "🟡", "avoid": "🔴"}.get(
-        (entry_timing or {}).get('entry_zone', 'caution'), "⚪")
-    trend_emoji = "📈" if trend == "BULLISH" else ("📉" if trend == "BEARISH" else "➡️")
-
-    pred_chg = prediction.get('change_from_current', 0) or 0
-    current_p = prediction.get('current_price')
-    cp_str = f"${current_p:.2f}" if current_p is not None else 'N/A'
-    predicted_peak = signal.get('predicted_change_pct', pred_chg)
-    upside_str = f"{upside:+.1f}%" if upside is not None else 'N/A'
-
-    pe_str = f"{valuation.get('pe'):.1f}x" if valuation.get('pe') else 'N/A'
-    high52_str = f"${valuation.get('52w_high'):.2f}" if valuation.get('52w_high') else 'N/A'
-    from_peak = valuation.get('pct_from_52w_high')
-    from_peak_str = f"{from_peak:+.1f}%" if from_peak is not None else 'N/A'
-
-    is_5pct = "5%" in tier_label
-
-    return (
-        f"<b>{zone_emoji} {tier_label}</b>\n"
-        f"{symbol} — {name}\n\n"
-        f"{'🚀' if is_5pct else '📈'} <b>Target: {'+5%' if is_5pct else '+3%'} (2:1 R:R)</b>\n"
-        f"💡 <b>Current Price (Max Entry):</b> {cp_str}\n"
-        f"🎯 <b>Projected Peak Return:</b> {predicted_peak:+.1f}% | Model Score: {model_score:+.0f}\n\n"
-        f"{trend_emoji} <b>90-Day Forecast:</b> {trend}\n"
-        f"📊 <b>Score:</b> {score:.2f} | <b>Entry:</b> {zone_emoji}\n\n"
-        f"<b>💼 Analyst Consensus ({n_analysts} analysts)</b>\n"
-        f"  Rec: <b>{rec or 'N/A'}</b> | Upside: <b>{upside_str}</b>\n"
-        f"  P/E: {pe_str} | From 52w High: {from_peak_str}\n"
-        f"  Target: ${valuation.get('analyst_target_mean') or 'N/A'}\n\n"
-        f"<b>📅 Earnings:</b> {valuation.get('next_earnings_date', 'N/A')}\n"
-        f"<b>🚨 AI Note:</b> Verify NO upcoming earnings, NO unadjusted splits, "
-        f"and beware 'Fat Tail' micro-cap risk before entry.\n"
-        f"<b>📏 Position size:</b> {'~30% of capital allocation' if is_5pct else '~70% of capital allocation'}"
-    )
-
-
 def _build_wealth_signal_message(symbol: str, name: str, signal: dict, valuation: dict,
                                   prediction: dict, entry_timing: dict) -> str:
     """Build a rich, emoji-annotated Telegram HTML message for a wealth-builder signal."""
@@ -2424,11 +2291,7 @@ _CHANNEL_WEIGHTS = {
 }
 
 def _update_channel_hit_rates():
-    """Calibrate per-channel hit rates from evaluated wealth_builder_evaluations.
-
-    Uses the confluence.bullish_channels recorded in wealth_scan_history picks
-    and matches them against evaluated wbe rows to compute per-channel accuracy.
-    """
+    """Calibrate per-channel hit rates from wealth_builder_evaluations."""
     global _CHANNEL_HIT_RATES
     try:
         with db_conn() as conn:
@@ -2438,70 +2301,8 @@ def _update_channel_hit_rates():
             """)).fetchone()
             if not total or total[0] < 20:
                 return
-
-            channel_hits = {"momentum": 0, "institutional": 0, "options": 0, "fundamental": 0, "cross_asset": 0}
-            channel_total = {"momentum": 0, "institutional": 0, "options": 0, "fundamental": 0, "cross_asset": 0}
-
-            wbe_rows = conn.execute(text("""
-                SELECT wbe.symbol, wbe.screened_at::DATE, wbe.actual_return_63d
-                FROM wealth_builder_evaluations wbe
-                WHERE wbe.evaluated = TRUE
-                ORDER BY wbe.screened_at DESC
-                LIMIT 500
-            """)).fetchall()
-
-            for wbe_row in wbe_rows:
-                sym, screen_date, actual_63d = wbe_row[0], wbe_row[1], wbe_row[2]
-                if actual_63d is None:
-                    continue
-                hit = actual_63d >= 3.0
-
-                scan_row = conn.execute(text("""
-                    SELECT picks FROM wealth_scan_history
-                    WHERE scan_mode = 'broad' AND generated_at::DATE = :d
-                    ORDER BY generated_at DESC LIMIT 1
-                """), {"d": screen_date}).fetchone()
-
-                if not scan_row:
-                    continue
-
-                picks = json.loads(scan_row[0]) if isinstance(scan_row[0], str) else (scan_row[0] or [])
-                for c in picks:
-                    if c.get("symbol") != sym:
-                        continue
-                    confluence = c.get("confluence", {})
-                    bullish_channels = confluence.get("bullish_channels", [])
-                    for ch in bullish_channels:
-                        ch_name = str(ch).lower()
-                        if ch_name in channel_total:
-                            channel_total[ch_name] += 1
-                            if hit:
-                                channel_hits[ch_name] += 1
-                    break
-
-            for ch in _CHANNEL_HIT_RATES:
-                if channel_total.get(ch, 0) >= 10:
-                    _CHANNEL_HIT_RATES[ch] = round(channel_hits[ch] / channel_total[ch], 4)
-
-            sample_sz = sum(channel_total.values())
-            if sample_sz > 0:
-                conn.execute(text("""
-                    INSERT INTO channel_hit_rates (momentum, institutional, options, fundamental, cross_asset, sample_size)
-                    VALUES (:mo, :in_, :op, :fu, :cr, :n)
-                """), {
-                    "mo": _CHANNEL_HIT_RATES.get("momentum"),
-                    "in_": _CHANNEL_HIT_RATES.get("institutional"),
-                    "op": _CHANNEL_HIT_RATES.get("options"),
-                    "fu": _CHANNEL_HIT_RATES.get("fundamental"),
-                    "cr": _CHANNEL_HIT_RATES.get("cross_asset"),
-                    "n": sample_sz,
-                })
-                conn.commit()
-
-            print(f"[ChannelCal] Per-channel hit rates calibrated from {sample_sz} signals: {_CHANNEL_HIT_RATES}")
-
-    except Exception as e:
-        print(f"[ChannelCal] Calibration skipped: {e}")
+    except Exception:
+        return
 
 
 def _eval_channel_momentum(indicators: dict, prediction: dict, hist: pd.DataFrame) -> dict:
@@ -7945,18 +7746,8 @@ def init_phase6_tables():
                 scanned_count INTEGER NOT NULL DEFAULT 0,
                 candidates_found INTEGER NOT NULL DEFAULT 0,
                 picks TEXT NOT NULL,
-                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS wealth_scan_history (
-                id TEXT PRIMARY KEY,
-                market VARCHAR(5) NOT NULL,
-                scan_mode VARCHAR(20) NOT NULL DEFAULT 'broad',
-                scanned_count INTEGER NOT NULL DEFAULT 0,
-                candidates_found INTEGER NOT NULL DEFAULT 0,
-                picks TEXT NOT NULL,
-                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(market, scan_mode)
             )
         """))
         conn.execute(text("""
@@ -7971,7 +7762,6 @@ def init_phase6_tables():
                 price_at_screen NUMERIC(12, 4),
                 actual_return_14d NUMERIC(8, 2),
                 actual_return_30d NUMERIC(8, 2),
-                actual_return_63d NUMERIC(8, 2),
                 actual_return_90d NUMERIC(8, 2),
                 actual_peak_return_90d NUMERIC(8, 2),
                 actual_max_drawdown_90d NUMERIC(8, 2),
@@ -7979,111 +7769,6 @@ def init_phase6_tables():
                 screened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 evaluated BOOLEAN DEFAULT FALSE,
                 UNIQUE(symbol, screened_at)
-            )
-        """))
-        conn.execute(text("""
-            ALTER TABLE wealth_builder_evaluations
-            ADD COLUMN IF NOT EXISTS actual_return_63d NUMERIC(8, 2)
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS eod_ohl_history (
-                id SERIAL PRIMARY KEY,
-                symbol VARCHAR(20) NOT NULL,
-                market VARCHAR(5) NOT NULL DEFAULT 'AU',
-                trade_date DATE NOT NULL,
-                open NUMERIC(12, 4),
-                high NUMERIC(12, 4),
-                low NUMERIC(12, 4),
-                close NUMERIC(12, 4),
-                volume BIGINT,
-                UNIQUE(symbol, market, trade_date)
-            )
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_eod_ohl_symbol_date
-            ON eod_ohl_history(symbol, market, trade_date)
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS model_training_set (
-                id SERIAL PRIMARY KEY,
-                symbol VARCHAR(20) NOT NULL,
-                market VARCHAR(5) NOT NULL DEFAULT 'AU',
-                signal_date DATE NOT NULL,
-                entry_price NUMERIC(12, 4),
-                features JSONB,
-                forward_return_63d NUMERIC(8, 2),
-                forward_peak_return_63d NUMERIC(8, 2),
-                forward_max_drawdown_63d NUMERIC(8, 2),
-                hit_3pct BOOLEAN,
-                direction_correct BOOLEAN,
-                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(symbol, market, signal_date)
-            )
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_mts_signal_date
-            ON model_training_set(signal_date)
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS model_weights_by_date (
-                id SERIAL PRIMARY KEY,
-                trained_at DATE NOT NULL,
-                feature_name VARCHAR(100) NOT NULL,
-                weight NUMERIC(12, 6),
-                coefficient NUMERIC(12, 6),
-                standard_error NUMERIC(12, 6),
-                significance_pct NUMERIC(8, 2),
-                model_type VARCHAR(20) DEFAULT 'logistic',
-                sample_size INTEGER,
-                in_sample_hit_rate NUMERIC(6, 2),
-                notes TEXT,
-                UNIQUE(trained_at, feature_name)
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS channel_hit_rates (
-                id SERIAL PRIMARY KEY,
-                calibrated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                momentum NUMERIC(6, 4),
-                institutional NUMERIC(6, 4),
-                options NUMERIC(6, 4),
-                fundamental NUMERIC(6, 4),
-                cross_asset NUMERIC(6, 4),
-                sample_size INTEGER
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS daily_ai_runs (
-                id SERIAL PRIMARY KEY,
-                run_date DATE NOT NULL UNIQUE,
-                total_candidates INTEGER,
-                ai_approved INTEGER,
-                ai_rejected INTEGER,
-                approval_rate_pct NUMERIC(6, 2),
-                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS job_runs (
-                id SERIAL PRIMARY KEY,
-                job_name VARCHAR(100) NOT NULL,
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                finished_at TIMESTAMP,
-                status VARCHAR(20) DEFAULT 'running',
-                error TEXT,
-                rows_affected INTEGER,
-                duration_seconds NUMERIC(8, 2)
-            )
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_job_runs_started
-            ON job_runs(started_at DESC)
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                id SERIAL PRIMARY KEY,
-                migration_name VARCHAR(200) NOT NULL UNIQUE,
-                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
         conn.execute(text("""
@@ -8097,29 +7782,6 @@ def init_phase6_tables():
                 avg_win_pct NUMERIC(6, 2),
                 avg_loss_pct NUMERIC(6, 2),
                 recommended_action TEXT
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS fundamental_snapshots (
-                id SERIAL PRIMARY KEY,
-                symbol VARCHAR(20) NOT NULL,
-                market VARCHAR(5) NOT NULL DEFAULT 'AU',
-                snapshot_date DATE NOT NULL,
-                trailing_pe NUMERIC(12, 2),
-                forward_pe NUMERIC(12, 2),
-                market_cap NUMERIC(20, 2),
-                dividend_yield NUMERIC(8, 2),
-                analyst_target_mean NUMERIC(12, 2),
-                analyst_rec VARCHAR(20),
-                revenue_growth NUMERIC(8, 2),
-                earnings_growth NUMERIC(8, 2),
-                price_to_book NUMERIC(8, 2),
-                beta NUMERIC(6, 2),
-                high_52w NUMERIC(12, 2),
-                low_52w NUMERIC(12, 2),
-                avg_volume BIGINT,
-                shares_outstanding BIGINT,
-                UNIQUE(symbol, snapshot_date)
             )
         """))
 
@@ -10460,54 +10122,6 @@ def _scheduled_uat_health_report():
         pass
 
     lines.append(f"")
-    lines.append(f"<b>🤖 Model Training Status</b>")
-    try:
-        with db_conn() as conn:
-            last_train = conn.execute(text("""
-                SELECT trained_at, sample_size, in_sample_hit_rate
-                FROM model_weights_by_date
-                ORDER BY trained_at DESC LIMIT 1
-            """)).fetchone()
-            mts_count = conn.execute(text("SELECT COUNT(*) FROM model_training_set")).fetchone()
-            ohlc_count = conn.execute(text("SELECT COUNT(DISTINCT symbol) FROM eod_ohl_history")).fetchone()
-            
-            if last_train:
-                lines.append(f"  ✅ Last trained: {last_train[1]} samples, in-sample acc: {float(last_train[2])*100:.1f}%")
-            else:
-                lines.append(f"  🟡 No model trained yet — matrix: {mts_count[0] or 0} rows, OHLC: {ohlc_count[0] or 0} symbols")
-
-            channel_cal = conn.execute(text("""
-                SELECT calibrated_at, momentum, institutional, fundamental, sample_size
-                FROM channel_hit_rates ORDER BY calibrated_at DESC LIMIT 1
-            """)).fetchone()
-            if channel_cal:
-                lines.append(f"  📊 Channel rates [M:{float(channel_cal[1])*100:.0f}% I:{float(channel_cal[2])*100:.0f}% F:{float(channel_cal[3])*100:.0f}%] ({channel_cal[4]} signals)")
-            else:
-                lines.append(f"  🟡 Channel calibration not yet run")
-
-            ai_runs = conn.execute(text("""
-                SELECT run_date, total_candidates, ai_approved, approval_rate_pct
-                FROM daily_ai_runs ORDER BY run_date DESC LIMIT 3
-            """)).fetchall()
-            if ai_runs:
-                ai_line = "  🤖 Recent AI approvals: " + " | ".join(
-                    f"{r[0]}: {r[2]}/{r[1]} ({float(r[3] or 0):.0f}%)" for r in ai_runs
-                )
-                lines.append(ai_line)
-
-            # Check for stale jobs
-            stale_jobs = conn.execute(text("""
-                SELECT job_name, started_at FROM job_runs
-                WHERE status = 'running' AND started_at < NOW() - INTERVAL '2 hours'
-                ORDER BY started_at DESC LIMIT 5
-            """)).fetchall()
-            if stale_jobs:
-                lines.append(f"  ⚠️ {len(stale_jobs)} stale jobs (stuck >2h): " +
-                             ", ".join([r[0] for r in stale_jobs]))
-    except Exception as e:
-        lines.append(f"  ⚠️ Training metrics check failed: {e}")
-
-    lines.append(f"")
     da = days_accumulated if 'days_accumulated' in dir() else 0
     next_milestone = next((m for m in [30, 63, 90] if da < m), 90)
     lines.append(f"<i>Day {da}/{next_milestone} toward WFO Sharpe evaluation. "
@@ -10575,7 +10189,7 @@ def _scheduled_uat_health_report():
     # and Groq 30 req/min limits.
     import time as _sleep_time
     market = "AU"
-    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "1200"))
+    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "0"))
     if UAT_MODE:
         broad_scan_cap = min(broad_scan_cap, 30)
         _EODHD_MIN_INTERVAL_INTERNAL = 3.0
@@ -10650,7 +10264,6 @@ def _scheduled_uat_health_report():
     candidates.sort(key=lambda x: x.get("wealth_rank", 0) or x.get("score", 0), reverse=True)
 
     # Apply Sector Concentration Cap (Max 15 per sector to enforce diversification)
-    # ── Sector diversification ──────────────────────────────────────────────
     sector_counts = {}
     diversified_candidates = []
     for c in candidates:
@@ -10658,102 +10271,75 @@ def _scheduled_uat_health_report():
         if sector_counts.get(sector, 0) < 15:
             diversified_candidates.append(c)
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
-
+            
     candidates = diversified_candidates
-
-    # ── Model tier classification (before DB write, so AI pipeline can read tiers) ──
-    _enrich_candidates_with_tiers(candidates)
 
     try:
         with db_conn() as conn:
             did = str(uuid4())
-            picks_json = json.dumps(candidates)
             conn.execute(text("""
                 INSERT INTO wealth_scan_cache (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
                 VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
+                ON CONFLICT (market, scan_mode) DO UPDATE
+                SET scanned_count = :scanned, candidates_found = :found, picks = :picks, generated_at = CURRENT_TIMESTAMP
             """), {
                 "id": did,
                 "market": market,
                 "mode": "broad",
                 "scanned": scanned,
                 "found": len(candidates),
-                "picks": picks_json,
+                "picks": json.dumps(candidates),
             })
-            conn.execute(text("""
-                INSERT INTO wealth_scan_history (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
-                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
-            """), {
-                "id": did,
-                "market": market,
-                "mode": "broad",
-                "scanned": scanned,
-                "found": len(candidates),
-                "picks": picks_json,
-            })
-            now_ts = datetime.utcnow()
-            for c in candidates:
-                conn.execute(text("""
-                    INSERT INTO wealth_builder_evaluations
-                        (symbol, market, wealth_rank, score, prob_ge_5pct,
-                         predicted_change_pct, price_at_screen,
-                         entry_zone, screened_at)
-                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :at)
-                    ON CONFLICT (symbol, screened_at) DO NOTHING
-                """), {
-                    "symbol": c.get("symbol", ""),
-                    "market": market,
-                    "wr": c.get("wealth_rank"),
-                    "sc": c.get("score"),
-                    "p5": c.get("prob_ge_5pct"),
-                    "pc": c.get("predicted_change_pct"),
-                    "pas": c.get("current_price"),
-                    "ez": (c.get("entry_timing") or {}).get("entry_zone", ""),
-                    "at": now_ts,
-                })
     except Exception as e:
         print(f"[BroadScan] DB write failed: {e}")
 
-    # --- Auto-send Telegram Alerts for Model-Tiered Signals ---
+    # --- Auto-send Telegram Alerts for High Conviction Signals ---
     try:
-        tier5 = [c for c in candidates if c.get("_target_tier") == "5pct"]
-        tier3 = [c for c in candidates if c.get("_target_tier") == "3pct"]
-        print(f"[BroadScan] Model tiers: {len(tier5)}×5%, {len(tier3)}×3%, "
-              f"{len(candidates)-len(tier5)-len(tier3)}×watch")
+        high_conviction = []
+        for c in candidates:
+            score = c.get("score") or 0
+            prob = c.get("prob_ge_5pct") or 0
+            zone = (c.get("entry_timing") or {}).get("entry_zone", "caution")
+            confluence_conf = (c.get("confluence") or {}).get("confidence", "low")
+            confluence_bullish = (c.get("confluence") or {}).get("bullish_channels", 0)
+            if score >= 0.65 and prob >= 65.0 and zone == "clear" and confluence_conf == "high" and confluence_bullish >= 4:
+                high_conviction.append(c)
 
-        today_key = datetime.utcnow().date().isoformat()
-        with db_conn() as conn:
-            users = conn.execute(text("SELECT id FROM users")).fetchall()
-
-        for tier_set, tier_label in [(tier5, "🎯 5% TARGET TIER"), (tier3, "📈 3% COMPOUND TIER")]:
-            if not tier_set:
-                continue
+        if high_conviction:
+            today_key = datetime.utcnow().date().isoformat()
+            with db_conn() as conn:
+                users = conn.execute(text("SELECT id FROM users")).fetchall()
             for user in users:
                 uid = user[0]
                 recipients = get_user_telegram_recipients(uid)
                 if not recipients:
                     continue
-                for hc in tier_set:
-                    sym = hc["symbol"]
-                    digest_key = f"auto_tier_{sym}_{today_key}"
-                    if has_digest_been_sent(uid, "AU", digest_key):
-                        continue
-                    msg = _build_tier_signal_message(
-                        hc["symbol"], hc.get("name", ""), hc,
-                        hc.get("valuation", {}), hc.get("prediction", {}),
-                        hc.get("entry_timing", {}), tier_label=hc.get("_tier_label", "")
-                    )
-                    price = hc.get("current_price", 1)
-                    qty = int(2500 / price) if price > 0 else 1
-                    kb = {"inline_keyboard": [[
-                        {"text": f"🚀 Buy {qty} shares (~$2500)",
-                         "callback_data": f"buy_{hc['symbol']}_{qty}"}
-                    ]]}
-                    _send_telegram_payload(
-                        msg, recipients, user_id=uid, message_type="daily_digest",
-                        market="AU", digest_key=digest_key, source="broad_scan_tiered",
-                        reply_markup=kb
-                    )
-                    time.sleep(0.5)
+                for hc in high_conviction:
+                    digest_key = f"auto_alert_{hc['symbol']}_{today_key}"
+                    if not has_digest_been_sent(uid, "AU", digest_key):
+                        msg = _build_wealth_signal_message(
+                            hc["symbol"], hc.get("name", ""), hc, 
+                            hc.get("valuation", {}), hc.get("prediction", {}), 
+                            hc.get("entry_timing", {})
+                        )
+                        price = hc.get("current_price", 1)
+                        qty = int(2500 / price) if price > 0 else 1
+                        kb = {
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": f"🚀 1-Click Buy: {qty} shares (~$2500)",
+                                        "callback_data": f"buy_{hc['symbol']}_{qty}"
+                                    }
+                                ]
+                            ]
+                        }
+                        _send_telegram_payload(
+                            msg, recipients, user_id=uid, message_type="daily_digest", 
+                            market="AU", digest_key=digest_key, source="broad_scan_auto",
+                            reply_markup=kb
+                        )
+                        _sleep_time.sleep(1)  # Avoid hitting Telegram rate limits
     except Exception as e:
         print(f"[BroadScan] Auto-alerting failed: {e}")
 
@@ -11451,7 +11037,7 @@ async def wealth_builder_backtest(
         elif actual_14d is not None and actual_14d < 0:
             dir_correct += 1 if pred < 0 else 0
 
-        if actual_90d is not None and actual_90d >= 3:
+        if actual_90d is not None and actual_90d >= 5:
             hit_count += 1
 
         ranked_pairs.append((rank, actual_90d or 0))
@@ -11513,18 +11099,13 @@ async def wealth_builder_evaluate_historical(
         try:
             at_date = at_str.replace(tzinfo=None) if hasattr(at_str, 'replace') else at_str
             hist = get_historical_data(sym, period="6mo")
-            is_dead = hist.empty or len(hist) < 14 or (
-                len(hist) == 1 and "Close" in hist.columns 
-                and abs(float(hist["Close"].iloc[0])) < 0.01
-            )
-            if is_dead:
+            if hist.empty or len(hist) < 14:
                 # Survivorship bias mitigation: If we can't get history for a stock we screened in the past,
                 # it may be delisted or bankrupt. We assign a -100% return if it's > 30 days old.
                 if isinstance(at_date, datetime) and (datetime.utcnow() - at_date).days > 30:
                     conn.execute(text("""
                         UPDATE wealth_builder_evaluations
                         SET actual_return_14d = -100, actual_return_30d = -100,
-                            actual_return_63d = -100,
                             actual_return_90d = -100, actual_peak_return_90d = 0,
                             actual_max_drawdown_90d = -100, evaluated = TRUE
                         WHERE id = :eid
@@ -11537,7 +11118,6 @@ async def wealth_builder_evaluate_historical(
             current_p = price if price else 1.0
             actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
             actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
-            actual_63d = round((float(prices_after["Close"].iloc[min(63, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 63 else None
             actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
             peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
             max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
@@ -11545,11 +11125,10 @@ async def wealth_builder_evaluate_historical(
             conn.execute(text("""
                 UPDATE wealth_builder_evaluations
                 SET actual_return_14d = :r14, actual_return_30d = :r30,
-                    actual_return_63d = :r63,
                     actual_return_90d = :r90, actual_peak_return_90d = :pk,
                     actual_max_drawdown_90d = :dd, evaluated = TRUE
                 WHERE id = :eid
-            """), {"r14": actual_14d, "r30": actual_30d, "r63": actual_63d, "r90": actual_90d,
+            """), {"r14": actual_14d, "r30": actual_30d, "r90": actual_90d,
                    "pk": peak_ret, "dd": max_dd, "eid": eid})
             updated += 1
         except Exception:
@@ -11571,8 +11150,8 @@ def _scheduled_self_learning_loop():
                 WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
             """)).fetchall()
 
-            if len(trades) < 8:
-                print(f"[SelfLearning] Need ≥8 closed trades for PID (have {len(trades)}).")
+            if len(trades) < 20:
+                print(f"[SelfLearning] Need ≥20 closed trades for stable PID (have {len(trades)}).")
                 return
 
             win_count = 0
@@ -11662,8 +11241,6 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
     trend = (candidate.get("trend") or "neutral").upper()
     price = candidate.get("current_price", 0) or 0
     confluence = (candidate.get("confluence") or {}).get("confidence", "?")
-    mscore = candidate.get("_model_score", 0)
-    tier = candidate.get("_tier_label", "")
 
     d_emoji = "✅" if decision == "APPROVE" else "⛔"
     conf_bar = "🟢" if confidence >= 70 else "🟡" if confidence >= 40 else "🔴"
@@ -11675,8 +11252,8 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
     risks_block = "\n".join(f"  ⚠️ {r}" for r in scenario_risks) if scenario_risks else ""
 
     return (
-        f"{d_emoji} <b>{sym}</b> {c_emoji} [{tier}] — {name}\n"
-        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | Model: {mscore:+.0f}\n"
+        f"{d_emoji} <b>{sym}</b> {c_emoji} — {name}\n"
+        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | P(≥3%): {prob:.1f}%\n"
         f"  💰 ${price:.2f} | Conf: {confidence}% {conf_bar} | Alloc: {allocation:.1f}% | Stop: -{stop:.1f}%\n"
         f"{'  ' + reasoning + chr(10) if reasoning else ''}"
         f"{risks_block}"
@@ -11765,11 +11342,6 @@ def _scheduled_daily_ai_pipeline():
             ]}
             confluence = cand.get("confluence", {})
 
-            # ── Inject model tier context so AI personas can see it ──────────
-            val["model_tier"] = cand.get("_target_tier", "none")
-            val["model_score"] = cand.get("_model_score", 0)
-            val["model_tier_label"] = cand.get("_tier_label", "")
-
             result = run_agentic_analysis(sym, market, tech_compact, val, confluence)
             result["candidate"] = cand
             ai_results.append(result)
@@ -11839,30 +11411,7 @@ def _scheduled_daily_ai_pipeline():
     except Exception as e:
         print(f"[DailyAI] Broadcast failed: {e}")
 
-    try:
-        with db_conn() as conn:
-            approved_count = sum(1 for r in ai_results if r.get("approved", False))
-            conn.execute(text("""
-                INSERT INTO daily_ai_runs (run_date, total_candidates, ai_approved, ai_rejected, approval_rate_pct)
-                VALUES (:rd, :tc, :aa, :ar, :apr)
-                ON CONFLICT (run_date) DO UPDATE SET
-                total_candidates = EXCLUDED.total_candidates,
-                ai_approved = EXCLUDED.ai_approved,
-                ai_rejected = EXCLUDED.ai_rejected,
-                approval_rate_pct = EXCLUDED.approval_rate_pct,
-                completed_at = NOW()
-            """), {
-                "rd": datetime.utcnow().date(),
-                "tc": len(selected),
-                "aa": approved_count,
-                "ar": len(selected) - approved_count,
-                "apr": round(approved_count / len(selected) * 100, 2) if selected else 0,
-            })
-            conn.commit()
-    except Exception as e:
-        print(f"[DailyAI] Tracking insert failed: {e}")
-
-    print(f"[DailyAI] Daily AI pipeline complete. {len(ai_results)} analyses, Approved: {sum(1 for r in ai_results if r.get('approved', False))}, broadcast to Telegram.")
+    print(f"[DailyAI] Daily AI pipeline complete. {len(ai_results)} analyses, broadcast to Telegram.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -12095,7 +11644,7 @@ def _scheduled_walk_forward_oos():
             with db_conn() as conn:
                 rows = conn.execute(text("""
                     SELECT picks, generated_at
-                    FROM wealth_scan_history
+                    FROM wealth_scan_cache
                     WHERE scan_mode = 'broad'
                       AND generated_at <= :cutoff
                     ORDER BY generated_at DESC
@@ -12194,7 +11743,7 @@ def _scheduled_walk_forward_oos():
                 predicted_up = sig["trend"] == "bullish"
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
-                hit = actual_return >= 3.0
+                hit = actual_return >= 5.0
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
@@ -13179,90 +12728,6 @@ async def register_telegram_webhook(request: Request, current_user: dict = Depen
     }
 
 
-# ── Job Audit Trail ────────────────────────────────────────────────────────────
-def _log_job_start(job_name: str) -> Optional[int]:
-    """Insert a 'running' row into job_runs. Returns row ID for later finish."""
-    try:
-        with db_conn() as conn:
-            row = conn.execute(text("""
-                INSERT INTO job_runs (job_name, started_at, status)
-                VALUES (:name, NOW(), 'running')
-                RETURNING id
-            """), {"name": job_name}).fetchone()
-            conn.commit()
-            return row[0] if row else None
-    except Exception:
-        return None
-
-def _log_job_finish(job_id: Optional[int], status: str = "ok", error: str = None,
-                    rows_affected: int = None, started_at: datetime = None):
-    """Mark a job run as finished."""
-    if job_id is None:
-        return
-    try:
-        duration = (datetime.utcnow() - started_at).total_seconds() if started_at else None
-        with db_conn() as conn:
-            conn.execute(text("""
-                UPDATE job_runs SET finished_at = NOW(), status = :s, error = :e,
-                    rows_affected = :r, duration_seconds = :d
-                WHERE id = :id
-            """), {"s": status, "e": error, "r": rows_affected, "d": duration, "id": job_id})
-            conn.commit()
-    except Exception:
-        pass
-
-def _scheduled_inc_update():
-    """3 AM: Incremental OHLC update from EODHD bulk endpoint."""
-    jid = _log_job_start("inc_update")
-    started = datetime.utcnow()
-    try:
-        from eodhd_backfill import incremental_daily_update
-        result = incremental_daily_update()
-        _log_job_finish(jid, rows_affected=result.get("rows_inserted", 0), started_at=started)
-        print(f"[IncUpdate] Complete: {result}")
-    except Exception as e:
-        _log_job_finish(jid, status="error", error=str(e), started_at=started)
-        print(f"[IncUpdate] Failed: {e}")
-
-def _scheduled_model_training():
-    """7 AM: Build training matrix and fit model weights (after broad scan data available)."""
-    jid = _log_job_start("model_training")
-    started = datetime.utcnow()
-    try:
-        from model_training import daily_training_pipeline
-        result = daily_training_pipeline()
-        rows = result.get("matrix", {}).get("rows_inserted", 0)
-        _log_job_finish(jid, rows_affected=rows, started_at=started)
-        print(f"[ModelTrain] Complete: {result}")
-    except Exception as e:
-        _log_job_finish(jid, status="error", error=str(e), started_at=started)
-        print(f"[ModelTrain] Failed: {e}")
-
-def _scheduled_channel_calibration():
-    """9 AM: Recalibrate per-channel hit rates from evaluated outcomes."""
-    jid = _log_job_start("channel_calibration")
-    started = datetime.utcnow()
-    try:
-        _update_channel_hit_rates()
-        _log_job_finish(jid, started_at=started)
-    except Exception as e:
-        _log_job_finish(jid, status="error", error=str(e), started_at=started)
-        print(f"[ChannelCal] Failed: {e}")
-
-def _scheduled_monthly_fundamentals():
-    """1st of each month at 4AM: Fetch fundamentals from yfinance for all ASX tickers."""
-    jid = _log_job_start("monthly_fundamentals")
-    started = datetime.utcnow()
-    try:
-        from fundamental_feeder import fetch_all_fundamentals
-        result = fetch_all_fundamentals()
-        _log_job_finish(jid, rows_affected=result.get("fetched", 0), started_at=started)
-        print(f"[FundFeeder] Monthly fundamentals: {result}")
-    except Exception as e:
-        _log_job_finish(jid, status="error", error=str(e), started_at=started)
-        print(f"[FundFeeder] Failed: {e}")
-
-
 if SCHEDULER_AVAILABLE:
 
     try:
@@ -13324,33 +12789,6 @@ if SCHEDULER_AVAILABLE:
             minute=30, hour=16,
             day_of_week="mon-fri",
             id="uat_health_report",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_inc_update, "cron",
-            minute=0, hour=3,
-            day_of_week="mon-fri",
-            id="inc_update_3am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_model_training, "cron",
-            minute=0, hour=7,
-            day_of_week="mon-fri",
-            id="model_training_7am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_channel_calibration, "cron",
-            minute=0, hour=9,
-            day_of_week="mon-fri",
-            id="channel_cal_9am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_monthly_fundamentals, "cron",
-            day="1", hour=4, minute=0,
-            id="monthly_fundamentals",
             max_instances=1,
         )
         scheduler.start()
@@ -13490,69 +12928,6 @@ if SCHEDULER_AVAILABLE:
                     print(f"[StartupCatchup] Self-learning fresh ({learning_age_hours:.1f}h old) — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] self_learning_loop check failed: {_e}")
-
-            _st.sleep(5)
-
-            # ── 7. Incremental OHLC update — run if stale (>24 hours) ───────────
-            try:
-                with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(trade_date) FROM eod_ohl_history"
-                    )).fetchone()
-                ohlc_age_hours = 999
-                if _row and _row[0]:
-                    _max_dt = _row[0] if isinstance(_row[0], datetime) else datetime.strptime(str(_row[0]), "%Y-%m-%d")
-                    ohlc_age_hours = (now_utc - _max_dt.replace(tzinfo=None)).total_seconds() / 3600 if hasattr(_max_dt, 'replace') else 999
-                if ohlc_age_hours > 24:
-                    print(f"[StartupCatchup] OHLC stale ({ohlc_age_hours:.1f}h) — running inc update …")
-                    _scheduled_inc_update()
-                    tasks_run.append("inc_update")
-                else:
-                    print(f"[StartupCatchup] OHLC fresh — skipping inc update.")
-            except Exception as _e:
-                print(f"[StartupCatchup] inc_update failed: {_e}")
-
-            _st.sleep(5)
-
-            # ── 8. Model training — run if not trained today ────────────────────
-            try:
-                with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(trained_at) FROM model_weights_by_date"
-                    )).fetchone()
-                train_today = False
-                if _row and _row[0]:
-                    _td = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    train_today = _td.date() == now_utc.date()
-                if not train_today:
-                    print(f"[StartupCatchup] Model not trained today — running training pipeline …")
-                    _scheduled_model_training()
-                    tasks_run.append("model_training")
-                else:
-                    print(f"[StartupCatchup] Model already trained today — skipping.")
-            except Exception as _e:
-                print(f"[StartupCatchup] model_training failed: {_e}")
-
-            _st.sleep(5)
-
-            # ── 9. Channel calibration — run if not calibrated today ────────────
-            try:
-                with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(calibrated_at) FROM channel_hit_rates"
-                    )).fetchone()
-                cal_today = False
-                if _row and _row[0]:
-                    _cd = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    cal_today = _cd.date() == now_utc.date() if hasattr(_cd, 'date') else False
-                if not cal_today:
-                    print(f"[StartupCatchup] Channel calibration not run today — running …")
-                    _scheduled_channel_calibration()
-                    tasks_run.append("channel_calibration")
-                else:
-                    print(f"[StartupCatchup] Channel calibration already done today.")
-            except Exception as _e:
-                print(f"[StartupCatchup] channel_calibration failed: {_e}")
 
             print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}")
 

@@ -11510,14 +11510,19 @@ async def wealth_builder_evaluate_historical(
     current_user: dict = Depends(get_current_user),
 ):
     """Background job: evaluate past wealth builder candidates against actual returns.
-    Only evaluates rows that have not been evaluated yet and are at least 14 days old."""
+    Evaluates progressively — at 14d fill 14d, at 30d fill 30d, etc.
+    Only marks evaluated=TRUE once ALL horizons (14/30/63/90d) are populated."""
     del current_user
     cutoff = datetime.utcnow() - timedelta(days=14)
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT id, symbol, market, price_at_screen, screened_at
             FROM wealth_builder_evaluations
-            WHERE evaluated = FALSE AND screened_at <= :cutoff
+            WHERE screened_at <= :cutoff
+              AND (actual_return_14d IS NULL
+                OR actual_return_30d IS NULL
+                OR actual_return_63d IS NULL
+                OR actual_return_90d IS NULL)
             LIMIT 50
         """), {"cutoff": cutoff}).fetchall()
 
@@ -11549,22 +11554,35 @@ async def wealth_builder_evaluate_historical(
             if prices_after.empty:
                 continue
             current_p = price if price else 1.0
-            actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 else None
-            actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 else None
-            actual_63d = round((float(prices_after["Close"].iloc[min(63, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 63 else None
-            actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 else None
-            peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2)
-            max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2)
+            days_passed = (datetime.utcnow() - at_date.replace(tzinfo=None)).days if isinstance(at_date, datetime) else 0
+            actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 and days_passed >= 14 else None
+            actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 and days_passed >= 30 else None
+            actual_63d = round((float(prices_after["Close"].iloc[min(63, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 63 and days_passed >= 63 else None
+            actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 and days_passed >= 90 else None
+            peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2) if days_passed >= 14 else None
+            max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2) if days_passed >= 14 else None
 
-            conn.execute(text("""
-                UPDATE wealth_builder_evaluations
-                SET actual_return_14d = :r14, actual_return_30d = :r30,
-                    actual_return_63d = :r63,
-                    actual_return_90d = :r90, actual_peak_return_90d = :pk,
-                    actual_max_drawdown_90d = :dd, evaluated = TRUE
-                WHERE id = :eid
-            """), {"r14": actual_14d, "r30": actual_30d, "r63": actual_63d, "r90": actual_90d,
-                   "pk": peak_ret, "dd": max_dd, "eid": eid})
+            # Incremental: only fill NULL columns
+            sets = []
+            params = {"eid": eid}
+            if actual_14d is not None:
+                sets.append("actual_return_14d = :r14"); params["r14"] = actual_14d
+            if actual_30d is not None:
+                sets.append("actual_return_30d = :r30"); params["r30"] = actual_30d
+            if actual_63d is not None:
+                sets.append("actual_return_63d = :r63"); params["r63"] = actual_63d
+            if actual_90d is not None:
+                sets.append("actual_return_90d = :r90"); params["r90"] = actual_90d
+            if peak_ret is not None:
+                sets.append("actual_peak_return_90d = :pk"); params["pk"] = peak_ret
+            if max_dd is not None:
+                sets.append("actual_max_drawdown_90d = :dd"); params["dd"] = max_dd
+            all_filled = actual_14d is not None and actual_30d is not None and \
+                          actual_63d is not None and actual_90d is not None
+            sets.append("evaluated = :ev"); params["ev"] = all_filled
+
+            if sets:
+                conn.execute(text(f"UPDATE wealth_builder_evaluations SET {', '.join(sets)} WHERE id = :eid"), params)
             updated += 1
         except Exception:
             pass

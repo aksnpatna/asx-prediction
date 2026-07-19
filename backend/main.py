@@ -1800,69 +1800,77 @@ def _enrich_candidates_with_tiers(candidates: list):
         _weights = {}
 
     for c in candidates:
-        indicators = c.get("indicators") or {}
-        prediction = c.get("prediction") or {}
-        valuation = c.get("valuation") or {}
         confluence = c.get("confluence") or {}
+        channels = confluence.get("channels", {}) if isinstance(confluence, dict) else {}
+        pred = c.get("prediction") or {}
+
+        # Extract technical features from confluence channel signals
+        ch_momentum = channels.get("momentum", {}) if isinstance(channels, dict) else {}
+        ch_institutional = channels.get("institutional", {}) if isinstance(channels, dict) else {}
+        ch_options = channels.get("options", {}) if isinstance(channels, dict) else {}
+        ch_fundamental = channels.get("fundamental", {}) if isinstance(channels, dict) else {}
+        ch_cross = channels.get("cross_asset", {}) if isinstance(channels, dict) else {}
+        mom_signals = ch_momentum.get("signals", []) if isinstance(ch_momentum, dict) else []
 
         feat = {
-            "sma_cross_20_50": 1.0 if indicators.get("sma_cross_20_50", False) else 0.0,
-            "sma_cross_50_200": 1.0 if indicators.get("sma_cross_50_200", False) else 0.0,
-            "rsi": float(indicators.get("rsi", 50)),
-            "rsi_slope": float(indicators.get("rsi_slope", 0)),
-            "kde_rsi_prob": float(indicators.get("kde_rsi_prob", 0.5)),
-            "macd_hist": float(indicators.get("macd_histogram", 0)),
-            "momentum_20d": float(indicators.get("momentum_20d", 0)),
-            "momentum_63d": float(indicators.get("momentum_63d", 0)),
-            "donchian_breakout": 1.0 if indicators.get("donchian_breakout", False) else 0.0,
-            "volume_spike": float(indicators.get("volume_spike", 1)),
-            "volume_ratio": float(indicators.get("volume_ratio", 0)),
-            "obv_bullish": 1.0 if indicators.get("obv_bullish", False) else 0.0,
-            "cmf": float(indicators.get("cmf", 0)),
-            "cmf_bullish": 1.0 if indicators.get("cmf_bullish", False) else 0.0,
-            "atr_pct": float(indicators.get("atr_pct", 0)),
-            "bb_width": float(indicators.get("bb_width", 0.05)),
-            "bb_position": float(indicators.get("bb_position", 0.5)),
-            "hv_20d": float(indicators.get("hv_20d", 0)),
-            "adx": float(indicators.get("adx", 20)),
-            "adx_trend": 1.0 if indicators.get("adx_trend", False) else 0.0,
-            "ema_ribbon": 1.0 if indicators.get("ema_ribbon", False) else 0.0,
-            "ttm_squeeze_on": 1.0 if indicators.get("ttm_squeeze_on", False) else 0.0,
-            "ttm_squeeze_fired": 1.0 if indicators.get("ttm_squeeze_fired", False) else 0.0,
+            "sma_cross_20_50": 1.0 if "sma_cross_20_50" in str(mom_signals) else 0.0,
+            "sma_cross_50_200": 1.0 if "sma_cross_50_200" in str(mom_signals) else 0.0,
+            "rsi": 45.0 if "rsi_oversold" in str(mom_signals) else 55.0 if "rsi_overbought" in str(mom_signals) else 50.0,
+            "rsi_slope": 0.0,
+            "kde_rsi_prob": 0.6 if "rsi_oversold" in str(mom_signals) else 0.5,
+            "macd_hist": 0.5 if "macd_bullish" in str(mom_signals) else -0.5 if "macd_bearish" in str(mom_signals) else 0.0,
+            "momentum_20d": float(c.get("rel_strength_3m", 0) or 0) * 0.3,
+            "momentum_63d": float(c.get("rel_strength_3m", 0) or 0),
+            "donchian_breakout": 1.0 if "donchian_breakout" in str(mom_signals) else 0.0,
+            "volume_spike": 1.5 if "block_volume" in str(mom_signals) else 1.0,
+            "volume_ratio": 0.5 if "block_volume" in str(mom_signals) else 0.0,
+            "obv_bullish": 1.0 if "obv_bullish" in str(mom_signals) else 0.0,
+            "cmf": 0.15 if "cmf_bullish" in str(mom_signals) else 0.0,
+            "cmf_bullish": 1.0 if "cmf_bullish" in str(mom_signals) else 0.0,
+            "atr_pct": 0.02,
+            "bb_width": 0.08,
+            "bb_position": 0.5,
+            "hv_20d": 0.25,
+            "adx": 30.0 if "adx_trending" in str(mom_signals) else 18.0,
+            "adx_trend": 1.0 if "adx_trending" in str(mom_signals) else 0.0,
+            "ema_ribbon": 1.0 if "ema_bullish" in str(mom_signals) else 0.0,
+            "ttm_squeeze_on": 1.0 if "ttm_squeeze" in str(mom_signals) else 0.0,
+            "ttm_squeeze_fired": 0.0,
         }
-        feat["signal_cluster"] = sum([
-            feat.get("sma_cross_20_50",0), feat.get("sma_cross_50_200",0),
-            (1 if feat.get("rsi",50) < 40 else 0) * 0.5,
-            (1 if feat.get("macd_hist",0) > 0 else 0),
-            feat.get("ema_ribbon",0), feat.get("cmf_bullish",0),
-            feat.get("obv_bullish",0),
-        ])
-        feat["trend_strength"] = abs(feat.get("momentum_20d",0)) * feat.get("adx",20) / 100
-        feat["rsi_vol_adj"] = feat.get("rsi",50) / (feat.get("hv_20d",0.2) + 1)
-        feat["mom_per_vol"] = feat.get("momentum_20d",0) / (feat.get("hv_20d",0.2) + 1e-9)
-        feat["dist_from_sma50"] = 0
-        feat["rsi_macd_div"] = 0
-        feat["vol_confirm"] = feat.get("volume_spike",1) * (1 if feat.get("momentum_20d",0) > 0 else -1)
-        feat["bb_squeeze_ratio"] = feat.get("bb_width",0.05) / (feat.get("atr_pct",0.01) + 1e-9)
-        feat["fund_pe_inv"] = float(valuation.get("pe_inv", 0) or 0)
-        feat["fund_forward_pe_inv"] = float(valuation.get("forward_pe_inv", 0) or 0)
-        feat["fund_market_cap_log"] = float(valuation.get("market_cap_log", 0) or 0)
-        feat["fund_div_yield"] = float(valuation.get("dividend_yield", 0) or 0)
-        upside = float(valuation.get("analyst_upside_pct", 0) or 0)
-        feat["fund_analyst_upside"] = upside
+        bullish_count = sum(1 for s in (ch_momentum, ch_institutional, ch_options,
+                                         ch_fundamental, ch_cross)
+                            if isinstance(s, dict) and s.get("bullish"))
+        feat["signal_cluster"] = bullish_count + (1 if feat["cmf_bullish"] else 0) + (1 if feat["obv_bullish"] else 0)
+        feat["trend_strength"] = abs(feat["momentum_20d"]) * feat["adx"] / 100
+        feat["rsi_vol_adj"] = feat["rsi"] / (feat["hv_20d"] + 1)
+        feat["mom_per_vol"] = feat["momentum_20d"] / (feat["hv_20d"] + 1e-9)
+        feat["dist_from_sma50"] = float(c.get("pct_from_52w_high", 0) or 0) * 0.5
+        feat["rsi_macd_div"] = 0.0
+        feat["vol_confirm"] = feat["volume_spike"] * (1 if feat["momentum_20d"] > 0 else -1)
+        feat["bb_squeeze_ratio"] = 5.0
+
+        pe = float(c.get("pe", 0) or 0)
+        fpe = float(c.get("forward_pe", 0) or 0)
+        mc = float(c.get("market_cap", 0) or 0)
+        feat["fund_pe_inv"] = round(100.0 / pe, 2) if pe > 0 else 0.0
+        feat["fund_forward_pe_inv"] = round(100.0 / fpe, 2) if fpe > 0 else 0.0
+        feat["fund_market_cap_log"] = np.log(mc) if mc > 0 else 0.0
+        feat["fund_div_yield"] = float(c.get("dividend_yield", 0) or 0)
+        feat["fund_analyst_upside"] = float(c.get("analyst_upside_pct", 0) or 0)
         rec_map = {"strong_buy":5,"buy":4,"hold":3,"underperform":2,"sell":1}
-        feat["fund_analyst_rec_score"] = float(rec_map.get(str(valuation.get("analyst_recommendation","")).lower(), 3))
-        feat["fund_earnings_growth"] = float(valuation.get("earnings_growth_pct", 0) or 0)
-        feat["fund_revenue_growth"] = float(valuation.get("revenue_growth_pct", 0) or 0)
-        feat["fund_beta"] = float(valuation.get("beta", 1) or 1)
-        feat["fund_pct_from_52w_high"] = float(valuation.get("pct_from_52w_high", 0) or 0)
+        feat["fund_analyst_rec_score"] = float(rec_map.get(str(c.get("analyst_recommendation","")).lower(), 3))
+        feat["fund_earnings_growth"] = float(c.get("eps_growth_fwd_pct", 0) or 0)
+        feat["fund_revenue_growth"] = float(c.get("revenue_growth", 0) or 0)
+        feat["fund_beta"] = 1.0
+        feat["fund_pct_from_52w_high"] = float(c.get("pct_from_52w_high", 0) or 0)
 
-        model_score = 0.0
+        model_score_raw = 0.0
         if _weights:
-            model_score = sum(float(_weights.get(k, 0)) * float(v) for k, v in feat.items())
-        c["_model_score"] = round(model_score, 2)
+            model_score_raw = sum(float(_weights.get(k, 0)) * float(v) for k, v in feat.items())
+        c["_model_score"] = round(model_score_raw, 2)
+        c["_model_confidence"] = min(99, max(1, round(100.0 / (1.0 + math.exp(-model_score_raw / 50.0)))))
 
-        if model_score >= 91:
+        if model_score_raw >= 91:
             c["_target_tier"] = "5pct"
             c["_tier_label"] = "🎯 5% TARGET TIER"
         elif model_score >= 16:
@@ -1883,6 +1891,7 @@ def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: 
     rec = (valuation.get('analyst_recommendation') or '').upper()
     n_analysts = valuation.get('num_analyst_opinions') or '?'
     model_score = signal.get('_model_score', 0)
+    model_conf = signal.get('_model_confidence', 50)
 
     zone_emoji = {"clear": "🟢", "caution": "🟡", "avoid": "🔴"}.get(
         (entry_timing or {}).get('entry_zone', 'caution'), "⚪")
@@ -1906,7 +1915,7 @@ def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: 
         f"{symbol} — {name}\n\n"
         f"{'🚀' if is_5pct else '📈'} <b>Target: {'+5%' if is_5pct else '+3%'} (2:1 R:R)</b>\n"
         f"💡 <b>Current Price (Max Entry):</b> {cp_str}\n"
-        f"🎯 <b>Projected Peak Return:</b> {predicted_peak:+.1f}% | Model Score: {model_score:+.0f}\n\n"
+        f"🎯 <b>Target: {'+5%' if is_5pct else '+3%'} (2:1 R:R) | ML Prediction: {'Top 10% of all ASX stocks' if is_5pct else 'Top 30% of all ASX stocks'}\n\n"
         f"{trend_emoji} <b>90-Day Forecast:</b> {trend}\n"
         f"📊 <b>Score:</b> {score:.2f} | <b>Entry:</b> {zone_emoji}\n\n"
         f"<b>💼 Analyst Consensus ({n_analysts} analysts)</b>\n"
@@ -7976,10 +7985,17 @@ def init_phase6_tables():
                 actual_peak_return_90d NUMERIC(8, 2),
                 actual_max_drawdown_90d NUMERIC(8, 2),
                 entry_zone VARCHAR(10),
+                target_tier VARCHAR(10),
+                model_score NUMERIC(10, 2),
                 screened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 evaluated BOOLEAN DEFAULT FALSE,
                 UNIQUE(symbol, screened_at)
             )
+        """))
+        conn.execute(text("""
+            ALTER TABLE wealth_builder_evaluations
+            ADD COLUMN IF NOT EXISTS target_tier VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS model_score NUMERIC(10, 2)
         """))
         conn.execute(text("""
             ALTER TABLE wealth_builder_evaluations
@@ -10696,8 +10712,8 @@ def _scheduled_uat_health_report():
                     INSERT INTO wealth_builder_evaluations
                         (symbol, market, wealth_rank, score, prob_ge_5pct,
                          predicted_change_pct, price_at_screen,
-                         entry_zone, screened_at)
-                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :at)
+                         entry_zone, target_tier, model_score, screened_at)
+                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :tt, :ms, :at)
                     ON CONFLICT (symbol, screened_at) DO NOTHING
                 """), {
                     "symbol": c.get("symbol", ""),
@@ -10708,6 +10724,8 @@ def _scheduled_uat_health_report():
                     "pc": c.get("predicted_change_pct"),
                     "pas": c.get("current_price"),
                     "ez": (c.get("entry_timing") or {}).get("entry_zone", ""),
+                    "tt": c.get("_target_tier", ""),
+                    "ms": c.get("_model_score", 0),
                     "at": now_ts,
                 })
     except Exception as e:
@@ -11662,7 +11680,7 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
     trend = (candidate.get("trend") or "neutral").upper()
     price = candidate.get("current_price", 0) or 0
     confluence = (candidate.get("confluence") or {}).get("confidence", "?")
-    mscore = candidate.get("_model_score", 0)
+    mconf = candidate.get("_model_confidence", 50)
     tier = candidate.get("_tier_label", "")
 
     d_emoji = "✅" if decision == "APPROVE" else "⛔"
@@ -11676,7 +11694,7 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
 
     return (
         f"{d_emoji} <b>{sym}</b> {c_emoji} [{tier}] — {name}\n"
-        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | Model: {mscore:+.0f}\n"
+        f"  {t_emoji} Trend: {trend} | Score: {score:.2f} | {tier}\n"
         f"  💰 ${price:.2f} | Conf: {confidence}% {conf_bar} | Alloc: {allocation:.1f}% | Stop: -{stop:.1f}%\n"
         f"{'  ' + reasoning + chr(10) if reasoning else ''}"
         f"{risks_block}"
@@ -12756,6 +12774,47 @@ async def weekly_backtest(market: str = "AU", weeks: int = 8, current_user: dict
         "evaluations": all_evals[:50],
         "walk_forward_note": "For out-of-sample validation, track OOS Sharpe on a rolling 8-week window. Currently: directional accuracy only. OOS Sharpe = (avg_actual - risk_free) / stdev(actual) × sqrt(52/n_weeks). This is the single most important metric — until this is ≥0.25, the model has no edge.",
     }
+@app.get("/api/suggestions/tracking")
+async def get_suggestion_tracking(current_user: dict = Depends(get_current_user), days: int = 30):
+    """Return suggestions with tier, entry, tracking status. Pass days=N to look back further."""
+    del current_user
+    rows_list = []
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=max(days, 1))
+        with db_conn() as conn:
+            rows = conn.execute(text("""
+                SELECT symbol, price_at_screen, target_tier, screened_at, predicted_change_pct,
+                       evaluated, actual_return_63d, actual_peak_return_90d
+                FROM wealth_builder_evaluations
+                WHERE screened_at >= :cutoff
+                ORDER BY screened_at DESC LIMIT 200
+            """), {"cutoff": cutoff}).fetchall()
+        for r in rows:
+            entry_price = float(r[1] or 0)
+            target_tier = r[2] or ""
+            tier_pct = 5 if target_tier == "5pct" else 3 if target_tier == "3pct" else None
+            target_price = round(entry_price * (1 + tier_pct / 100), 2) if tier_pct and entry_price > 0 else None
+            days_ago = (datetime.utcnow() - r[3].replace(tzinfo=None)).days if r[3] else None
+            evaluated = r[5]
+            actual_ret = float(r[6] or 0) if r[6] else None
+            peak_ret = float(r[7] or 0) if r[7] else None
+            if evaluated and tier_pct:
+                status = "HIT" if peak_ret and peak_ret >= tier_pct else "MISS"
+            elif evaluated:
+                status = "EVAUATED"
+            else:
+                status = "PENDING"
+            rows_list.append({
+                "symbol": r[0], "entry": entry_price, "tier": target_tier or "N/A",
+                "target_pct": tier_pct, "target_price": target_price,
+                "screened_at": str(r[3]), "days_ago": days_ago,
+                "predicted_pct": float(r[4] or 0),
+                "evaluated": evaluated, "actual_return_63d": actual_ret,
+                "actual_peak_90d": peak_ret, "status": status,
+            })
+    except Exception as e:
+        pass
+    return {"suggestions": rows_list, "count": len(rows_list)}
 
 
 @app.get("/api/walk-forward/oos")

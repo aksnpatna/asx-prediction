@@ -11555,11 +11555,18 @@ async def wealth_builder_evaluate_historical(
                 continue
             current_p = price if price else 1.0
             days_passed = (datetime.utcnow() - at_date.replace(tzinfo=None)).days if isinstance(at_date, datetime) else 0
-            actual_14d = round((float(prices_after["Close"].iloc[min(14, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 14 and days_passed >= 14 else None
-            actual_30d = round((float(prices_after["Close"].iloc[min(30, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 30 and days_passed >= 30 else None
-            actual_63d = round((float(prices_after["Close"].iloc[min(63, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 63 and days_passed >= 63 else None
-            actual_90d = round((float(prices_after["Close"].iloc[min(90, len(prices_after)) - 1]) / current_p - 1) * 100, 2) if len(prices_after) >= 90 and days_passed >= 90 else None
-            peak_ret = round((float(prices_after["Close"].max()) / current_p - 1) * 100, 2) if days_passed >= 14 else None
+
+            # Peak-within-window returns (a stock that hits +5% on day 3 IS a hit at 14d)
+            peak_14d = float(prices_after["Close"].iloc[:min(14, len(prices_after))].max()) if len(prices_after) >= 3 else None
+            peak_30d = float(prices_after["Close"].iloc[:min(30, len(prices_after))].max()) if len(prices_after) >= 3 else None
+            peak_63d = float(prices_after["Close"].iloc[:min(63, len(prices_after))].max()) if len(prices_after) >= 3 else None
+            peak_90d = float(prices_after["Close"].max()) if len(prices_after) >= 3 else None
+
+            actual_14d = round((peak_14d / current_p - 1) * 100, 2) if peak_14d and days_passed >= 14 else None
+            actual_30d = round((peak_30d / current_p - 1) * 100, 2) if peak_30d and days_passed >= 30 else None
+            actual_63d = round((peak_63d / current_p - 1) * 100, 2) if peak_63d and days_passed >= 63 else None
+            actual_90d = round((peak_90d / current_p - 1) * 100, 2) if peak_90d and days_passed >= 90 else None
+            peak_ret = round((peak_90d / current_p - 1) * 100, 2) if peak_90d and days_passed >= 14 else None
             max_dd = round((float(prices_after["Close"].min()) / current_p - 1) * 100, 2) if days_passed >= 14 else None
 
             # Incremental: only fill NULL columns
@@ -12855,9 +12862,10 @@ async def get_suggestion_tracking(current_user: dict = Depends(get_current_user)
             actual_ret = float(r[6] or 0) if r[6] else None
             peak_ret = float(r[7] or 0) if r[7] else None
             if evaluated and tier_pct:
+                # Hit if peak within 90 days reached the tier target
                 status = "HIT" if peak_ret and peak_ret >= tier_pct else "MISS"
             elif evaluated:
-                status = "EVAUATED"
+                status = "EVALUATED"
             else:
                 status = "PENDING"
             rows_list.append({
@@ -13409,7 +13417,7 @@ if SCHEDULER_AVAILABLE:
         )
         scheduler.add_job(
             _scheduled_wealth_builder_evaluate, "cron",
-            minute=30, hour=8,
+            minute=5, hour=16,
             day_of_week="mon-fri",
             id="wealth_builder_evaluate",
             max_instances=1,

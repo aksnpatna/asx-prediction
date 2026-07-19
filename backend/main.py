@@ -1787,6 +1787,103 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO-AWARE POSITION SIZING — Fixed-Fractional + Equal Allocation + ASX Rules
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PORTFOLIO_STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "30000"))
+PORTFOLIO_RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))
+PORTFOLIO_MAX_SECTOR_PCT = float(os.getenv("MAX_SECTOR_PCT", "25"))
+PORTFOLIO_MAX_ADV_PCT = float(os.getenv("MAX_ADV_PCT", "5"))
+PORTFOLIO_ASX_MIN_PARCEL = float(os.getenv("ASX_MIN_PARCEL", "500"))
+
+
+def _compute_portfolio_state() -> dict:
+    try:
+        with db_conn() as conn:
+            closed_pnl = conn.execute(text(
+                "SELECT COALESCE(SUM(current_pnl),0) FROM paper_trades WHERE status='closed'"
+            )).fetchone()
+            open_rows = conn.execute(text(
+                "SELECT symbol, COALESCE(entry_price,0)*COALESCE(qty,0) AS cost "
+                "FROM paper_trades WHERE status='open'"
+            )).fetchall()
+        total_pnl = float(closed_pnl[0] or 0)
+        invested = sum(float(r[1] or 0) for r in open_rows)
+        equity = PORTFOLIO_STARTING_CAPITAL + total_pnl
+        available = equity - invested
+        return {
+            "starting_capital": PORTFOLIO_STARTING_CAPITAL,
+            "total_equity": round(equity, 2),
+            "invested": round(invested, 2),
+            "available_cash": round(available, 2),
+            "realized_pnl": round(total_pnl, 2),
+        }
+    except Exception:
+        return {"total_equity": PORTFOLIO_STARTING_CAPITAL, "available_cash": PORTFOLIO_STARTING_CAPITAL,
+                "invested": 0, "realized_pnl": 0}
+
+
+def _get_sector_exposure() -> dict:
+    try:
+        with db_conn() as conn:
+            open_syms = conn.execute(text(
+                "SELECT symbol FROM paper_trades WHERE status='open'"
+            )).fetchall()
+    except Exception:
+        return {}
+    exposures = {}
+    for (sym,) in open_syms:
+        try:
+            val = get_valuation_metrics(sym)
+            sector = str(val.get("sector", "Unknown"))
+            exposures[sector] = exposures.get(sector, 0) + 1
+        except Exception:
+            exposures["Unknown"] = exposures.get("Unknown", 0) + 1
+    return exposures
+
+
+def _calculate_position_size(price: float, stop_loss_pct: float, account_balance: float,
+                              num_picks: int = 5, avg_volume: int = 0,
+                              current_sector_exposure: dict = None,
+                              candidate_sector: str = "Unknown") -> dict:
+    risk_pct = PORTFOLIO_RISK_PER_TRADE_PCT / 100.0
+    max_risk_amount = account_balance * risk_pct
+    risk_per_share = abs(price * stop_loss_pct / 100.0)
+    if risk_per_share <= 0:
+        risk_per_share = 0.01
+
+    qty_by_risk = int(max_risk_amount / risk_per_share)
+    cost_by_risk = qty_by_risk * price
+
+    max_per_stock = account_balance / max(num_picks, 1)
+    qty_by_cap = int(max_per_stock / price) if price > 0 else 0
+
+    qty = min(qty_by_risk, qty_by_cap)
+    cost = qty * price
+
+    warnings = []
+    if current_sector_exposure and candidate_sector:
+        sector_count = current_sector_exposure.get(candidate_sector, 0)
+        sector_max_picks = int(num_picks * PORTFOLIO_MAX_SECTOR_PCT / 100)
+        if sector_count >= sector_max_picks:
+            warnings.append(f"Sector cap: {candidate_sector} at {sector_count}/{sector_max_picks} positions")
+    if cost < PORTFOLIO_ASX_MIN_PARCEL:
+        warnings.append(f"Below ASX ${PORTFOLIO_ASX_MIN_PARCEL:.0f} minimum parcel")
+    if avg_volume > 0 and qty > avg_volume * PORTFOLIO_MAX_ADV_PCT / 100:
+        warnings.append(f"Exceeds {PORTFOLIO_MAX_ADV_PCT:.0f}% ADV")
+
+    return {
+        "qty": max(qty, 0),
+        "cost": round(cost, 2),
+        "risk_per_share": round(risk_per_share, 4),
+        "risk_amount": round(qty * risk_per_share, 2),
+        "pct_of_account": round(cost / account_balance * 100, 1) if account_balance > 0 else 0,
+        "stop_price": round(price * (1 + stop_loss_pct / 100), 2) if stop_loss_pct < 0 else round(price * (1 - stop_loss_pct / 100), 2),
+        "warnings": warnings,
+    }
+
+
 def _enrich_candidates_with_tiers(candidates: list):
     """Compute 41-feature model score and assign target tier to each candidate.
 
@@ -11878,9 +11975,14 @@ def _scheduled_daily_ai_pipeline():
     except Exception as e:
         print(f"[DailyAI] Broadcast failed: {e}")
 
-    # 7. Send per-stock Buy buttons for AI-APPROVED stocks
+    # 7. Send per-stock Buy buttons for AI-APPROVED stocks (portfolio-aware sizing)
     if approved:
-        print(f"[DailyAI] Sending Buy alerts for {len(approved)} AI-approved stocks...")
+        pf = _compute_portfolio_state()
+        sector_exp = _get_sector_exposure()
+        num_approved = len(approved)
+        available_capital = pf["available_cash"]
+        print(f"[DailyAI] Portfolio: ${available_capital:.0f} available, {num_approved} approved. Sending Buy alerts...")
+
         try:
             with db_conn() as conn:
                 post_users = conn.execute(text("SELECT id FROM users")).fetchall()
@@ -11900,17 +12002,38 @@ def _scheduled_daily_ai_pipeline():
                 if has_digest_been_sent(uid, market, digest_key):
                     continue
                 price = float(cand.get("current_price", 1) or 1)
-                qty = int(2500 / price) if price > 0 else 1
+                stop_pct = float(a.get("stop_loss_pct", 10) or 10)
+                adv = int(cand.get("avg_volume", 0) or 0)
+                sector = str((cand.get("valuation") or {}).get("sector",
+                           cand.get("sector", "Unknown")))
+
+                size = _calculate_position_size(
+                    price=price, stop_loss_pct=-abs(stop_pct),
+                    account_balance=available_capital, num_picks=num_approved,
+                    avg_volume=int(adv), current_sector_exposure=sector_exp,
+                    candidate_sector=sector,
+                )
+                qty = size["qty"]
+                cost = size["cost"]
+                risk = size["risk_amount"]
+                stop_p = size["stop_price"]
+
+                warn_note = ""
+                if size["warnings"]:
+                    warn_note = "\n⚠️ " + ", ".join(size["warnings"])
+
                 buy_msg = (
                     f"<b>✅ AI-APPROVED — {tier}</b>\n"
                     f"{sym} — {cand.get('name', sym)}\n\n"
                     f"{'🚀' if is_5pct else '📈'} <b>Target: {'+5%' if is_5pct else '+3%'} (2:1 R:R)</b>\n"
-                    f"💰 Price: ${price:.2f} | Conf: {a.get('confidence',0)}% | Stop: -{a.get('stop_loss_pct',0):.1f}%\n"
-                    f"📊 Allocation: {a.get('allocation_pct',0):.1f}% | Position: ~${2500:.0f}\n\n"
-                    f"<i>AI analysis: {a.get('reasoning','')[:150]}...</i>"
+                    f"💰 Price: ${price:.2f} | Stop: ${stop_p:.2f} (-{abs(stop_pct):.1f}%)\n"
+                    f"📊 {qty} shares = ${cost:.0f} ({size['pct_of_account']}% of portfolio)\n"
+                    f"🎯 Risk: ${risk:.0f} ({PORTFOLIO_RISK_PER_TRADE_PCT}% of capital per trade)\n"
+                    f"💼 Portfolio: ${available_capital:.0f} available | {num_approved} picks today{warn_note}\n\n"
+                    f"<i>AI: {a.get('reasoning','')[:120]}...</i>"
                 )
                 kb = {"inline_keyboard": [[
-                    {"text": f"🚀 Buy {qty} shares (~$2500)",
+                    {"text": f"🚀 Buy {qty} shares (~${cost:.0f})",
                      "callback_data": f"buy_{sym}_{qty}"}
                 ]]}
                 _send_telegram_payload(

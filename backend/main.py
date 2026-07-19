@@ -1924,8 +1924,11 @@ def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: 
         f"  Target: ${valuation.get('analyst_target_mean') or 'N/A'}\n\n"
         f"<b>📅 Earnings:</b> {valuation.get('next_earnings_date', 'N/A')}\n"
         f"<b>🚨 AI Note:</b> Verify NO upcoming earnings, NO unadjusted splits, "
-        f"and beware 'Fat Tail' micro-cap risk before entry.\n"
-        f"<b>📏 Position size:</b> {'~30% of capital allocation' if is_5pct else '~70% of capital allocation'}"
+        f"and beware 'Fat Tail' micro-cap risk before entry.\n\n"
+        f"<b>⏰ AI Review at 7:00 AM — do NOT buy yet.</b> "
+        f"6-persona AI will approve or reject. "
+        f"Buy button sent at 7 AM for AI-approved stocks.\n"
+        f"📏 Position size: {'~30% of capital' if is_5pct else '~70% of capital'}"
     )
 
 
@@ -10760,18 +10763,11 @@ def _scheduled_uat_health_report():
                         hc.get("valuation", {}), hc.get("prediction", {}),
                         hc.get("entry_timing", {}), tier_label=hc.get("_tier_label", "")
                     )
-                    price = hc.get("current_price", 1)
-                    qty = int(2500 / price) if price > 0 else 1
-                    kb = {"inline_keyboard": [[
-                        {"text": f"🚀 Buy {qty} shares (~$2500)",
-                         "callback_data": f"buy_{hc['symbol']}_{qty}"}
-                    ]]}
                     _send_telegram_payload(
                         msg, recipients, user_id=uid, message_type="daily_digest",
-                        market="AU", digest_key=digest_key, source="broad_scan_tiered",
-                        reply_markup=kb
+                        market="AU", digest_key=digest_key, source="broad_scan_tiered"
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.2)
     except Exception as e:
         print(f"[BroadScan] Auto-alerting failed: {e}")
 
@@ -11856,6 +11852,48 @@ def _scheduled_daily_ai_pipeline():
                 )
     except Exception as e:
         print(f"[DailyAI] Broadcast failed: {e}")
+
+    # 7. Send per-stock Buy buttons for AI-APPROVED stocks
+    if approved:
+        print(f"[DailyAI] Sending Buy alerts for {len(approved)} AI-approved stocks...")
+        try:
+            with db_conn() as conn:
+                post_users = conn.execute(text("SELECT id FROM users")).fetchall()
+        except Exception:
+            post_users = []
+        for user in post_users:
+            uid = user[0]
+            recipients = get_user_telegram_recipients(uid)
+            if not recipients:
+                continue
+            for a in approved:
+                cand = a.get("candidate", {})
+                sym = a.get("symbol", "???")
+                tier = cand.get("_tier_label", "")
+                is_5pct = "5%" in tier
+                digest_key = f"ai_buy_{sym}_{today_key}"
+                if has_digest_been_sent(uid, market, digest_key):
+                    continue
+                price = float(cand.get("current_price", 1) or 1)
+                qty = int(2500 / price) if price > 0 else 1
+                buy_msg = (
+                    f"<b>✅ AI-APPROVED — {tier}</b>\n"
+                    f"{sym} — {cand.get('name', sym)}\n\n"
+                    f"{'🚀' if is_5pct else '📈'} <b>Target: {'+5%' if is_5pct else '+3%'} (2:1 R:R)</b>\n"
+                    f"💰 Price: ${price:.2f} | Conf: {a.get('confidence',0)}% | Stop: -{a.get('stop_loss_pct',0):.1f}%\n"
+                    f"📊 Allocation: {a.get('allocation_pct',0):.1f}% | Position: ~${2500:.0f}\n\n"
+                    f"<i>AI analysis: {a.get('reasoning','')[:150]}...</i>"
+                )
+                kb = {"inline_keyboard": [[
+                    {"text": f"🚀 Buy {qty} shares (~$2500)",
+                     "callback_data": f"buy_{sym}_{qty}"}
+                ]]}
+                _send_telegram_payload(
+                    buy_msg, recipients, user_id=uid, message_type="daily_digest",
+                    market=market, digest_key=digest_key, source="ai_approved_buy",
+                    reply_markup=kb
+                )
+                time.sleep(0.3)
 
     try:
         with db_conn() as conn:

@@ -10423,6 +10423,189 @@ def _scheduled_broad_scan_precompute():
     wfo = get_current_wfo_state()
     wfo_state = wfo["state"]
     gate = _wfo_position_gate()
+    # In UAT mode, cap reduces to 30 to stay within EODHD 20 calls/min free tier
+    # and Groq 30 req/min limits.
+    import time as _sleep_time
+    market = "AU"
+    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "1200"))
+    if UAT_MODE:
+        broad_scan_cap = min(broad_scan_cap, 30)
+        _EODHD_MIN_INTERVAL_INTERNAL = 3.0
+    else:
+        _EODHD_MIN_INTERVAL_INTERNAL = _EODHD_MIN_INTERVAL
+    full_universe = get_asx_universe()  # up to 1,600+ with EODHD, 257 without
+    all_symbols = list(full_universe.keys())
+    # BROAD_SCAN_CAP=0 means unlimited — scan full universe
+    if broad_scan_cap <= 0:
+        broad_scan_cap = len(all_symbols)
+    # Guarantee priority stocks (large/mid cap and hardcoded) are always included
+    priority_symbols = set()
+    # Add large/mid caps
+    for cap_type in ["large_cap", "mid_cap", "etf", "crypto"]:
+        for sym in WEEKLY_UNIVERSE.get("AU", {}).get(cap_type, []):
+            priority_symbols.add(sym)
+            
+    # Add curated ASX_COMPANIES
+    for sym in ASX_COMPANIES.keys():
+        priority_symbols.add(sym)
+        
+    priority_pool = list(priority_symbols)
+    
+    # Remaining universe (strictly exclude non-ordinary shares/hybrids with length > 3)
+    remaining_pool = [s for s in all_symbols if s not in priority_symbols and len(s) <= 3]
+    random.shuffle(remaining_pool)
+    
+    # Combine (Priority first, then shuffled remaining up to cap)
+    symbol_pool = priority_pool + remaining_pool
+    symbol_pool = symbol_pool[:broad_scan_cap]
+
+    # Skip tickers known to have no yfinance price data (delisted / no history)
+    _yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
+    yfinance_dead = set()
+    if os.path.exists(_yf_dead_path):
+        with open(_yf_dead_path) as _f:
+            yfinance_dead = set(line.strip() for line in _f if line.strip())
+    symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
+    if yfinance_dead:
+        print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")
+
+    scanned = 0
+    candidates = []
+
+    scan_start = datetime.utcnow()
+    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
+
+    new_dead = set()
+    for sym in symbol_pool:
+        try:
+            result = _score_wealth_candidate(sym, market)
+            scanned += 1
+            if result:
+                if (result.get("score") or 0) >= 35.0:
+                    candidates.append(result)
+            else:
+                new_dead.add(sym)
+            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits.
+            # At ~1,600 stocks this takes ~8 min — well under Yahoo's ~2,000/hr threshold.
+            _sleep_time.sleep(0.3)
+        except Exception:
+            new_dead.add(sym)
+
+    # Persist dead tickers so next scan skips them
+    if new_dead:
+        yfinance_dead |= new_dead
+        with open(_yf_dead_path, "w") as _f:
+            _f.write("\n".join(sorted(yfinance_dead)) + "\n")
+        print(f"[BroadScan] {len(new_dead)} additional tickers failed — cached for future skip")
+
+    # Sort by wealth_rank descending
+    candidates.sort(key=lambda x: x.get("wealth_rank", 0) or x.get("score", 0), reverse=True)
+
+    # Apply Sector Concentration Cap (Max 15 per sector to enforce diversification)
+    # ── Sector diversification ──────────────────────────────────────────────
+    sector_counts = {}
+    diversified_candidates = []
+    for c in candidates:
+        sector = (c.get("valuation_metrics") or {}).get("sector", "Unknown")
+        if sector_counts.get(sector, 0) < 15:
+            diversified_candidates.append(c)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+    candidates = diversified_candidates
+
+    # ── Model tier classification (before DB write, so AI pipeline can read tiers) ──
+    _enrich_candidates_with_tiers(candidates)
+
+    try:
+        with db_conn() as conn:
+            did = str(uuid4())
+            picks_json = json.dumps(candidates)
+            conn.execute(text("""
+                INSERT INTO wealth_scan_cache (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
+                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
+            """), {
+                "id": did,
+                "market": market,
+                "mode": "broad",
+                "scanned": scanned,
+                "found": len(candidates),
+                "picks": picks_json,
+            })
+            conn.execute(text("""
+                INSERT INTO wealth_scan_history (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
+                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
+            """), {
+                "id": did,
+                "market": market,
+                "mode": "broad",
+                "scanned": scanned,
+                "found": len(candidates),
+                "picks": picks_json,
+            })
+            now_ts = datetime.utcnow()
+            for c in candidates:
+                conn.execute(text("""
+                    INSERT INTO wealth_builder_evaluations
+                        (symbol, market, wealth_rank, score, prob_ge_5pct,
+                         predicted_change_pct, price_at_screen,
+                         entry_zone, target_tier, model_score, screened_at)
+                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :tt, :ms, :at)
+                    ON CONFLICT (symbol, screened_at) DO NOTHING
+                """), {
+                    "symbol": c.get("symbol", ""),
+                    "market": market,
+                    "wr": c.get("wealth_rank"),
+                    "sc": c.get("score"),
+                    "p5": c.get("prob_ge_5pct"),
+                    "pc": c.get("predicted_change_pct"),
+                    "pas": c.get("current_price"),
+                    "ez": (c.get("entry_timing") or {}).get("entry_zone", ""),
+                    "tt": c.get("_target_tier", ""),
+                    "ms": c.get("_model_score", 0),
+                    "at": now_ts,
+                })
+    except Exception as e:
+        print(f"[BroadScan] DB write failed: {e}")
+
+    # --- Auto-send Telegram Alerts for Model-Tiered Signals ---
+    try:
+        tier5 = [c for c in candidates if c.get("_target_tier") == "5pct"]
+        tier3 = [c for c in candidates if c.get("_target_tier") == "3pct"]
+        print(f"[BroadScan] Model tiers: {len(tier5)}×5%, {len(tier3)}×3%, "
+              f"{len(candidates)-len(tier5)-len(tier3)}×watch")
+
+        today_key = datetime.utcnow().date().isoformat()
+        with db_conn() as conn:
+            users = conn.execute(text("SELECT id FROM users")).fetchall()
+
+        for tier_set, tier_label in [(tier5, "🎯 5% TARGET TIER"), (tier3, "📈 3% COMPOUND TIER")]:
+            if not tier_set:
+                continue
+            for user in users:
+                uid = user[0]
+                recipients = get_user_telegram_recipients(uid)
+                if not recipients:
+                    continue
+                for hc in tier_set:
+                    sym = hc["symbol"]
+                    digest_key = f"auto_tier_{sym}_{today_key}"
+                    if has_digest_been_sent(uid, "AU", digest_key):
+                        continue
+                    msg = _build_tier_signal_message(
+                        hc["symbol"], hc.get("name", ""), hc,
+                        hc.get("valuation", {}), hc.get("prediction", {}),
+                        hc.get("entry_timing", {}), tier_label=hc.get("_tier_label", "")
+                    )
+                    _send_telegram_payload(
+                        msg, recipients, user_id=uid, message_type="daily_digest",
+                        market="AU", digest_key=digest_key, source="broad_scan_tiered"
+                    )
+                    time.sleep(0.2)
+    except Exception as e:
+        print(f"[BroadScan] Auto-alerting failed: {e}")
+
+    duration = (datetime.utcnow() - scan_start).total_seconds()
+    print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s. Sent auto-alerts if any.")
     print(f"[BroadScan] WFO gate: {wfo_state} — {gate['reason']}")
 
 
@@ -10687,189 +10870,6 @@ def _scheduled_uat_health_report():
     # ── Expanded universe via EODHD (falls back to hardcoded if key not set) ──
     # BROAD_SCAN_CAP caps the number of tickers per run so a mini-PC (6800H)
     # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
-    # In UAT mode, cap reduces to 30 to stay within EODHD 20 calls/min free tier
-    # and Groq 30 req/min limits.
-    import time as _sleep_time
-    market = "AU"
-    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "1200"))
-    if UAT_MODE:
-        broad_scan_cap = min(broad_scan_cap, 30)
-        _EODHD_MIN_INTERVAL_INTERNAL = 3.0
-    else:
-        _EODHD_MIN_INTERVAL_INTERNAL = _EODHD_MIN_INTERVAL
-    full_universe = get_asx_universe()  # up to 1,600+ with EODHD, 257 without
-    all_symbols = list(full_universe.keys())
-    # BROAD_SCAN_CAP=0 means unlimited — scan full universe
-    if broad_scan_cap <= 0:
-        broad_scan_cap = len(all_symbols)
-    # Guarantee priority stocks (large/mid cap and hardcoded) are always included
-    priority_symbols = set()
-    # Add large/mid caps
-    for cap_type in ["large_cap", "mid_cap", "etf", "crypto"]:
-        for sym in WEEKLY_UNIVERSE.get("AU", {}).get(cap_type, []):
-            priority_symbols.add(sym)
-            
-    # Add curated ASX_COMPANIES
-    for sym in ASX_COMPANIES.keys():
-        priority_symbols.add(sym)
-        
-    priority_pool = list(priority_symbols)
-    
-    # Remaining universe (strictly exclude non-ordinary shares/hybrids with length > 3)
-    remaining_pool = [s for s in all_symbols if s not in priority_symbols and len(s) <= 3]
-    random.shuffle(remaining_pool)
-    
-    # Combine (Priority first, then shuffled remaining up to cap)
-    symbol_pool = priority_pool + remaining_pool
-    symbol_pool = symbol_pool[:broad_scan_cap]
-
-    # Skip tickers known to have no yfinance price data (delisted / no history)
-    _yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
-    yfinance_dead = set()
-    if os.path.exists(_yf_dead_path):
-        with open(_yf_dead_path) as _f:
-            yfinance_dead = set(line.strip() for line in _f if line.strip())
-    symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
-    if yfinance_dead:
-        print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")
-
-    scanned = 0
-    candidates = []
-
-    scan_start = datetime.utcnow()
-    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
-
-    new_dead = set()
-    for sym in symbol_pool:
-        try:
-            result = _score_wealth_candidate(sym, market)
-            scanned += 1
-            if result:
-                if (result.get("score") or 0) >= 35.0:
-                    candidates.append(result)
-            else:
-                new_dead.add(sym)
-            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits.
-            # At ~1,600 stocks this takes ~8 min — well under Yahoo's ~2,000/hr threshold.
-            _sleep_time.sleep(0.3)
-        except Exception:
-            new_dead.add(sym)
-
-    # Persist dead tickers so next scan skips them
-    if new_dead:
-        yfinance_dead |= new_dead
-        with open(_yf_dead_path, "w") as _f:
-            _f.write("\n".join(sorted(yfinance_dead)) + "\n")
-        print(f"[BroadScan] {len(new_dead)} additional tickers failed — cached for future skip")
-
-    # Sort by wealth_rank descending
-    candidates.sort(key=lambda x: x.get("wealth_rank", 0) or x.get("score", 0), reverse=True)
-
-    # Apply Sector Concentration Cap (Max 15 per sector to enforce diversification)
-    # ── Sector diversification ──────────────────────────────────────────────
-    sector_counts = {}
-    diversified_candidates = []
-    for c in candidates:
-        sector = (c.get("valuation_metrics") or {}).get("sector", "Unknown")
-        if sector_counts.get(sector, 0) < 15:
-            diversified_candidates.append(c)
-            sector_counts[sector] = sector_counts.get(sector, 0) + 1
-
-    candidates = diversified_candidates
-
-    # ── Model tier classification (before DB write, so AI pipeline can read tiers) ──
-    _enrich_candidates_with_tiers(candidates)
-
-    try:
-        with db_conn() as conn:
-            did = str(uuid4())
-            picks_json = json.dumps(candidates)
-            conn.execute(text("""
-                INSERT INTO wealth_scan_cache (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
-                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
-            """), {
-                "id": did,
-                "market": market,
-                "mode": "broad",
-                "scanned": scanned,
-                "found": len(candidates),
-                "picks": picks_json,
-            })
-            conn.execute(text("""
-                INSERT INTO wealth_scan_history (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
-                VALUES (:id, :market, :mode, :scanned, :found, :picks, CURRENT_TIMESTAMP)
-            """), {
-                "id": did,
-                "market": market,
-                "mode": "broad",
-                "scanned": scanned,
-                "found": len(candidates),
-                "picks": picks_json,
-            })
-            now_ts = datetime.utcnow()
-            for c in candidates:
-                conn.execute(text("""
-                    INSERT INTO wealth_builder_evaluations
-                        (symbol, market, wealth_rank, score, prob_ge_5pct,
-                         predicted_change_pct, price_at_screen,
-                         entry_zone, target_tier, model_score, screened_at)
-                    VALUES (:symbol, :market, :wr, :sc, :p5, :pc, :pas, :ez, :tt, :ms, :at)
-                    ON CONFLICT (symbol, screened_at) DO NOTHING
-                """), {
-                    "symbol": c.get("symbol", ""),
-                    "market": market,
-                    "wr": c.get("wealth_rank"),
-                    "sc": c.get("score"),
-                    "p5": c.get("prob_ge_5pct"),
-                    "pc": c.get("predicted_change_pct"),
-                    "pas": c.get("current_price"),
-                    "ez": (c.get("entry_timing") or {}).get("entry_zone", ""),
-                    "tt": c.get("_target_tier", ""),
-                    "ms": c.get("_model_score", 0),
-                    "at": now_ts,
-                })
-    except Exception as e:
-        print(f"[BroadScan] DB write failed: {e}")
-
-    # --- Auto-send Telegram Alerts for Model-Tiered Signals ---
-    try:
-        tier5 = [c for c in candidates if c.get("_target_tier") == "5pct"]
-        tier3 = [c for c in candidates if c.get("_target_tier") == "3pct"]
-        print(f"[BroadScan] Model tiers: {len(tier5)}×5%, {len(tier3)}×3%, "
-              f"{len(candidates)-len(tier5)-len(tier3)}×watch")
-
-        today_key = datetime.utcnow().date().isoformat()
-        with db_conn() as conn:
-            users = conn.execute(text("SELECT id FROM users")).fetchall()
-
-        for tier_set, tier_label in [(tier5, "🎯 5% TARGET TIER"), (tier3, "📈 3% COMPOUND TIER")]:
-            if not tier_set:
-                continue
-            for user in users:
-                uid = user[0]
-                recipients = get_user_telegram_recipients(uid)
-                if not recipients:
-                    continue
-                for hc in tier_set:
-                    sym = hc["symbol"]
-                    digest_key = f"auto_tier_{sym}_{today_key}"
-                    if has_digest_been_sent(uid, "AU", digest_key):
-                        continue
-                    msg = _build_tier_signal_message(
-                        hc["symbol"], hc.get("name", ""), hc,
-                        hc.get("valuation", {}), hc.get("prediction", {}),
-                        hc.get("entry_timing", {}), tier_label=hc.get("_tier_label", "")
-                    )
-                    _send_telegram_payload(
-                        msg, recipients, user_id=uid, message_type="daily_digest",
-                        market="AU", digest_key=digest_key, source="broad_scan_tiered"
-                    )
-                    time.sleep(0.2)
-    except Exception as e:
-        print(f"[BroadScan] Auto-alerting failed: {e}")
-
-    duration = (datetime.utcnow() - scan_start).total_seconds()
-    print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s. Sent auto-alerts if any.")
 
 
 def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):

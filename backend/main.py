@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import macro_model
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from zoneinfo import ZoneInfo
 
@@ -1970,7 +1970,7 @@ def _enrich_candidates_with_tiers(candidates: list):
         if model_score_raw >= 91:
             c["_target_tier"] = "5pct"
             c["_tier_label"] = "🎯 5% TARGET TIER"
-        elif model_score >= 16:
+        elif model_score_raw >= 16:
             c["_target_tier"] = "3pct"
             c["_tier_label"] = "📈 3% COMPOUND TIER"
         else:
@@ -10485,9 +10485,6 @@ def _scheduled_broad_scan_precompute():
                     candidates.append(result)
             else:
                 new_dead.add(sym)
-            # Rate-limit: ~1 call per 300ms = ~3/sec to avoid yfinance rate limits.
-            # At ~1,600 stocks this takes ~8 min — well under Yahoo's ~2,000/hr threshold.
-            _sleep_time.sleep(0.3)
         except Exception:
             new_dead.add(sym)
 

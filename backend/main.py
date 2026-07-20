@@ -13553,7 +13553,7 @@ if SCHEDULER_AVAILABLE:
         )
         scheduler.add_job(
             _scheduled_daily_ai_pipeline, "cron",
-            minute=0, hour=7,
+            minute=15, hour=8,
             day_of_week="mon-fri",
             id="daily_ai_pipeline",
             max_instances=1,
@@ -13581,9 +13581,9 @@ if SCHEDULER_AVAILABLE:
         )
         scheduler.add_job(
             _scheduled_model_training, "cron",
-            minute=0, hour=7,
+            minute=0, hour=8,
             day_of_week="mon-fri",
-            id="model_training_7am",
+            id="model_training_8am",
             max_instances=1,
         )
         scheduler.add_job(

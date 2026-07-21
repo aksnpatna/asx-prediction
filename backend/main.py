@@ -10505,12 +10505,12 @@ def _scheduled_broad_scan_precompute():
     symbol_pool = priority_pool + remaining_pool
     symbol_pool = symbol_pool[:broad_scan_cap]
 
-    # Skip tickers known to have no yfinance price data (delisted / no history)
-#     _yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
-#     yfinance_dead = set()
-#     if os.path.exists(_yf_dead_path):
-#         with open(_yf_dead_path) as _f:
-#             yfinance_dead = set(line.strip() for line in _f if line.strip())
+    # yfinance dead ticker tracking (no longer filters, but tracks new failures)
+    _yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
+    yfinance_dead = set()
+    if os.path.exists(_yf_dead_path):
+        with open(_yf_dead_path) as _f:
+            yfinance_dead = set(line.strip() for line in _f if line.strip())
 #     symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
 #     if yfinance_dead:
 #         print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")

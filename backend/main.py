@@ -10473,7 +10473,7 @@ def _scheduled_broad_scan_precompute():
     # and Groq 30 req/min limits.
     import time as _sleep_time
     market = "AU"
-    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "1200"))
+    broad_scan_cap = int(os.getenv("BROAD_SCAN_CAP", "500"))
     if UAT_MODE:
         broad_scan_cap = min(broad_scan_cap, 30)
         _EODHD_MIN_INTERVAL_INTERNAL = 3.0

@@ -10522,28 +10522,19 @@ def _scheduled_broad_scan_precompute():
     print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
 
     new_dead = set()
-    scan_workers = 3
-    def _score_one(sym):
+    for sym in symbol_pool:
         try:
-            r = _score_wealth_candidate(sym, market)
-            return ("ok", sym, r)
-        except:
-            return ("dead", sym, None)
-    with ThreadPoolExecutor(max_workers=scan_workers) as ex:
-        futs = {ex.submit(_score_one, s): s for s in symbol_pool}
-        for f in as_completed(futs):
-            s = futs[f]
-            try:
-                st, _, r = f.result(timeout=60)
-                scanned += 1
-                if r and (r.get("score") or 0) >= 35.0:
-                    candidates.append(r)
-                elif r is None:
-                    new_dead.add(s)
-                if scanned % 50 == 0:
-                    print(f"[BroadScan] {scanned}/{len(symbol_pool)} processed, {len(candidates)} candidates")
-            except:
-                new_dead.add(s)
+            result = _score_wealth_candidate(sym, market)
+            scanned += 1
+            if result:
+                if (result.get("score") or 0) >= 35.0:
+                    candidates.append(result)
+            else:
+                new_dead.add(sym)
+            if scanned % 50 == 0:
+                print(f"[BroadScan] {scanned}/{len(symbol_pool)} processed, {len(candidates)} candidates")
+        except Exception:
+            new_dead.add(sym)
 
     # Persist dead tickers so next scan skips them
     if new_dead:

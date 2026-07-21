@@ -78,7 +78,7 @@ UAT_MODE = os.getenv("ENV", "production").upper() == "UAT"
 # ── EODHD Rate Limiter (thread-safe token bucket for 20 calls/min free tier) ──
 _EODHD_RATE_LOCK = threading.Lock()
 _EODHD_LAST_CALL = 0.0
-_EODHD_MIN_INTERVAL = 1.5  # 40 calls/min — EODHD free tier handles bursts above 20/min
+_EODHD_MIN_INTERVAL = 0.3  # 200 calls/min — well within 100K/day paid plan
 _YFINANCE_LOCK = threading.Lock()  # yfinance global state is not thread-safe
 
 def _eodhd_rate_limit():

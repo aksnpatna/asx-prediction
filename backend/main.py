@@ -2979,8 +2979,9 @@ def bullish_confluence_score(symbol: str, market: str, indicators: dict, predict
     ch_b = _eval_channel_institutional(indicators, sd, hist)
     channels["institutional"] = ch_b
 
-    # Channel C — Options Market (async-safe, may return unavailable)
-    ch_c = _eval_channel_options(symbol, market)
+    # Channel C — Options Market (skipped for broad scan — most ASX stocks lack ETOs)
+    ch_c = {"channel": "options", "bullish": True, "confidence": 0.0,
+            "signals": ["no_options_data"], "hit_rate": 0.50, "unavailable": True}
     channels["options"] = ch_c
 
     # Channel D — Fundamental Quality
@@ -10530,6 +10531,8 @@ def _scheduled_broad_scan_precompute():
                     candidates.append(result)
             else:
                 new_dead.add(sym)
+            if scanned % 50 == 0:
+                print(f"[BroadScan] {scanned}/{len(symbol_pool)} processed, {len(candidates)} candidates")
         except Exception:
             new_dead.add(sym)
 

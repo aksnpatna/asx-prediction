@@ -3,10 +3,21 @@ import pandas as pd
 import numpy as np
 import os
 import requests
+import threading
+import time as _time
 from datetime import datetime, timedelta
 
+_macro_cache = {}
+_macro_cache_ts = 0.0
+_macro_cache_lock = threading.Lock()
+
 def get_macro_data():
-    """Fetch recent macro indicators for top-down analysis, including FRED rates."""
+    """Fetch recent macro indicators. Cached for 1 hour (thread-safe)."""
+    global _macro_cache, _macro_cache_ts
+    with _macro_cache_lock:
+        if _macro_cache and (_time.time() - _macro_cache_ts) < 3600:
+            return _macro_cache.copy()
+    
     tickers = {
         "aud_usd": "AUDUSD=X",
         "gold": "GC=F",
@@ -54,6 +65,8 @@ def get_macro_data():
         except Exception as e:
             print(f"Error fetching FRED API: {e}")
             
+    _macro_cache = data.copy()
+    _macro_cache_ts = _time.time()
     return data
 
 def calculate_macro_adjustment(sector: str, macro: dict) -> float:

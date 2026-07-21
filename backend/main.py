@@ -10460,6 +10460,11 @@ def _scheduled_broad_scan_precompute():
     start = datetime.utcnow()
     market = "AU"
 
+    if getattr(_scheduled_broad_scan_precompute, "_running", False):
+        print("[BroadScan] Scan already running — skipping duplicate.")
+        return
+    _scheduled_broad_scan_precompute._running = True
+
     wfo = get_current_wfo_state()
     wfo_state = wfo["state"]
     gate = _wfo_position_gate()
@@ -10644,6 +10649,7 @@ def _scheduled_broad_scan_precompute():
     duration = (datetime.utcnow() - scan_start).total_seconds()
     print(f"[BroadScan] Complete: {scanned} scanned, {len(candidates)} candidates in {duration:.0f}s. Sent auto-alerts if any.")
     print(f"[BroadScan] WFO gate: {wfo_state} — {gate['reason']}")
+    _scheduled_broad_scan_precompute._running = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

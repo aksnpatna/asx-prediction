@@ -79,6 +79,7 @@ UAT_MODE = os.getenv("ENV", "production").upper() == "UAT"
 _EODHD_RATE_LOCK = threading.Lock()
 _EODHD_LAST_CALL = 0.0
 _EODHD_MIN_INTERVAL = 1.5  # 40 calls/min — EODHD free tier handles bursts above 20/min
+_YFINANCE_LOCK = threading.Lock()  # yfinance global state is not thread-safe
 
 def _eodhd_rate_limit():
     """Block the calling thread until the EODHD rate-limit window reopens."""
@@ -1331,7 +1332,8 @@ def detect_market(symbol: str) -> str:
         return "IN"
     # Unknown symbol: probe yfinance to see if it trades on ASX before falling back.
     try:
-        probe = yf.Ticker(f"{s}.AX").fast_info
+        with _YFINANCE_LOCK:
+            probe = yf.Ticker(f"{s}.AX").fast_info
         if getattr(probe, "last_price", None) or getattr(probe, "regular_market_price", None):
             return "AU"
     except Exception:
@@ -1484,17 +1486,55 @@ def _eodhd_fundamentals(symbol: str, market: str) -> dict:
         return {}
 
 def get_valuation_metrics(symbol: str) -> dict:
-    """Fetch valuation metrics, preferring EODHD if available, falling back to yfinance."""
+    """Fetch valuation metrics — DB snapshot first, then EODHD, yfinance last."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     market = detect_market(s)
-    
-    # Try EODHD first
+
+    # 1. Try cached monthly fundamental snapshot (fast, no API call)
+    try:
+        from fundamental_feeder import get_fundamentals_for_symbol
+        cached = get_fundamentals_for_symbol(s)
+        if cached and cached.get("trailing_pe") is not None:
+            current_p = 0
+            try:
+                sd = get_stock_data(s, market)
+                current_p = sd.get("current_price", 0) or 0
+            except Exception:
+                pass
+            upside = None
+            if cached.get("analyst_target_mean") and current_p > 0:
+                upside = round((float(cached["analyst_target_mean"]) / current_p - 1) * 100, 2)
+            return {
+                "pe": cached.get("trailing_pe"),
+                "forward_pe": cached.get("forward_pe"),
+                "market_cap": cached.get("market_cap"),
+                "dividend_yield": cached.get("dividend_yield"),
+                "analyst_target_mean": cached.get("analyst_target_mean"),
+                "analyst_upside_pct": upside,
+                "analyst_recommendation": cached.get("analyst_rec", ""),
+                "revenue_growth": cached.get("revenue_growth"),
+                "earnings_growth": cached.get("earnings_growth"),
+                "52w_high": cached.get("high_52w"),
+                "52w_low": cached.get("low_52w"),
+                "pct_from_52w_high": round((current_p / float(cached["high_52w"]) - 1) * 100, 2) if cached.get("high_52w") and current_p > 0 else None,
+                "avg_volume": cached.get("avg_volume"),
+                "beta": cached.get("beta"),
+                "pb": cached.get("price_to_book"),
+                "_source": "db_snapshot",
+            }
+    except Exception:
+        pass
+
+    # 2. Try EODHD fundamentals
     eodhd_data = _eodhd_fundamentals(s, market)
     
-    stock = yf.Ticker(format_ticker(s, market))
+    # 3. Fallback to yfinance (slow, serialized via lock)
+    with _YFINANCE_LOCK:
+        stock = yf.Ticker(format_ticker(s, market))
     
     try:
-        info = stock.info
+        with _YFINANCE_LOCK:
+            info = stock.info
     except:
         info = {}
     

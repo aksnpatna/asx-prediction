@@ -26,7 +26,7 @@ export default function WealthTab({ token, preferredMarket }) {
           setSuggestions(sugRes.value.data?.suggestions || [])
         }
         if (tradesRes.status === 'fulfilled') {
-          setPaperTrades(tradesRes.value.data || [])
+          setPaperTrades(Array.isArray(tradesRes.value.data) ? tradesRes.value.data : (tradesRes.value.data?.items || []))
         }
         if (wfoRes.status === 'fulfilled') {
           setWfo(wfoRes.value.data || null)

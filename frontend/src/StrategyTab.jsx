@@ -45,7 +45,7 @@ export default function StrategyTab({ token, preferredMarket }) {
         }
 
         if (tradesRes.status === 'fulfilled') {
-          setPaperTrades(tradesRes.value.data || [])
+          setPaperTrades(Array.isArray(tradesRes.value.data) ? tradesRes.value.data : (tradesRes.value.data?.items || []))
         } else {
           errors.push('Paper trades failed to load')
         }

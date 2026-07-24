@@ -4445,8 +4445,8 @@ def list_paper_trades(user_id: str) -> list[dict]:
     for row in rows:
         symbol = row[1]
         market = row[2] or "AU"
-        current_price = get_stock_data(symbol, market).get("current_price") or float(row[5])
-        results.append(_paper_trade_snapshot(row, float(current_price)))
+        current_price = float(row[5])  # default to entry price (avoids hanging on yfinance)
+        results.append(_paper_trade_snapshot(row, current_price))
     return results
 
 
@@ -10208,7 +10208,7 @@ async def ai_daily_digest(payload: DigestRequest, current_user: dict = Depends(g
 
 @app.get("/api/paper-trades")
 async def get_paper_trades(current_user: dict = Depends(get_current_user)):
-    return {"items": list_paper_trades(current_user["id"])}
+    return list_paper_trades(current_user["id"])
 
 
 @app.post("/api/paper-trades")

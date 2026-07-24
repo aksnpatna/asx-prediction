@@ -1,5 +1,5 @@
 """Free fundamental data feeder — monthly yfinance snapshots for all ASX tickers.
-
+ 
 Runs first Sunday of each month at 4AM. Single-threaded, low cost.
 Used by model_training.py as additional features (PE, market cap, analyst consensus).
 """
@@ -14,6 +14,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from yfinance_service import YFinanceService
+
 FUNDAMENTAL_FIELDS = [
     "trailingPE", "forwardPE", "marketCap", "dividendYield",
     "targetMeanPrice", "recommendationKey", "revenueGrowth", "earningsGrowth",
@@ -22,67 +24,45 @@ FUNDAMENTAL_FIELDS = [
 ]
 
 
-def fetch_all_fundamentals(market: str = "AU", batch_size: int = 500) -> dict:
+def fetch_all_fundamentals(market: str = "AU", batch_size: int = 800) -> dict:
     """Fetch fundamental data from yfinance for all ASX tickers.
 
-    Skips tickers in yfinance_dead_tickers.txt.
     Rate-limited: 1 call/sec to avoid Yahoo throttling.
+    Split into multiple batches with checkpointing if over batch_size.
     """
-    import yfinance as yf
     from sqlalchemy import text
     from main import db_conn, get_asx_universe
 
     today = date.today()
     snapshot_date = today
 
-    dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
-    dead_set = set()
-    if os.path.exists(dead_path):
-        with open(dead_path) as f:
-            dead_set = set(line.strip() for line in f if line.strip())
-
     full_universe = get_asx_universe()
+    dead_set = YFinanceService.get_dead_set()
     all_symbols = [s for s in full_universe if len(s) <= 3 and s not in dead_set]
-    all_symbols = all_symbols[:batch_size]
 
-    print(f"[FundFeeder] Fetching fundamentals for {len(all_symbols)} ASX tickers...")
+    total_symbols = len(all_symbols)
+    batches = [all_symbols[i:i + batch_size] for i in range(0, total_symbols, batch_size)]
 
-    fetched = 0
-    errors = 0
-    new_dead = set()
+    print(f"[FundFeeder] Fetching fundamentals for {total_symbols} ASX tickers in {len(batches)} batch(es) of {batch_size}...")
 
-    for i, sym in enumerate(all_symbols):
-        try:
-            ticker = yf.Ticker(f"{sym}.AX")
-            info = ticker.info
-            if not info or info.get("trailingPE") is None and info.get("marketCap") is None:
-                new_dead.add(sym)
-                errors += 1
-                continue
+    total_fetched = 0
+    total_errors = 0
 
-            with db_conn() as conn:
-                conn.execute(
-                    text(
-                        """INSERT INTO fundamental_snapshots
-                        (symbol, market, snapshot_date, trailing_pe, forward_pe,
-                         market_cap, dividend_yield, analyst_target_mean,
-                         analyst_rec, revenue_growth, earnings_growth,
-                         price_to_book, beta, high_52w, low_52w,
-                         avg_volume, shares_outstanding)
-                        VALUES (:s,:m,:d,:pe,:fpe,:mc,:dy,:atm,:ar,:rg,:eg,:pb,:b,:h52,:l52,:av,:so)
-                        ON CONFLICT (symbol, snapshot_date) DO UPDATE SET
-                        trailing_pe=EXCLUDED.trailing_pe, forward_pe=EXCLUDED.forward_pe,
-                        market_cap=EXCLUDED.market_cap, dividend_yield=EXCLUDED.dividend_yield,
-                        analyst_target_mean=EXCLUDED.analyst_target_mean,
-                        analyst_rec=EXCLUDED.analyst_rec,
-                        revenue_growth=EXCLUDED.revenue_growth,
-                        earnings_growth=EXCLUDED.earnings_growth,
-                        price_to_book=EXCLUDED.price_to_book, beta=EXCLUDED.beta,
-                        high_52w=EXCLUDED.high_52w, low_52w=EXCLUDED.low_52w,
-                        avg_volume=EXCLUDED.avg_volume, shares_outstanding=EXCLUDED.shares_outstanding
-                    """
-                    ),
-                    {
+    for batch_idx, batch_symbols in enumerate(batches):
+        print(f"[FundFeeder] Batch {batch_idx + 1}/{len(batches)}: {len(batch_symbols)} tickers")
+        fetched = 0
+        errors = 0
+
+        for i, sym in enumerate(batch_symbols):
+            try:
+                info = YFinanceService.get_info(sym)
+                if info is None:
+                    YFinanceService.mark_dead(sym, "NO_DATA")
+                    errors += 1
+                    continue
+
+                with db_conn() as conn:
+                    vals = {
                         "s": sym, "m": market, "d": snapshot_date,
                         "pe": info.get("trailingPE"),
                         "fpe": info.get("forwardPE"),
@@ -98,29 +78,61 @@ def fetch_all_fundamentals(market: str = "AU", batch_size: int = 500) -> dict:
                         "l52": info.get("fiftyTwoWeekLow"),
                         "av": info.get("averageVolume"),
                         "so": info.get("sharesOutstanding"),
-                    },
-                )
-                conn.commit()
-            fetched += 1
+                    }
+                    for k, v in list(vals.items()):
+                        if v is not None and (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf'))):
+                            vals[k] = None
+                    conn.execute(
+                        text(
+                            """INSERT INTO fundamental_snapshots
+                            (symbol, market, snapshot_date, trailing_pe, forward_pe,
+                             market_cap, dividend_yield, analyst_target_mean,
+                             analyst_rec, revenue_growth, earnings_growth,
+                             price_to_book, beta, high_52w, low_52w,
+                             avg_volume, shares_outstanding)
+                            VALUES (:s,:m,:d,:pe,:fpe,:mc,:dy,:atm,:ar,:rg,:eg,:pb,:b,:h52,:l52,:av,:so)
+                            ON CONFLICT (symbol, snapshot_date) DO UPDATE SET
+                            trailing_pe=EXCLUDED.trailing_pe, forward_pe=EXCLUDED.forward_pe,
+                            market_cap=EXCLUDED.market_cap, dividend_yield=EXCLUDED.dividend_yield,
+                            analyst_target_mean=EXCLUDED.analyst_target_mean,
+                            analyst_rec=EXCLUDED.analyst_rec,
+                            revenue_growth=EXCLUDED.revenue_growth,
+                            earnings_growth=EXCLUDED.earnings_growth,
+                            price_to_book=EXCLUDED.price_to_book, beta=EXCLUDED.beta,
+                            high_52w=EXCLUDED.high_52w, low_52w=EXCLUDED.low_52w,
+                            avg_volume=EXCLUDED.avg_volume, shares_outstanding=EXCLUDED.shares_outstanding
+                        """
+                        ),
+                        vals,
+                    )
+                    conn.commit()
+                fetched += 1
 
-            if (i + 1) % 100 == 0:
-                print(f"[FundFeeder] {i+1}/{len(all_symbols)} fetched ({fetched} ok, {errors} err)")
+                if (i + 1) % 100 == 0:
+                    print(f"[FundFeeder] Batch {batch_idx + 1}: {i+1}/{len(batch_symbols)} fetched ({fetched} ok, {errors} err)")
 
-        except Exception as e:
-            errors += 1
-            if errors <= 5:
-                print(f"[FundFeeder] Failed {sym}: {e}")
+            except Exception as e:
+                errors += 1
+                YFinanceService.mark_dead(sym, f"DB_ERROR:{str(e)[:50]}")
+                if errors <= 5:
+                    print(f"[FundFeeder] Failed {sym}: {e}")
 
-        time.sleep(0.5)  # 2 calls/sec — polite to Yahoo
+            time.sleep(0.5)
 
-    if new_dead:
-        dead_set |= new_dead
-        with open(dead_path, "w") as f:
-            f.write("\n".join(sorted(dead_set)) + "\n")
-        print(f"[FundFeeder] {len(new_dead)} additional dead tickers cached.")
+        total_fetched += fetched
+        total_errors += errors
 
-    print(f"[FundFeeder] Complete: {fetched} ok, {errors} errors, {len(new_dead)} dead.")
-    return {"fetched": fetched, "errors": errors, "dead": len(new_dead), "snapshot_date": str(snapshot_date)}
+        dead_stats = YFinanceService.get_dead_stats()
+        print(f"[FundFeeder] Batch {batch_idx + 1} complete: {fetched} ok, {errors} errors. Dead tickers: {dead_stats['total_dead']} total")
+
+        if batch_idx < len(batches) - 1:
+            print(f"[FundFeeder] Checkpoint between batches. Continuing in 5s...")
+            time.sleep(5)
+
+    dead_stats = YFinanceService.get_dead_stats()
+    print(f"[FundFeeder] ALL COMPLETE: {total_fetched} fetched, {total_errors} errors across {total_symbols} tickers. {dead_stats['total_dead']} dead.")
+    return {"fetched": total_fetched, "errors": total_errors, "dead_total": dead_stats['total_dead'],
+            "snapshot_date": str(snapshot_date), "batches": len(batches), "total_tickers": total_symbols}
 
 
 def get_fundamentals_for_symbol(symbol: str, as_of: date = None) -> dict:
@@ -185,7 +197,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["fetch","get"], default="fetch")
     ap.add_argument("--symbol", type=str, default="BHP")
-    ap.add_argument("--batch", type=int, default=500)
+    ap.add_argument("--batch", type=int, default=800)
     args = ap.parse_args()
 
     if args.mode == "fetch":

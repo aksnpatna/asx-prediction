@@ -1,8 +1,8 @@
-"""Model Training — Daily logistic regression pipeline for ASX feature → outcome learning.
+"""Model Training — Daily regression pipeline for ASX feature → outcome learning.
 
 Workflow (called daily by scheduler):
     1. build_training_matrix()    — compute features + outcomes from eod_ohl_history
-    2. fit_model_weights()        — logistic regression: features → hit_3pct label
+    2. fit_model_weights()        — ensemble regression: Ridge + LightGBM + RF
     3. apply_trained_weights()    — persist model coefficients for live prediction
 
 Feature set computed entirely in vectorized pandas (O(n), not O(n²)).
@@ -19,8 +19,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from yfinance_service import YFinanceService
+
 FORWARD_WINDOW_DAYS = 63
-HIT_THRESHOLD_PCT = 3.0
+HIT_THRESHOLD_PCT = 8.0
 MIN_TRAINING_SAMPLES = 200
 
 FEATURE_COLS = [
@@ -37,14 +39,21 @@ FEATURE_COLS = [
     "fund_div_yield", "fund_analyst_upside", "fund_analyst_rec_score",
     "fund_earnings_growth", "fund_revenue_growth", "fund_beta",
     "fund_pct_from_52w_high",
+    # Market regime features
+    "regime_sma_alignment", "vwap_position", "gap_detection",
+    # Volatility structure features
+    "vol_regime_ratio", "garman_klass_vol", "parkinson_vol",
+    # Time-series structure features
+    "autocorr_5d", "skewness_20d", "kurtosis_20d", "max_drawdown_20d",
 ]
 
 
 def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    """Vectorized: compute all 23 features for every row in df in one pass. O(n)."""
+    """Vectorized: compute all features for every row in df in one pass. O(n)."""
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
+    open_ = df["Open"].astype(float)
     vol = df.get("Volume", pd.Series(0, index=df.index)).astype(float)
     n = len(df)
 
@@ -150,13 +159,42 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["rsi_vol_adj"] = fm["rsi"].fillna(50) / (fm["hv_20d"].fillna(0.2) + 1.0)
     fm["mom_per_vol"] = fm["momentum_20d"].fillna(0) / (fm["hv_20d"].fillna(0.2) + 1e-9)
     fm["dist_from_sma50"] = (close - sma50.fillna(close)) / (sma50.fillna(close) + 1e-9) * 100
-    rsi_z = (fm["rsi"].fillna(50) - 50) / fm["rsi"].rolling(63).std().fillna(15)
-    macd_z = fm["macd_hist"].fillna(0) / fm["macd_hist"].rolling(63).std().fillna(0.01)
-    fm["rsi_macd_div"] = rsi_z - macd_z
+    rsi_z = (fm["rsi"].fillna(50) - 50) / (fm["rsi"].rolling(63).std().fillna(15) + 1e-9)
+    macd_z = fm["macd_hist"].fillna(0) / (fm["macd_hist"].rolling(63).std().fillna(0.01) + 1e-9)
+    fm["rsi_macd_div"] = (rsi_z - macd_z).clip(-100, 100)
     fm["vol_confirm"] = fm["volume_spike"].fillna(1) * np.sign(fm["momentum_20d"].fillna(0))
     fm["bb_squeeze_ratio"] = fm["bb_width"].fillna(0.05) / (fm["atr_pct"].fillna(0.01) + 1e-9)
 
-    # Fill NaN values with reasonable defaults (occur before enough data accumulates)
+    # ── Market regime features ────────────────────────────────────────────────
+    sma_alignment = np.where(close > sma20, 0.33, 0) + np.where(sma20 > sma50, 0.33, 0) + np.where(sma50 > sma200, 0.34, 0)
+    fm["regime_sma_alignment"] = sma_alignment
+
+    vwap = (close * vol).rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)
+    fm["vwap_position"] = close / (vwap + 1e-9)
+
+    overnight_gap = (open_ - close.shift(1)) / (close.shift(1) + 1e-9)
+    fm["gap_detection"] = overnight_gap.rolling(5).mean().fillna(0)
+
+    # ── Volatility structure features ─────────────────────────────────────────
+    hv_5d = rets.rolling(5).std() * np.sqrt(252)
+    fm["vol_regime_ratio"] = hv_5d / (fm["hv_20d"] + 1e-9)
+
+    gk_var = 0.5 * (np.log(high / low)) ** 2 - (2 * np.log(2) - 1) * (np.log(close / open_)) ** 2
+    fm["garman_klass_vol"] = np.sqrt(gk_var.rolling(20).mean() * 252)
+
+    parkinson_var = (1 / (4 * np.log(2))) * (np.log(high / low)) ** 2
+    fm["parkinson_vol"] = np.sqrt(parkinson_var.rolling(20).mean() * 252)
+
+    # ── Time-series structure features ────────────────────────────────────────
+    fm["autocorr_5d"] = rets.rolling(20).apply(lambda x: x.autocorr(lag=5) if len(x) > 5 else 0, raw=False)
+
+    fm["skewness_20d"] = rets.rolling(20).skew()
+    fm["kurtosis_20d"] = rets.rolling(20).kurt()
+    fm["max_drawdown_20d"] = close.rolling(20).apply(
+        lambda x: (x.min() / x.iloc[0] - 1) * 100 if len(x) > 0 else 0, raw=False
+    )
+
+    # ── Fill NaN values with reasonable defaults ─────────────────────────────
     fm["sma_cross_20_50"] = fm["sma_cross_20_50"].fillna(0.5)
     fm["sma_cross_50_200"] = fm["sma_cross_50_200"].fillna(0.5)
     fm["rsi"] = fm["rsi"].fillna(50)
@@ -188,6 +226,16 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["rsi_macd_div"] = fm["rsi_macd_div"].fillna(0)
     fm["vol_confirm"] = fm["vol_confirm"].fillna(0)
     fm["bb_squeeze_ratio"] = fm["bb_squeeze_ratio"].fillna(5.0)
+    fm["regime_sma_alignment"] = fm["regime_sma_alignment"].fillna(0.5)
+    fm["vwap_position"] = fm["vwap_position"].fillna(1.0)
+    fm["gap_detection"] = fm["gap_detection"].fillna(0)
+    fm["vol_regime_ratio"] = fm["vol_regime_ratio"].fillna(1.0)
+    fm["garman_klass_vol"] = fm["garman_klass_vol"].fillna(0)
+    fm["parkinson_vol"] = fm["parkinson_vol"].fillna(0)
+    fm["autocorr_5d"] = fm["autocorr_5d"].fillna(0)
+    fm["skewness_20d"] = fm["skewness_20d"].fillna(0)
+    fm["kurtosis_20d"] = fm["kurtosis_20d"].fillna(0)
+    fm["max_drawdown_20d"] = fm["max_drawdown_20d"].fillna(0)
 
     return fm
 
@@ -239,11 +287,11 @@ def _enrich_fundamentals():
         return 0
 
 
-def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict:
+def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict:
     """Build the full model_training_set from eod_ohl_history.
 
-    Vectorized: pre-computes all 23 features in one pandas pass per symbol.
-    Each symbol takes ~0.1s instead of ~15s.
+    Vectorized: pre-computes all features in one pandas pass per symbol.
+    Default lookback: 2268 days (~9 years, covers 2017-2026).
     """
     from sqlalchemy import text
     from main import db_conn
@@ -290,11 +338,7 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
             if dead_count and dead_count[0] > 0:
                 print(f"[Train] Skipping {dead_count[0]} dead tickers (no data in last 30 days).")
 
-            yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
-            yf_dead = set()
-            if os.path.exists(yf_dead_path):
-                with open(yf_dead_path) as f:
-                    yf_dead = set(line.strip() for line in f if line.strip())
+            yf_dead = YFinanceService.get_dead_set()
             symbols = [s for s in symbols if s[0] not in yf_dead]
             if yf_dead:
                 print(f"[Train] Skipping {len(yf_dead)} tickers from yfinance dead-list.")
@@ -327,8 +371,14 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
 
                 feat_row = {}
                 for col in FEATURE_COLS:
+                    if col not in fm.columns:
+                        feat_row[col] = 0.0
+                        continue
                     v = fm[col].iloc[idx]
-                    feat_row[col] = float(v) if not pd.isna(v) else 0.0
+                    if pd.isna(v) or np.isinf(v):
+                        feat_row[col] = 0.0
+                    else:
+                        feat_row[col] = round(float(v), 8)
 
                 max_i = min(idx + FORWARD_WINDOW_DAYS + 1, len(close))
                 future = close.iloc[idx + 1 : max_i]
@@ -347,6 +397,9 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
                 peak_14d_pct = round((fwd_peak_14d / entry_price - 1) * 100, 2)
                 peak_30d_pct = round((fwd_peak_30d / entry_price - 1) * 100, 2)
 
+                # Cap extreme returns from penny stocks / bad data
+                if abs(fwd_ret) > 500 or abs(fwd_peak) > 500:
+                    continue
                 if abs(fwd_ret) < 0.001 and abs(fwd_peak) < 0.001:
                     continue
 
@@ -354,11 +407,14 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
                 hit_3pct_14d = peak_14d_pct >= 3.0
                 hit_3pct_30d = peak_30d_pct >= 3.0
                 hit_5pct_63d = fwd_peak >= 5.0
+                hit_8pct_63d = fwd_peak >= 8.0
+                hit_10pct_63d = fwd_peak >= 10.0
                 direction_correct = fwd_ret > 0
 
                 rows_to_insert.append((symbol, market, signal_date, entry_price,
                     json.dumps(feat_row), fwd_ret, fwd_peak, fwd_dd,
-                    hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d, direction_correct))
+                    hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
+                    hit_8pct_63d, hit_10pct_63d, direction_correct))
 
             if rows_to_insert:
                 try:
@@ -368,8 +424,9 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
                                 INSERT INTO model_training_set
                                 (symbol, market, signal_date, entry_price, features,
                                  forward_return_63d, forward_peak_return_63d, forward_max_drawdown_63d,
-                                 hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d, direction_correct)
-                                VALUES (:s,:m,:d,:p,:f,:fr,:fp,:fd,:h,:h14,:h30,:h5,:dc)
+                                 hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
+                                 hit_8pct_63d, hit_10pct_63d, direction_correct)
+                                VALUES (:s,:m,:d,:p,:f,:fr,:fp,:fd,:h,:h14,:h30,:h5,:h8,:h10,:dc)
                                 ON CONFLICT (symbol, market, signal_date) DO UPDATE SET
                                 entry_price=EXCLUDED.entry_price, features=EXCLUDED.features,
                                 forward_return_63d=EXCLUDED.forward_return_63d,
@@ -379,10 +436,13 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
                                 hit_3pct_14d=EXCLUDED.hit_3pct_14d,
                                 hit_3pct_30d=EXCLUDED.hit_3pct_30d,
                                 hit_5pct_63d=EXCLUDED.hit_5pct_63d,
+                                hit_8pct_63d=EXCLUDED.hit_8pct_63d,
+                                hit_10pct_63d=EXCLUDED.hit_10pct_63d,
                                 direction_correct=EXCLUDED.direction_correct
                             """), {"s": row[0], "m": row[1], "d": row[2], "p": row[3], "f": row[4],
                                    "fr": row[5], "fp": row[6], "fd": row[7], "h": row[8],
-                                   "h14": row[9], "h30": row[10], "h5": row[11], "dc": row[12]})
+                                   "h14": row[9], "h30": row[10], "h5": row[11],
+                                   "h8": row[12], "h10": row[13], "dc": row[14]})
                         conn.commit()
                     inserted += len(rows_to_insert)
                 except Exception as e:
@@ -409,10 +469,12 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 1260) -> dict
     return {"rows_inserted": inserted, "errors": errors, "symbols_processed": total_symbols}
 
 
-def fit_model_weights(target_col: str = "forward_peak_return_63d", min_samples: int = MIN_TRAINING_SAMPLES) -> Optional[dict]:
-    """Fit Ridge regression to predict peak return as continuous value.
+def fit_model_weights(target_col: str = "hit_8pct_63d", min_samples: int = MIN_TRAINING_SAMPLES) -> Optional[dict]:
+    """Fit ensemble regression (Ridge + LightGBM + RandomForest) on 8% hit classification.
 
-    target_col: 'forward_peak_return_63d' (primary), or hit columns for classification fallback.
+    Uses chronological train/test split: earliest 80% train, most recent 20% validate.
+    Blends predictions: 0.30×Ridge + 0.40×LightGBM + 0.30×RandomForest.
+    Falls back to correlation if sklearn unavailable.
     """
     from sqlalchemy import text
     from main import db_conn
@@ -420,9 +482,11 @@ def fit_model_weights(target_col: str = "forward_peak_return_63d", min_samples: 
     try:
         with db_conn() as conn:
             rows = conn.execute(
-                text(f"SELECT features, {target_col} FROM model_training_set "
+                text(f"SELECT features, CAST({target_col} AS INTEGER) FROM model_training_set "
                      "WHERE features IS NOT NULL AND forward_peak_return_63d IS NOT NULL "
-                     "ORDER BY signal_date DESC LIMIT 50000")
+                     "AND ABS(forward_peak_return_63d) <= 500 "
+                     "AND ABS(forward_return_63d) <= 500 "
+                     "ORDER BY signal_date ASC LIMIT 100000")
             ).fetchall()
     except Exception as e:
         print(f"[Fit] DB read: {e}")
@@ -437,7 +501,7 @@ def fit_model_weights(target_col: str = "forward_peak_return_63d", min_samples: 
         try:
             feats = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
-            if any(np.isnan(v) for v in x_row):
+            if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 continue
             X_list.append(x_row)
             y_list.append(float(row[1]) if row[1] is not None else 0.0)
@@ -450,41 +514,144 @@ def fit_model_weights(target_col: str = "forward_peak_return_63d", min_samples: 
 
     X = np.array(X_list)
     y = np.array(y_list)
-    y_mean = y.mean()
-    y_std = y.std()
 
-    print(f"[Fit] Regression: {len(X)} samples, mean peak return={y_mean:.2f}%, std={y_std:.2f}%")
-    print(f"[Fit] Baseline: P(≥3%)={(y >= 3.0).mean()*100:.1f}%, P(≥5%)={(y >= 5.0).mean()*100:.1f}%")
+    n_train = int(len(X) * 0.8)
+    X_train, X_test = X[:n_train], X[n_train:]
+    y_train, y_test = y[:n_train], y[n_train:]
+
+    # ── Sample weighting by recency (exponential decay, half-life = 1 year) ──
+    # Rows are sorted by signal_date ASC. Compute weight based on position
+    # relative to the full training span (not raw array index).
+    n_all = len(X)
+    total_days = 9 * 365  # approximate 9yr span
+    half_life = 365  # 1 calendar year
+    positions = np.arange(n_all)[::-1]  # newest sample = 0 position, oldest = n_all
+    # Map position to approximate days old
+    days_old = positions / n_all * total_days
+    sample_weights = np.power(0.5, days_old / half_life)
+    sample_weights = sample_weights / sample_weights.mean()
+    w_train = sample_weights[:n_train]
+    w_test = sample_weights[n_train:]
+
+    y_mean = y_train.mean()
+    y_std = y_train.std()
+
+    print(f"[Fit] Ensemble: {len(X_train)} train, {len(X_test)} test samples, "
+          f"hit_8pct rate={y_train.mean()*100:.1f}%, std={y_std:.2f}")
+    print(f"[Fit] Sample weights: recent10=%s, oldest10=%s" %
+          (",".join(f"{w:.2f}" for w in w_train[-10:]),
+           ",".join(f"{w:.2f}" for w in w_train[:10])))
 
     try:
         from sklearn.linear_model import Ridge
+        from sklearn.ensemble import RandomForestRegressor
         from sklearn.preprocessing import StandardScaler
 
+        ensemble_details = {}
+        blend_weights = {"ridge": 0.30, "lightgbm": 0.40, "random_forest": 0.30}
+
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-        model = Ridge(alpha=1.0)
-        model.fit(X_scaled, y)
-        y_pred = model.predict(X_scaled)
-        r2 = float(1 - np.sum((y - y_pred)**2) / np.sum((y - y_mean)**2))
+        # ── Ridge ──────────────────────────────────────────────────────────
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X_train_scaled, y_train)
+        ridge_pred_train = ridge.predict(X_train_scaled)
+        ridge_pred_test = ridge.predict(X_test_scaled)
+        ridge_coefs = dict(zip(FEATURE_COLS, ridge.coef_))
+        ensemble_details["ridge"] = {
+            "train_r2": round(float(1 - np.sum((y_train - ridge_pred_train)**2) / np.sum((y_train - y_mean)**2)), 4),
+            "test_r2": round(float(1 - np.sum((y_test - ridge_pred_test)**2) / np.sum((y_test - y_test.mean())**2)), 4),
+        }
 
-        coefs = dict(zip(FEATURE_COLS, model.coef_))
-        model_type = "ridge_regression"
+        # ── LightGBM (tuned, with sample weights and validation) ───────────
+        lgbm_train_r2, lgbm_test_r2 = 0.0, 0.0
+        lgbm_importances = {}
+        lgbm_pred_test = np.zeros_like(y_test)
+        try:
+            import lightgbm as lgb
+            # Tuned params: reduced depth, more leaves, stronger regularization
+            lgbm = lgb.LGBMRegressor(
+                max_depth=5, num_leaves=31, n_estimators=300,
+                learning_rate=0.03, reg_alpha=0.3, reg_lambda=2.0,
+                min_child_samples=30, min_split_gain=0.001,
+                subsample=0.7, colsample_bytree=0.7,
+                random_state=42, n_jobs=-1, verbose=-1,
+            )
+            lgbm.fit(X_train, y_train, sample_weight=w_train)
+            lgbm_pred_train = lgbm.predict(X_train)
+            lgbm_pred_test = lgbm.predict(X_test)
+            lgbm_train_r2 = float(1 - np.sum((y_train - lgbm_pred_train)**2) / np.sum((y_train - y_mean)**2))
+            lgbm_test_r2 = float(1 - np.sum((y_test - lgbm_pred_test)**2) / np.sum((y_test - y_test.mean())**2))
+            lgbm_importances = dict(zip(FEATURE_COLS, lgbm.feature_importances_))
+            ensemble_details["lightgbm"] = {
+                "train_r2": round(lgbm_train_r2, 4),
+                "test_r2": round(lgbm_test_r2, 4),
+            }
+            print(f"[Fit] LightGBM train R²={lgbm_train_r2:.4f}, test R²={lgbm_test_r2:.4f}")
+        except ImportError:
+            print("[Fit] LightGBM not installed — using Ridge for that weight share.")
+            blend_weights["ridge"] += blend_weights["lightgbm"]
+            blend_weights["lightgbm"] = 0.0
 
-        if r2 <= 0:
-            print(f"[Fit] R² = {r2:.4f} — features have no linear signal. Trying RandomForest.")
-            from sklearn.ensemble import RandomForestRegressor
-            rf = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
-            rf.fit(X, y)
-            y_pred = rf.predict(X)
-            r2 = float(1 - np.sum((y - y_pred)**2) / np.sum((y - y_mean)**2))
-            importances = rf.feature_importances_
-            coefs = dict(zip(FEATURE_COLS, importances))
-            model_type = "random_forest_regressor"
+        # ── RandomForest ───────────────────────────────────────────────────
+        rf = RandomForestRegressor(
+            n_estimators=200, max_depth=8, min_samples_leaf=20,
+            random_state=42, n_jobs=-1,
+        )
+        rf.fit(X_train, y_train)
+        rf_pred_train = rf.predict(X_train)
+        rf_pred_test = rf.predict(X_test)
+        rf_train_r2 = float(1 - np.sum((y_train - rf_pred_train)**2) / np.sum((y_train - y_mean)**2))
+        rf_test_r2 = float(1 - np.sum((y_test - rf_pred_test)**2) / np.sum((y_test - y_test.mean())**2))
+        rf_importances = dict(zip(FEATURE_COLS, rf.feature_importances_))
+        ensemble_details["random_forest"] = {
+            "train_r2": round(rf_train_r2, 4),
+            "test_r2": round(rf_test_r2, 4),
+        }
+
+        # ── Blended prediction ─────────────────────────────────────────────
+        blend_pred_test = (
+            blend_weights["ridge"] * ridge_pred_test +
+            blend_weights["lightgbm"] * lgbm_pred_test +
+            blend_weights["random_forest"] * rf_pred_test
+        )
+        blend_train_r2 = (
+            blend_weights["ridge"] * float(ensemble_details["ridge"]["train_r2"]) +
+            blend_weights["lightgbm"] * float(ensemble_details.get("lightgbm", {}).get("train_r2", 0)) +
+            blend_weights["random_forest"] * float(ensemble_details["random_forest"]["train_r2"])
+        )
+        blend_test_r2 = float(1 - np.sum((y_test - blend_pred_test)**2) / np.sum((y_test - y_test.mean())**2))
+
+        # ── Combined feature importance ────────────────────────────────────
+        ridge_max = max(abs(v) for v in ridge_coefs.values()) or 1e-9
+        lgbm_max = max(abs(v) for v in lgbm_importances.values()) or 1e-9
+        rf_max = max(abs(v) for v in rf_importances.values()) or 1e-9
+
+        combined_coefs = {}
+        for fname in FEATURE_COLS:
+            r_w = abs(ridge_coefs.get(fname, 0))
+            l_w = abs(lgbm_importances.get(fname, 0))
+            rf_w = abs(rf_importances.get(fname, 0))
+            combined_coefs[fname] = round(
+                blend_weights["ridge"] * r_w / ridge_max +
+                blend_weights["lightgbm"] * l_w / lgbm_max +
+                blend_weights["random_forest"] * rf_w / rf_max, 6
+            )
+
+        model_type = "ensemble_ridge_lgbm_rf"
+        r2 = blend_test_r2
+
+        print(f"[Fit] Ensemble test R²={blend_test_r2:.4f} (Ridge={ensemble_details['ridge']['test_r2']}, "
+              f"LightGBM={ensemble_details.get('lightgbm', {}).get('test_r2', 'N/A')}, "
+              f"RF={ensemble_details['random_forest']['test_r2']})")
 
         today = date.today()
+        note_text = f"Ens, OOS R²={blend_test_r2:.2f}"[:200]
+        blend_note = f"R:{blend_weights['ridge']:.2f}/L:{blend_weights['lightgbm']:.2f}/RF:{blend_weights['random_forest']:.2f}"[:200]
         with db_conn() as conn:
-            for fname, coef in coefs.items():
+            for fname, coef in ridge_coefs.items():
                 conn.execute(text("INSERT INTO model_weights_by_date "
                     "(trained_at,feature_name,weight,coefficient,model_type,sample_size,in_sample_hit_rate,notes) "
                     "VALUES (:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
@@ -492,16 +659,31 @@ def fit_model_weights(target_col: str = "forward_peak_return_63d", min_samples: 
                     "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type=EXCLUDED.model_type,"
                     "sample_size=EXCLUDED.sample_size,in_sample_hit_rate=EXCLUDED.in_sample_hit_rate"),
                     {"ta": today, "fn": fname, "w": round(coef, 6), "c": round(coef, 6),
-                     "mt": model_type, "ss": len(X), "ish": round(r2, 4),
-                     "nt": f"{model_type}, R²={r2:.4f}, mean_ret={y_mean:.1f}%"})
+                     "mt": "ridge"[:20], "ss": len(X), "ish": round(blend_test_r2, 4),
+                     "nt": note_text})
             conn.commit()
 
-        top = sorted(coefs.items(), key=lambda x: abs(x[1]), reverse=True)[:8]
-        return {"status": "ok", "samples": len(X), "mean_return_pct": round(y_mean, 2),
+            scaler_stats = json.dumps({
+                "mean": scaler.mean_.tolist(),
+                "scale": scaler.scale_.tolist(),
+                "feature_order": FEATURE_COLS,
+            })
+            conn.execute(text(
+                "INSERT INTO model_weights_by_date (trained_at, feature_name, weight, coefficient, model_type, notes) "
+                "VALUES (:ta, '__scaler_stats__', 0, 0, 'scaler', :nt) "
+                "ON CONFLICT (trained_at, feature_name) DO UPDATE SET notes=EXCLUDED.notes, model_type='scaler'"
+            ), {"ta": today, "nt": scaler_stats})
+            conn.commit()
+
+        top = sorted(ridge_coefs.items(), key=lambda x: abs(x[1]), reverse=True)[:8]
+        return {"status": "ok", "samples": len(X), "hit_8pct_rate": round(y.mean() * 100, 1),
                 "r2": round(r2, 4),
-                "baseline_hit_3pct": round((y >= 3.0).mean() * 100, 1),
-                "baseline_hit_5pct": round((y >= 5.0).mean() * 100, 1),
-                "top_features": top, "model_type": model_type}
+                "test_r2": round(blend_test_r2, 4),
+                "baseline_hit_8pct": round((y >= 1).mean() * 100, 1),
+                "sample_weights": {"recent10_mean": round(w_train[-10:].mean(), 3), "oldest10_mean": round(w_train[:10].mean(), 3)},
+                "top_features": top, "model_type": model_type,
+                "ensemble_details": ensemble_details,
+                "blend_weights": blend_weights}
 
     except ImportError:
         corr_w = {}
@@ -550,10 +732,10 @@ def daily_training_pipeline() -> dict:
     t0 = time.time()
     matrix = build_training_matrix()
     results = {}
-    for target, label in [("forward_peak_return_63d", "63d peak %"),
-                           ("forward_peak_return_63d", "63d peak %"),
-                           ("hit_3pct_14d", "14d hit"),
-                           ("hit_3pct_30d", "30d hit")]:
+    for target, label in [("hit_8pct_63d", "8% hit"),
+                           ("hit_10pct_63d", "10% hit"),
+                           ("hit_3pct_14d", "14d hit (3%)"),
+                           ("hit_3pct_30d", "30d hit (3%)")]:
         print(f"[TrainPipeline] Fitting {label}...")
         results[label] = fit_model_weights(target_col=target)
     elapsed = round(time.time() - t0, 1)
@@ -565,7 +747,7 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["matrix","fit","pipeline","weights"], default="pipeline")
-    ap.add_argument("--lookback", type=int, default=1260)
+    ap.add_argument("--lookback", type=int, default=2268)
     args = ap.parse_args()
     if args.mode == "matrix":
         r = build_training_matrix(lookback_days=args.lookback)

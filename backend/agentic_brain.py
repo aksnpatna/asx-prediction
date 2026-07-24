@@ -26,7 +26,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 _NVIDIA_RATE_LOCK = threading.Lock()
 _NVIDIA_CALL_COUNT = 0
 _NVIDIA_WINDOW_START = 0.0
-_NVIDIA_MAX_PER_MINUTE = 35  # 40 limit, 5 headroom buffer
+_NVIDIA_MAX_PER_MINUTE = 35
 _NVIDIA_WINDOW_SECS = 60.0
 
 def _nvidia_rate_limit():
@@ -47,7 +47,7 @@ def _nvidia_rate_limit():
 # ── Tavily Rate Limiter (1,000 credits/month free tier) ─────────────────────
 _TAVILY_CALL_COUNT = 0
 _TAVILY_MONTH = 0
-_TAVILY_MAX_PER_DAY = 250  # full-coverage: ~50-100 deep-dives/day, each 1 Tavily call
+_TAVILY_MAX_PER_DAY = 250
 
 def _tavily_rate_limit():
     global _TAVILY_CALL_COUNT, _TAVILY_MONTH
@@ -56,7 +56,7 @@ def _tavily_rate_limit():
         _TAVILY_CALL_COUNT = 0
         _TAVILY_MONTH = current_month
     if _TAVILY_CALL_COUNT >= _TAVILY_MAX_PER_DAY:
-        return  # silently skip, the researcher will show "No Web Search API available."
+        return
     _TAVILY_CALL_COUNT += 1
 
 # ── LLM instances — Primary: DeepSeek V4 Flash, Fallback: Nvidia NIM, Groq, Local ─
@@ -99,9 +99,6 @@ llm_liquidity = _make_llm(GROQ_MODEL_STANDARD, 0.20)
 llm_cio = _make_llm(GROQ_MODEL_STANDARD, 0.10)
 
 
-# ── Automated Consensus Counter ──────────────────────────────────────────────
-
-
 # ── Structured CIO Output ──────────────────────────────────────────────────────
 class ChiefDecision(BaseModel):
     decision: str = Field(description="APPROVE or REJECT")
@@ -116,8 +113,6 @@ class ChiefDecision(BaseModel):
 
 
 # ── State Definition (Annotated reducers for parallel fan-out merge) ──────────
-# LangGraph v0.2+ detects Annotated types inside TypedDict for parallel merge.
-# Each persona writes its own key; reducer picks the non-empty value on merge.
 class AgentState(TypedDict):
     symbol: Annotated[str, lambda a, b: b or a]
     market: Annotated[str, lambda a, b: b or a]
@@ -139,6 +134,9 @@ class AgentState(TypedDict):
     key_risk: Annotated[str, lambda a, b: b or a]
     constraints_violated: Annotated[List[str], lambda a, b: b or a]
     scenario_risks: Annotated[List[str], lambda a, b: b or a]
+    model_context: Annotated[Optional[Dict[str, Any]], lambda a, b: b or a]
+    macro_data: Annotated[Optional[Dict[str, Any]], lambda a, b: b or a]
+    wfo_gate_status: Annotated[Optional[str], lambda a, b: b or a]
 
 
 def _format_data_blob(state: AgentState) -> str:
@@ -146,6 +144,7 @@ def _format_data_blob(state: AgentState) -> str:
     tech = state.get("technicals", {})
     val = state.get("valuation", {})
     confluence = state.get("confluence", {}) or {}
+    model_ctx = state.get("model_context") or {}
 
     ch_strs = []
     if confluence:
@@ -155,9 +154,37 @@ def _format_data_blob(state: AgentState) -> str:
     else:
         ch_strs.append("  (confluence data not available)")
 
+    feature_breakdown = ""
+    if model_ctx.get("top_features"):
+        feature_breakdown = "Model Feature Drivers:\n"
+        for fname, score in model_ctx.get("top_features", [])[:5]:
+            feature_breakdown += f"  - {fname}: {score:.3f}\n"
+
+    peer_section = ""
+    if model_ctx.get("sector_peer_comparison"):
+        peer = model_ctx["sector_peer_comparison"]
+        peer_section = f"Sector Peer Comparison:\n  RSI rank: {peer.get('rsi_rank','?')}, Momentum rank: {peer.get('momentum_rank','?')}"
+
+    macro_section = ""
+    if state.get("macro_data"):
+        md = state["macro_data"]
+        macro_section = f"Macro Snapshot:\n  VIX: {md.get('vix',{}).get('current','?')}, ASX200 trend: {md.get('asx200',{}).get('trend_30d','?')}%, AUD/USD: {md.get('aud_usd',{}).get('current','?')}"
+
+    wfo_section = f"WFO Gate: {state.get('wfo_gate_status', 'INSUFFICIENT_DATA')}"
+
+    tier_info = ""
+    if model_ctx.get("tier_label"):
+        tier_info = f"Model Tier: {model_ctx['tier_label']} (score: {model_ctx.get('model_score','?')})"
+
     return f"""Symbol: {state['symbol']} ({state['market']})
 Confluence: {confluence.get('confidence', 'unknown').upper()} — {confluence.get('bullish_channels', '?')}/{confluence.get('total_channels', '?')} channels bullish
 {chr(10).join(ch_strs)}
+
+{tier_info}
+{feature_breakdown}
+{peer_section}
+{macro_section}
+{wfo_section}
 
 Technicals: {json.dumps(tech, indent=2, default=str)}
 Valuation: {json.dumps(val, indent=2, default=str)}
@@ -174,13 +201,10 @@ _BULLISH_PATTERNS = [
     "bullish", "poised for", "accumulation", "uptrend", "breakout",
     "favorable", "tailwind", "entry point", "upside", "undervalued",
     "approve", "growth potential", "should perform", "likely to outperform",
-    "compliant",  # tax agent uses COMPLIANT as a positive verdict
+    "compliant",
 ]
 
 # ── Bearish signal phrases ───────────────────────────────────────────────────
-# NOTE: "risk" is intentionally EXCLUDED — the RiskController agent always
-# mentions the word "risk" by design. Including it would penalise every
-# risk thesis regardless of its actual direction.
 _BEARISH_PATTERNS = [
     "not bullish", "not a buy", "not recommend", "not poised", "not support",
     "bearish", "sell", "downtrend", "overvalued", "excessive valuation",
@@ -194,61 +218,93 @@ _NEGATION_PREFIXES = (
     "cannot ", "can't ", "fails to ", "unlikely to ", "no longer ",
 )
 
-def _count_bullish_votes(state: AgentState) -> int:
-    """
-    Objectively count how many of the 6 persona theses recommend BUY.
+_VERDICT_PATTERNS = {
+    "BUY": ["VERDICT: BUY", "VERDICT:BUY", "Verdict: BUY"],
+    "HOLD": ["VERDICT: HOLD", "VERDICT:HOLD", "Verdict: HOLD"],
+    "SELL": ["VERDICT: SELL", "VERDICT:SELL", "Verdict: SELL"],
+}
 
-    Scoring per thesis:
-      - For each bullish phrase found, check if it is immediately preceded
-        by a negation prefix (e.g. "not bullish" → does NOT count as bullish).
-      - For each bearish phrase found, count it as a bear signal.
-      - net = bullish_hits - bearish_hits; vote=1 if net > 0, else 0.
 
-    This correctly handles:
-      - "not bullish"          → bearish_hit=1, bullish_hit=0  (net=-1 → 0 vote)
-      - "strong bullish trend" → bullish_hit=1, bearish_hit=0  (net=+1 → 1 vote)
-      - "risk is manageable"   → bearish_hit=0 ("risk" excluded by design)
+def _parse_structured_verdict(thesis: str) -> Optional[str]:
+    """Parse explicit VERDICT: tag from thesis text. Returns BUY/HOLD/SELL or None."""
+    for verdict_type, patterns in _VERDICT_PATTERNS.items():
+        for pat in patterns:
+            if pat in thesis:
+                return verdict_type
+    return None
+
+
+def _count_bullish_votes(state: AgentState) -> dict:
+    """Count how many of the 6 persona theses recommend BUY.
+
+    Returns dict with vote count and detailed per-persona verdicts.
+    Uses structured VERDICT tags first, falls back to pattern matching.
     """
-    theses = [
-        state.get("technical_thesis", ""),
-        state.get("macro_thesis", ""),
-        state.get("valuation_thesis", ""),
-        state.get("risk_thesis", ""),
-        state.get("tax_thesis", ""),
-        state.get("liquidity_thesis", ""),
-    ]
+    theses = {
+        "technical": state.get("technical_thesis", ""),
+        "macro": state.get("macro_thesis", ""),
+        "valuation": state.get("valuation_thesis", ""),
+        "risk": state.get("risk_thesis", ""),
+        "tax": state.get("tax_thesis", ""),
+        "liquidity": state.get("liquidity_thesis", ""),
+    }
     votes = 0
-    for thesis in theses:
+    verdicts = {}
+    discrepancies = []
+
+    for persona, thesis in theses.items():
+        structured = _parse_structured_verdict(thesis)
         t = thesis.lower()
+
         bull_hits = 0
         bear_hits = 0
 
-        # Count bullish phrases — subtract any that are negated
         for phrase in _BULLISH_PATTERNS:
             idx = 0
             while True:
                 pos = t.find(phrase, idx)
                 if pos == -1:
                     break
-                # Check the 15 characters before the phrase for a negation prefix
                 prefix_window = t[max(0, pos - 15): pos]
                 negated = any(prefix_window.endswith(neg) or prefix_window.rstrip().endswith(neg.rstrip())
                               for neg in _NEGATION_PREFIXES)
                 if negated:
-                    bear_hits += 1   # negated bullish = effectively bearish signal
+                    bear_hits += 1
                 else:
                     bull_hits += 1
                 idx = pos + len(phrase)
 
-        # Count bearish phrases (these do not need negation inversion)
         for phrase in _BEARISH_PATTERNS:
             if phrase in t:
                 bear_hits += 1
 
-        if bull_hits > bear_hits:
-            votes += 1
+        pattern_vote = bull_hits > bear_hits
+        pattern_verdict = "BUY" if pattern_vote else "HOLD"
 
-    return votes
+        if structured and structured != pattern_verdict:
+            discrepancies.append({
+                "persona": persona,
+                "structured": structured,
+                "pattern": pattern_verdict,
+                "thesis_preview": thesis[:100],
+            })
+
+        if structured == "BUY":
+            votes += 1
+            verdicts[persona] = "BUY"
+        elif structured:
+            verdicts[persona] = structured
+        elif pattern_vote:
+            votes += 1
+            verdicts[persona] = "BUY"
+        else:
+            verdicts[persona] = "HOLD"
+
+    return {
+        "votes": votes,
+        "verdicts": verdicts,
+        "discrepancies": discrepancies,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -292,7 +348,10 @@ def technical_strategist_node(state: AgentState) -> AgentState:
     task = (
         f"Write a 3-sentence thesis on whether {state['symbol']} is technically poised for a bullish breakout. "
         f"Reference specific indicators from the data. Mention the HACOLT signal, ADX/DMI trend strength, "
-        f"EMA ribbon alignment, and volume pattern. If confluence is HIGH, state whether the technicals align with it."
+        f"EMA ribbon alignment, and volume pattern. If confluence is HIGH, state whether the technicals align with it. "
+        f"IMPORTANT: This model predicts PEAK return within 63 days, not close return. A stock hitting +5% on day 10 "
+        f"and drifting to +1% at day 63 IS A HIT. Evaluate whether a quick spike is likely. "
+        f"End your response with VERDICT: BUY or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["technical_thesis"] = _invoke_persona(llm_technical, system, _format_data_blob(state), task)
     return state
@@ -300,10 +359,21 @@ def technical_strategist_node(state: AgentState) -> AgentState:
 
 def macro_regime_node(state: AgentState) -> AgentState:
     system = "You are a Macro Strategist for an Australian SMSF. You assess monetary policy, commodity cycles, and cross-asset flows."
+    macro = state.get("macro_data") or {}
+    vix_level = macro.get("vix", {}).get("current", "N/A")
+    asx_trend = macro.get("asx200", {}).get("trend_30d", "N/A")
+    aud_usd = macro.get("aud_usd", {}).get("current", "N/A")
+    gold_trend = macro.get("gold", {}).get("trend_30d", "N/A")
+    copper_trend = macro.get("copper", {}).get("trend_30d", "N/A")
+    au_yield = macro.get("au_10y_yield", {}).get("current", "N/A")
+
     task = (
         f"Write a 3-sentence assessment of the macro regime tailwinds or headwinds for {state['symbol']}. "
+        f"Current macro data: VIX={vix_level}, ASX200 30d trend={asx_trend}%, AUD/USD={aud_usd}, "
+        f"Gold 30d={gold_trend}%, Copper 30d={copper_trend}%, AU 10Y yield={au_yield}%. "
         f"Consider: Australia RBA rate outlook, global commodity demand (if mining/materials), "
-        f"AUD/USD currency impact, and current VIX regime. State whether macro supports a 3-month bullish position."
+        f"AUD/USD currency impact, and current VIX regime. State whether macro supports a 3-month bullish position. "
+        f"End your response with VERDICT: BUY or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["macro_thesis"] = _invoke_persona(llm_macro, system, _format_data_blob(state), task)
     return state
@@ -315,7 +385,9 @@ def valuation_analyst_node(state: AgentState) -> AgentState:
         f"Write a 3-sentence assessment of {state['symbol']}'s valuation. "
         f"Address: is the trailing PE reasonable vs sector? Is EPS growing? "
         f"Is the analyst consensus target offering meaningful upside (>10%) with at least 3 covering analysts? "
-        f"Flag any red flags: negative EPS, excessive forward PE (>40), or very low analyst coverage."
+        f"Flag any red flags: negative EPS, excessive forward PE (>40), or very low analyst coverage. "
+        f"Check the sector peer comparison data for context on relative valuation. "
+        f"End your response with VERDICT: BUY or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["valuation_thesis"] = _invoke_persona(llm_valuation, system, _format_data_blob(state), task)
     return state
@@ -323,11 +395,16 @@ def valuation_analyst_node(state: AgentState) -> AgentState:
 
 def risk_controller_node(state: AgentState) -> AgentState:
     system = "You are a Risk Controller for an Australian SMSF. Your ONLY job is to find what can go wrong. Be ruthless."
+    wfo_status = state.get("wfo_gate_status", "INSUFFICIENT_DATA")
+    forward_dd = (state.get("technicals") or {}).get("forward_max_drawdown_63d", "N/A")
     task = (
         f"Write a 3-sentence RISK assessment for a long position in {state['symbol']}. "
         f"Identify the single biggest risk: earnings catalyst, liquidity trap, drawdown severity, "
-        f"concentration risk, or regime shift. Mention specific numbers from the data. "
-        f"State whether the confluence confidence tier is justified or if there are hidden risks the channels missed."
+        f"concentration risk, or regime shift. The model training label shows forward max drawdown of {forward_dd}%. "
+        f"Current WFO capital gate is {wfo_status} — if RED or AMBER, this limits position sizing. "
+        f"Mention specific numbers from the data. State whether the confluence confidence tier is justified "
+        f"or if there are hidden risks the channels missed. "
+        f"End your response with VERDICT: BUY or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["risk_thesis"] = _invoke_persona(llm_risk, system, _format_data_blob(state), task)
     return state
@@ -344,7 +421,8 @@ def tax_compliance_node(state: AgentState) -> AgentState:
         f"Write a 2-sentence compliance assessment for buying {state['symbol']} in an SMSF. "
         f"Check: is this an ASX-listed ordinary share (passes sole purpose test)? "
         f"Are there franking credits? Would holding >12 months trigger CGT discount? "
-        f"Any related-party concerns? If no red flags, state COMPLIANT. If any issue, flag it."
+        f"Any related-party concerns? If no red flags, state COMPLIANT. If any issue, flag it. "
+        f"End your response with VERDICT: BUY (if compliant) or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["tax_thesis"] = _invoke_persona(llm_tax, system, _format_data_blob(state), task)
     return state
@@ -359,7 +437,8 @@ def liquidity_officer_node(state: AgentState) -> AgentState:
         f"Write a 2-sentence liquidity assessment for {state['symbol']}. "
         f"Check: average dollar volume, VWAP position, up/down volume ratio, block trade detection. "
         f"Is this stock liquid enough for a $2,000-$5,000 SMSF position (<0.5% of daily dollar volume)? "
-        f"Flag any LOW_VOL warning from the data."
+        f"Flag any LOW_VOL warning from the data. "
+        f"End your response with VERDICT: BUY or VERDICT: HOLD or VERDICT: SELL on its own line."
     )
     state["liquidity_thesis"] = _invoke_persona(llm_liquidity, system, _format_data_blob(state), task)
     return state
@@ -374,10 +453,8 @@ def _llm_json(llm, prompt: str, default: dict) -> dict:
     try:
         response = llm.invoke(prompt)
         content = (response.content or "").strip()
-        # Strip markdown fences
         for marker in ("```json", "```"):
             content = content.replace(marker, "")
-        # Find JSON object
         s = content.find("{")
         e = content.rfind("}") + 1
         if s >= 0 and e > s:
@@ -446,8 +523,13 @@ REBUTTALS:
 - Consensus: {state['rebuttals'].get('bullish_consensus', '')}"""
 
     # Automated consensus count (objective, not self-reported)
-    auto_votes = _count_bullish_votes(state)
+    consensus_result = _count_bullish_votes(state)
+    auto_votes = consensus_result["votes"]
+    verdict_details = consensus_result["verdicts"]
     vote_note = f"SYSTEM: Automated count shows {auto_votes}/6 personas recommend BUY. "
+    vote_note += f"Per-persona: {json.dumps(verdict_details)}. "
+    if consensus_result.get("discrepancies"):
+        vote_note += f"WARNING: {len(consensus_result['discrepancies'])} structured/pattern verdict mismatch(es)."
 
     prompt = (
         f"OUTPUT ONLY valid JSON. No markdown, no explanation outside JSON.\n"
@@ -476,21 +558,21 @@ REBUTTALS:
     return state
 
 
-
-
 def run_agentic_analysis(
     symbol: str,
     market: str,
     technicals: Dict,
     valuation: Dict,
     confluence: Optional[Dict] = None,
+    model_context: Optional[Dict] = None,
+    macro_data: Optional[Dict] = None,
+    wfo_gate_status: Optional[str] = None,
 ) -> Dict:
-    """
-    Entry point called from main.py.
-    Passes stock data through the 6-persona multi-agent debate engine.
+    """Entry point called from main.py.
 
-    Returns full deliberation including all individual theses, rebuttals,
-    CIO decision, allocation %, stop-loss, and scenario risks.
+    Passes stock data through the 6-persona multi-agent debate engine.
+    Includes optional model_context, macro_data, and wfo_gate_status
+    for richer persona analysis.
     """
     initial_state: AgentState = {
         "symbol": symbol,
@@ -513,9 +595,14 @@ def run_agentic_analysis(
         "key_risk": "",
         "constraints_violated": [],
         "scenario_risks": [],
+        "model_context": model_context,
+        "macro_data": macro_data,
+        "wfo_gate_status": wfo_gate_status,
     }
 
     final_state = brain_app.invoke(initial_state)
+
+    consensus_result = _count_bullish_votes(final_state)
 
     return {
         "symbol": symbol,
@@ -527,7 +614,9 @@ def run_agentic_analysis(
         "key_risk": final_state["key_risk"],
         "constraints_violated": final_state["constraints_violated"],
         "scenario_risks": final_state["scenario_risks"],
-        "auto_consensus_votes": _count_bullish_votes(final_state),
+        "auto_consensus_votes": consensus_result["votes"],
+        "auto_consensus_verdicts": consensus_result["verdicts"],
+        "auto_consensus_discrepancies": consensus_result.get("discrepancies", []),
         "deliberation": {
             "technical": final_state["technical_thesis"],
             "macro": final_state["macro_thesis"],

@@ -1,9 +1,9 @@
-"""EODHD Historical OHLC Backfill — idempotent 5-year ASX data population.
+"""EODHD Historical OHLC Backfill — idempotent 9-year ASX data population.
 
 Usage (via scheduler or manual):
     from eodhd_backfill import backfill_asx_universe, incremental_daily_update
 
-    backfill_asx_universe()          # one-time: populates 5y history
+    backfill_asx_universe()          # one-time: populates 9y history
     incremental_daily_update()       # daily: fills gaps with latest data
 
 Checkpoint file: backend/eodhd_backfill_state.json tracks completed tickers.
@@ -20,12 +20,14 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from yfinance_service import YFinanceService
+
 _STATE_FILE = Path(__file__).parent / "eodhd_backfill_state.json"
 _EODHD_KEY = ""
 _DAILY_CALL_LIMIT = 50000
 _SAFETY_MARGIN = 0.80
 
-BACKFILL_YEARS = 5
+BACKFILL_YEARS = 9
 FROM_DATE = (date.today() - timedelta(days=int(BACKFILL_YEARS * 365))).isoformat()
 
 
@@ -122,11 +124,7 @@ def backfill_asx_universe(batch_size: int = 500, max_workers: int = 4):
     full_universe = get_asx_universe()
     all_symbols = list(full_universe.keys())
 
-    yf_dead_path = os.path.join(os.path.dirname(__file__), "yfinance_dead_tickers.txt")
-    yf_dead = set()
-    if os.path.exists(yf_dead_path):
-        with open(yf_dead_path) as f:
-            yf_dead = set(line.strip() for line in f if line.strip())
+    yf_dead = YFinanceService.get_dead_set()
 
     to_fetch = [s for s in all_symbols if s not in completed and s not in yf_dead and len(s) <= 3]
     to_fetch = to_fetch[:batch_size]
@@ -331,7 +329,11 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["backfill", "incremental", "status"], default="status")
     parser.add_argument("--batch", type=int, default=500, help="Max tickers to backfill per run")
     parser.add_argument("--workers", type=int, default=4, help="Parallel fetch workers")
+    parser.add_argument("--from-date", type=str, default=None, help="Override FROM_DATE (YYYY-MM-DD)")
     args = parser.parse_args()
+
+    if args.from_date:
+        FROM_DATE = args.from_date
 
     if args.mode == "backfill":
         result = backfill_asx_universe(batch_size=args.batch, max_workers=args.workers)

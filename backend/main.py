@@ -2014,6 +2014,11 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["skewness_20d"] = 0.0
         feat["kurtosis_20d"] = 0.0
         feat["max_drawdown_20d"] = feat["dist_from_sma50"] * 0.5
+        # Macro features (approximate from market context)
+        feat["xjo_momentum_63d"] = float(c.get("sector_perf_1mo", 0) or 0)
+        feat["xjo_sma_position"] = 1.0 if treem in ("BULLISH", "UP") else 0.0
+        feat["xjo_vol_20d"] = feat["hv_20d"]
+        feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0)
 
         pe = float(c.get("pe", 0) or 0)
         fpe = float(c.get("forward_pe", 0) or 0)
@@ -2051,13 +2056,26 @@ def _enrich_candidates_with_tiers(candidates: list):
         c["_model_score"] = round(model_score_raw, 4)
         c["_model_confidence"] = min(99, max(1, round(max(0, model_score_raw) * 100)))
 
-        # Tier thresholds calibrated from scaled Ridge score percentiles (July 2026)
-        # Top 3% (score > 0.22) = 75.7% hit rate, +14.4% lift → 10% tier
-        # Top 10% (score > 0.155) = 73.3% hit rate, +12.0% lift → 8% tier
-        if model_score_raw >= 0.22:
+        # ── Adaptive tier thresholds based on WFO gate state ──────────────
+        base_8pct = 0.155
+        base_10pct = 0.22
+        try:
+            wfo_state = get_current_wfo_state()
+            gate = wfo_state.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
+            if gate == "RED":
+                base_8pct = 0.25
+                base_10pct = 0.35
+            elif gate == "AMBER":
+                base_8pct = 0.18
+                base_10pct = 0.25
+            # GREEN or INSUFFICIENT_DATA: use base thresholds
+        except Exception:
+            pass
+
+        if model_score_raw >= base_10pct:
             c["_target_tier"] = "10pct"
             c["_tier_label"] = "10% TARGET TIER"
-        elif model_score_raw >= 0.155:
+        elif model_score_raw >= base_8pct:
             c["_target_tier"] = "8pct"
             c["_tier_label"] = "8% COMPOUND TIER"
         else:

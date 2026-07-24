@@ -45,6 +45,9 @@ FEATURE_COLS = [
     "vol_regime_ratio", "garman_klass_vol", "parkinson_vol",
     # Time-series structure features
     "autocorr_5d", "skewness_20d", "kurtosis_20d", "max_drawdown_20d",
+    # Macro-adjacent features (computed from XJO ASX200 data, zero API cost)
+    "xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d",
+    "relative_strength_vs_xjo",
 ]
 
 
@@ -240,6 +243,64 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return fm
 
 
+_XJO_CACHE = {}
+import threading as _thr
+_xjo_cache_lock = _thr.Lock()
+
+def _get_xjo_data():
+    """Fetch ASX200 (XJO) benchmark data once per training run. Thread-safe cache."""
+    global _XJO_CACHE
+    with _xjo_cache_lock:
+        if _XJO_CACHE:
+            return _XJO_CACHE
+    try:
+        from eodhd_backfill import get_ohlc_for_symbol
+        xjo = get_ohlc_for_symbol("XJO")
+        if not xjo.empty:
+            xjo = xjo.sort_index()
+            _XJO_CACHE = xjo
+            return xjo
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _add_macro_features(fm: pd.DataFrame, symbol_df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich feature matrix with XJO benchmark-relative macro features."""
+    xjo = _get_xjo_data()
+    if xjo.empty:
+        for col in ["xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d", "relative_strength_vs_xjo"]:
+            if col not in fm.columns:
+                fm[col] = 0.0
+        return fm
+
+    xjo_close = xjo["Close"].astype(float)
+    xjo_aligned = xjo_close.reindex(fm.index, method="ffill")
+    xjo_aligned = xjo_aligned.fillna(method="bfill")
+
+    # XJO 63-day momentum
+    fm["xjo_momentum_63d"] = xjo_aligned.pct_change(63).fillna(0).astype(float) * 100
+
+    # XJO position vs SMA200 (bull/bear proxy: 1=above, 0=below)
+    xjo_sma200 = xjo_close.rolling(200).mean()
+    xjo_sma_aligned = xjo_sma200.reindex(fm.index, method="ffill").fillna(xjo_aligned)
+    fm["xjo_sma_position"] = (xjo_aligned > xjo_sma_aligned).astype(float)
+
+    # XJO 20-day volatility
+    fm["xjo_vol_20d"] = xjo_aligned.pct_change().rolling(20).std().fillna(0).astype(float) * np.sqrt(252)
+
+    # Relative strength: symbol momentum / XJO momentum
+    xjo_mom = xjo_aligned.pct_change(63).fillna(0) * 100
+    sym_close = symbol_df["Close"].astype(float)
+    sym_mom = sym_close.pct_change(63).fillna(0) * 100
+    fm["relative_strength_vs_xjo"] = (sym_mom - xjo_mom).fillna(0).astype(float)
+
+    for col in ["xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d", "relative_strength_vs_xjo"]:
+        fm[col] = fm[col].fillna(0)
+
+    return fm
+
+
 def _enrich_fundamentals():
     """Batch-update model_training_set rows with nearest prior fundamental snapshot.
 
@@ -359,6 +420,7 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
                 continue
 
             fm = _build_feature_matrix(df)
+            fm = _add_macro_features(fm, df)
             close = df["Close"].astype(float)
 
             rows_to_insert = []

@@ -10686,6 +10686,8 @@ def _scheduled_broad_scan_precompute():
                 recipients = get_user_telegram_recipients(uid)
                 if not recipients:
                     continue
+                # ── 5AM per-stock alerts SUPPRESSED — only 8AM AI report fires ──
+                continue
                 for hc in tier_set:
                     sym = hc["symbol"]
                     digest_key = f"auto_tier_{sym}_{today_key}"
@@ -10933,15 +10935,17 @@ def _scheduled_uat_health_report():
                 continue
             digest_key = f"uat_health_{today.isoformat()}"
             if not has_digest_been_sent(uid, market="AU", digest_key=digest_key):
-                _send_telegram_payload(
-                    message, recipients, user_id=uid,
-                    message_type="uat_health", market="AU",
-                    digest_key=digest_key, source="uat_health_watchdog",
-                    delivery_mode="auto",
-                )
+                pass  # UAT health alerts SUPPRESSED
+            # if not has_digest_been_sent(uid, market="AU", digest_key=digest_key):
+            #     _send_telegram_payload(
+            #         message, recipients, user_id=uid,
+            #         message_type="uat_health", market="AU",
+            #         digest_key=digest_key, source="uat_health_watchdog",
+            #         delivery_mode="auto",
+            #     )
 
             # ── URGENT ALERT: if anything has ⚠️, send a separate high-priority message ──
-            if has_warnings:
+            if has_warnings and False:  # UAT health alerts SUPPRESSED
                 alert_key = f"uat_alert_{today.isoformat()}"
                 if not has_digest_been_sent(uid, market="AU", digest_key=alert_key):
                     alert_lines = [
@@ -10974,6 +10978,8 @@ def _scheduled_uat_health_report():
 
 
 def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
+    # ── Every-15min position monitor alerts SUPPRESSED — position checks still run, alerts disabled ──
+    return
     try:
         now = datetime.utcnow()
         min_interval_minutes = max(1, int(os.getenv("PAPER_MONITOR_MIN_INTERVAL_MIN", "10")))
@@ -12106,6 +12112,21 @@ def _scheduled_daily_ai_pipeline():
                 digest_key = f"ai_buy_{sym}_{today_key}"
                 if has_digest_been_sent(uid, market, digest_key):
                     continue
+                # Skip if user already has an open position in this stock
+                already_bought = False
+                try:
+                    with db_conn() as check_conn:
+                        existing = check_conn.execute(
+                            text("SELECT 1 FROM paper_trades WHERE symbol=:sym AND user_id=:uid AND status='open' LIMIT 1"),
+                            {"sym": sym, "uid": uid}
+                        ).fetchone()
+                        if existing:
+                            already_bought = True
+                            print(f"[DailyAI] Skipping {sym} for user {uid} — already have open position")
+                except Exception:
+                    pass
+                if already_bought:
+                    continue
                 price = float(cand.get("current_price", 1) or 1)
                 stop_pct = float(a.get("stop_loss_pct", 10) or 10)
                 adv = int(cand.get("avg_volume", 0) or 0)
@@ -12914,6 +12935,8 @@ def _scheduled_wealth_builder_evaluate():
 # AUTONOMOUS POSITIONS MONITOR — runs every 2 hours during market hours
 # ─────────────────────────────────────────────────────────────────────────────
 def _scheduled_positions_monitor():
+    # ── Hourly auto-positions monitor alerts SUPPRESSED — monitor still runs, alerts disabled ──
+    return
     try:
         from datetime import time as _dt_time
         melbourne_tz = _get_scheduler_timezone()

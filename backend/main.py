@@ -2019,6 +2019,16 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["xjo_sma_position"] = 1.0 if treem in ("BULLISH", "UP") else 0.0
         feat["xjo_vol_20d"] = feat["hv_20d"]
         feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0)
+        # Pure macro features (live values from cached macro data)
+        macro = _get_macro_data_cached()
+        feat["vix_level"] = float(macro.get("vix", {}).get("current", 20) or 20)
+        feat["copper_gold_ratio"] = _safe_ratio(
+            float(macro.get("copper", {}).get("current", 0) or 0),
+            float(macro.get("gold", {}).get("current", 0) or 1),
+            0.004,
+        )
+        feat["yield_curve_slope"] = float(macro.get("au_10y_yield", {}).get("current", 0) or 0)
+        feat["aud_usd_trend"] = float(macro.get("aud_usd", {}).get("current", 0.65) or 0.65)
 
         pe = float(c.get("pe", 0) or 0)
         fpe = float(c.get("forward_pe", 0) or 0)
@@ -11427,6 +11437,13 @@ def _get_macro_data_cached():
     _MACRO_CACHE = macro_model.get_macro_data()
     _MACRO_CACHE_TIME = now
     return _MACRO_CACHE
+
+
+def _safe_ratio(numerator: float, denominator: float, fallback: float = 0.0) -> float:
+    if denominator == 0.0 or denominator is None:
+        return fallback
+    return numerator / denominator
+
 
 def _score_wealth_candidate_safe(symbol: str, market: str, timeout: float = 25.0) -> Optional[dict]:
     """Score a candidate with a semaphore for rate limiting and per-stock timeout."""

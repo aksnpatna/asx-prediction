@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,6 +49,8 @@ FEATURE_COLS = [
     # Macro-adjacent features (computed from XJO ASX200 data, zero API cost)
     "xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d",
     "relative_strength_vs_xjo",
+    # Pure macro features (VIX, copper/gold, yield curve, AUD/USD) — $0 API cost
+    "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
 ]
 
 
@@ -244,8 +247,10 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
 
 _XJO_CACHE = {}
+_MACRO_SERIES_CACHE = {}
 import threading as _thr
 _xjo_cache_lock = _thr.Lock()
+_macro_series_lock = _thr.Lock()
 
 def _get_xjo_data():
     """Fetch ASX200 (XJO) benchmark data once per training run. Thread-safe cache."""
@@ -265,37 +270,126 @@ def _get_xjo_data():
     return pd.DataFrame()
 
 
+def _get_macro_series() -> dict:
+    """Fetch VIX, copper, gold, AUD/USD, AU yield curve once per training run.
+    
+    Returns dict with keys: vix, copper, gold, aud_usd, au_yield_slope
+    Each value is a pd.Series aligned by date index.
+    Thread-safe cache.
+    """
+    global _MACRO_SERIES_CACHE
+    with _macro_series_lock:
+        if _MACRO_SERIES_CACHE:
+            return _MACRO_SERIES_CACHE
+
+    result = {}
+    end = date.today()
+    start = end - timedelta(days=9 * 365 + 30)
+
+    tickers = {"vix": "^VIX", "copper": "HG=F", "gold": "GC=F", "aud_usd": "AUDUSD=X"}
+    for key, ticker in tickers.items():
+        try:
+            df = yf.download(ticker, start=start, end=end, progress=False)
+            if not df.empty and not df["Close"].empty:
+                s = df["Close"].squeeze()
+                s = s.resample("D").ffill()
+                s.index = pd.to_datetime(s.index).normalize()
+                result[key] = s
+        except Exception:
+            pass
+
+    if "copper" in result and "gold" in result:
+        aligned = pd.concat([result["copper"].rename("copper"), result["gold"].rename("gold")], axis=1)
+        ratio = aligned["copper"] / (aligned["gold"] + 1e-9)
+        ratio = ratio.dropna()
+        result["copper_gold_ratio"] = ratio
+
+    try:
+        from fredapi import Fred
+        import os
+        fred_key = os.getenv("FRED_API_KEY", "55689724e13717f08cb5c36bf7d20921")
+        fred = Fred(api_key=fred_key)
+        
+        au_10y = fred.get_series("IRLTLT01AUM156N", observation_start=start.isoformat(), observation_end=end.isoformat())
+        au_3m = fred.get_series("IR3TIB01AUM156N", observation_start=start.isoformat(), observation_end=end.isoformat())
+        
+        if len(au_10y) > 0 and len(au_3m) > 0:
+            au_10y.index = pd.to_datetime(au_10y.index).normalize()
+            au_3m.index = pd.to_datetime(au_3m.index).normalize()
+            slope = au_10y.subtract(au_3m, fill_value=None)
+            slope = slope.resample("D").ffill().fillna(method="ffill")
+            result["yield_curve_slope"] = slope
+    except Exception:
+        pass
+
+    _MACRO_SERIES_CACHE = result
+    return result
+
+
 def _add_macro_features(fm: pd.DataFrame, symbol_df: pd.DataFrame) -> pd.DataFrame:
-    """Enrich feature matrix with XJO benchmark-relative macro features."""
+    """Enrich feature matrix with XJO benchmark-relative and pure macro features."""
+    MACRO_COLS = [
+        "xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d",
+        "relative_strength_vs_xjo",
+        "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
+    ]
+    
     xjo = _get_xjo_data()
-    if xjo.empty:
-        for col in ["xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d", "relative_strength_vs_xjo"]:
-            if col not in fm.columns:
-                fm[col] = 0.0
-        return fm
+    macro = _get_macro_series()
 
-    xjo_close = xjo["Close"].astype(float)
-    xjo_aligned = xjo_close.reindex(fm.index, method="ffill")
-    xjo_aligned = xjo_aligned.fillna(method="bfill")
+    fm_dates = pd.to_datetime(fm.index).normalize()
 
-    # XJO 63-day momentum
-    fm["xjo_momentum_63d"] = xjo_aligned.pct_change(63).fillna(0).astype(float) * 100
+    xjo_aligned = None
+    if not xjo.empty:
+        xjo_close = xjo["Close"].astype(float)
+        xjo_aligned = xjo_close.reindex(fm.index, method="ffill")
+        xjo_aligned = xjo_aligned.fillna(method="bfill")
 
-    # XJO position vs SMA200 (bull/bear proxy: 1=above, 0=below)
-    xjo_sma200 = xjo_close.rolling(200).mean()
-    xjo_sma_aligned = xjo_sma200.reindex(fm.index, method="ffill").fillna(xjo_aligned)
-    fm["xjo_sma_position"] = (xjo_aligned > xjo_sma_aligned).astype(float)
+        fm["xjo_momentum_63d"] = xjo_aligned.pct_change(63).fillna(0).astype(float) * 100
+        xjo_sma200 = xjo_close.rolling(200).mean()
+        xjo_sma_aligned = xjo_sma200.reindex(fm.index, method="ffill").fillna(xjo_aligned)
+        fm["xjo_sma_position"] = (xjo_aligned > xjo_sma_aligned).astype(float)
+        fm["xjo_vol_20d"] = xjo_aligned.pct_change().rolling(20).std().fillna(0).astype(float) * np.sqrt(252)
 
-    # XJO 20-day volatility
-    fm["xjo_vol_20d"] = xjo_aligned.pct_change().rolling(20).std().fillna(0).astype(float) * np.sqrt(252)
+        xjo_mom = xjo_aligned.pct_change(63).fillna(0) * 100
+        sym_close = symbol_df["Close"].astype(float)
+        sym_mom = sym_close.pct_change(63).fillna(0) * 100
+        fm["relative_strength_vs_xjo"] = (sym_mom - xjo_mom).fillna(0).astype(float)
+    else:
+        fm["xjo_momentum_63d"] = 0.0
+        fm["xjo_sma_position"] = 0.0
+        fm["xjo_vol_20d"] = 0.0
+        fm["relative_strength_vs_xjo"] = 0.0
 
-    # Relative strength: symbol momentum / XJO momentum
-    xjo_mom = xjo_aligned.pct_change(63).fillna(0) * 100
-    sym_close = symbol_df["Close"].astype(float)
-    sym_mom = sym_close.pct_change(63).fillna(0) * 100
-    fm["relative_strength_vs_xjo"] = (sym_mom - xjo_mom).fillna(0).astype(float)
+    if "vix" in macro:
+        vix_aligned = macro["vix"].reindex(fm_dates, method="ffill")
+        vix_aligned = vix_aligned.fillna(method="bfill").fillna(20).values
+        fm["vix_level"] = vix_aligned.astype(float)
+    else:
+        fm["vix_level"] = 20.0
 
-    for col in ["xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d", "relative_strength_vs_xjo"]:
+    if "copper_gold_ratio" in macro:
+        cg_aligned = macro["copper_gold_ratio"].reindex(fm_dates, method="ffill")
+        cg_aligned = cg_aligned.fillna(method="bfill").fillna(0.004).values
+        fm["copper_gold_ratio"] = cg_aligned.astype(float)
+    else:
+        fm["copper_gold_ratio"] = 0.004
+
+    if "yield_curve_slope" in macro:
+        yc_aligned = macro["yield_curve_slope"].reindex(fm_dates, method="ffill")
+        yc_aligned = yc_aligned.fillna(method="bfill").fillna(0).values
+        fm["yield_curve_slope"] = yc_aligned.astype(float)
+    else:
+        fm["yield_curve_slope"] = 0.0
+
+    if "aud_usd" in macro:
+        aud_aligned = macro["aud_usd"].reindex(fm_dates, method="ffill")
+        aud_aligned = aud_aligned.fillna(method="bfill").fillna(0.65).values
+        fm["aud_usd_trend"] = np.log(aud_aligned).astype(float)
+    else:
+        fm["aud_usd_trend"] = np.log(0.65)
+
+    for col in MACRO_COLS:
         fm[col] = fm[col].fillna(0)
 
     return fm

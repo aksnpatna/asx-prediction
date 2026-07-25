@@ -213,6 +213,9 @@ Walk-Forward OOS tracks performance with:
 
 1. **Sequential model** — LSTM or transformer for time-series pattern detection (requires more epochs)
 2. **Fundamental backfill to 2017** — Current fundamentals date to July 2026 only; historical snapshots would improve older sample quality
-3. **Macro features** — VIX, copper/gold ratio, yield curve as direct model features instead of only persona context
-4. **Adaptive thresholds** — Auto-adjust tier cutoffs based on current WFO gate state
-5. **EODHD fundamental endpoint** — Paid upgrade for deeper fundamental data (book value, FCF, debt ratios)
+3. **EODHD fundamental endpoint** — Paid upgrade for deeper fundamental data (book value, FCF, debt ratios)
+
+## Recently Completed
+
+3. **Macro features** ✅ (July 2026) — VIX, copper/gold ratio, AU yield curve slope, AUD/USD trend added as direct model features (59 total, $0 cost)
+4. **Adaptive thresholds** ✅ (July 2026) — WFO gate (GREEN/AMBER/RED) auto-adjusts 8%/10% tier cutoffs

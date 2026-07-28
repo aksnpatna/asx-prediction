@@ -93,8 +93,10 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["donchian_breakout"] = (close >= donchian_20).astype(float)
 
     vol_avg20 = vol.rolling(20).mean().shift(1)
-    fm["volume_spike"] = vol / (vol_avg20 + 1e-9)
-    fm["volume_ratio"] = (vol - vol_avg20).abs() / (vol_avg20 + 1e-9)
+    # Clip volume ratios to prevent extreme outliers (e.g. $0 avg_vol for
+    # delisted / micro-cap stocks) from corrupting the scaler and model weights.
+    fm["volume_spike"] = (vol / (vol_avg20 + 1e-9)).clip(0.01, 50.0)
+    fm["volume_ratio"] = ((vol - vol_avg20).abs() / (vol_avg20 + 1e-9)).clip(0.0, 50.0)
 
     obv_delta = np.sign(close.diff()).fillna(0) * vol
     obv = obv_delta.cumsum()
@@ -103,7 +105,7 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
     mf = ((close - low) - (high - close)) / (high - low + 1e-9)
     mf_vol = mf * vol
-    cmf_series = mf_vol.rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)
+    cmf_series = (mf_vol.rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)).clip(-5.0, 5.0)
     fm["cmf"] = cmf_series
     fm["cmf_bullish"] = (cmf_series > 0.10).astype(float)
 
@@ -162,14 +164,14 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     )
     fm["signal_cluster"] = bullish_signals
     fm["trend_strength"] = fm["momentum_20d"].abs().fillna(0) * fm["adx"].fillna(20) / 100.0
-    fm["rsi_vol_adj"] = fm["rsi"].fillna(50) / (fm["hv_20d"].fillna(0.2) + 1.0)
-    fm["mom_per_vol"] = fm["momentum_20d"].fillna(0) / (fm["hv_20d"].fillna(0.2) + 1e-9)
+    fm["rsi_vol_adj"] = (fm["rsi"].fillna(50) / (fm["hv_20d"].fillna(0.2) + 1.0)).clip(0, 1000)
+    fm["mom_per_vol"] = (fm["momentum_20d"].fillna(0) / (fm["hv_20d"].fillna(0.2) + 1e-9)).clip(-200, 200)
     fm["dist_from_sma50"] = (close - sma50.fillna(close)) / (sma50.fillna(close) + 1e-9) * 100
     rsi_z = (fm["rsi"].fillna(50) - 50) / (fm["rsi"].rolling(63).std().fillna(15) + 1e-9)
     macd_z = fm["macd_hist"].fillna(0) / (fm["macd_hist"].rolling(63).std().fillna(0.01) + 1e-9)
     fm["rsi_macd_div"] = (rsi_z - macd_z).clip(-100, 100)
     fm["vol_confirm"] = fm["volume_spike"].fillna(1) * np.sign(fm["momentum_20d"].fillna(0))
-    fm["bb_squeeze_ratio"] = fm["bb_width"].fillna(0.05) / (fm["atr_pct"].fillna(0.01) + 1e-9)
+    fm["bb_squeeze_ratio"] = (fm["bb_width"].fillna(0.05) / (fm["atr_pct"].fillna(0.01) + 1e-9)).clip(0.1, 50.0)
 
     # ── Market regime features ────────────────────────────────────────────────
     sma_alignment = np.where(close > sma20, 0.33, 0) + np.where(sma20 > sma50, 0.33, 0) + np.where(sma50 > sma200, 0.34, 0)

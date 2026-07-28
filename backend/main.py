@@ -75,6 +75,16 @@ EODHD_API_KEY = os.getenv("EODHD_API_KEY", "").strip()
 # extra inter-call sleep, and dry-run mode for LLM calls.
 UAT_MODE = os.getenv("ENV", "production").upper() == "UAT"
 
+# ── Paper Bootstrapping Mode ────────────────────────────────────────────────────
+# When PAPER_BOOTSTRAP_MODE=1, the WFO capital gate is bypassed for paper trades
+# (real capital is never deployed).  This lets the system auto-execute AI-approved
+# picks as paper trades, accumulate evaluation data, and self-learn without
+# waiting for manual user action.  Max 5 bootstrapping positions are kept open.
+# Once WFO graduates to AMBER/GREEN, bootstrapping naturally phases out.
+PAPER_BOOTSTRAP_MODE = os.getenv("PAPER_BOOTSTRAP_MODE", "1").strip() in {"1", "true", "yes", "on"}
+PAPER_BOOTSTRAP_MAX_POSITIONS = int(os.getenv("PAPER_BOOTSTRAP_MAX_POSITIONS", "5"))
+PAPER_BOOTSTRAP_AUTO_EXECUTE = os.getenv("PAPER_BOOTSTRAP_AUTO_EXECUTE", "1").strip() in {"1", "true", "yes", "on"}
+
 # ── EODHD Rate Limiter (thread-safe token bucket for 20 calls/min free tier) ──
 _EODHD_RATE_LOCK = threading.Lock()
 _EODHD_LAST_CALL = 0.0
@@ -2046,7 +2056,23 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["fund_pct_from_52w_high"] = float(c.get("pct_from_52w_high", 0) or 0)
 
         model_score_raw = 0.0
+        _scaler_ok = False
         if _weights and _scaler_stats:
+            # ── Scaler sanity check: if volume_spike mean/scale are extreme outliers,
+            #     the scaler was trained on corrupt data.  Fall back to raw path so
+            #     scores remain discriminative instead of collapsing to a narrow band.
+            try:
+                feature_order = _scaler_stats.get("feature_order", ML_FEATURES)
+                vol_idx = feature_order.index("volume_spike") if "volume_spike" in feature_order else -1
+                vol_mean = _scaler_stats.get("mean", [])[vol_idx] if vol_idx >= 0 else 0
+                if vol_mean > 1000:  # reasonable volume_spike ≈ 0.5–5
+                    print(f"[EnrichTiers] Scaler corrupted (volume_spike mean={vol_mean:.0f}) — falling back to raw path.")
+                    _scaler_ok = False
+                else:
+                    _scaler_ok = True
+            except Exception:
+                _scaler_ok = True  # couldn't check, assume ok
+        if _weights and _scaler_stats and _scaler_ok:
             # Apply StandardScaler: (x - mean) / scale
             feat_values = []
             feature_order = _scaler_stats.get("feature_order", ML_FEATURES)
@@ -2066,31 +2092,46 @@ def _enrich_candidates_with_tiers(candidates: list):
         c["_model_score"] = round(model_score_raw, 4)
         c["_model_confidence"] = min(99, max(1, round(max(0, model_score_raw) * 100)))
 
-        # ── Adaptive tier thresholds based on WFO gate state ──────────────
-        base_8pct = 0.155
-        base_10pct = 0.22
-        try:
-            wfo_state = get_current_wfo_state()
-            gate = wfo_state.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
-            if gate == "RED":
-                base_8pct = 0.25
-                base_10pct = 0.35
-            elif gate == "AMBER":
-                base_8pct = 0.18
-                base_10pct = 0.25
-            # GREEN or INSUFFICIENT_DATA: use base thresholds
-        except Exception:
-            pass
+    # ── After all candidates scored: use percentile-based tier thresholds ──
+    # Hardcoded thresholds (0.22 / 0.155) are meaningless because model_score
+    # is an uncalibrated dot product — its scale depends on feature scaling and
+    # Ridge coefficient magnitudes, which vary between training runs.
+    # Instead we rank candidates within each scan batch: top ~10% get 10pct
+    # tier, next ~15% get 8pct tier, remainder get watch.
+    scores = [(c.get("_model_score", 0) or 0, c) for c in candidates if c.get("_model_score", 0) is not None]
+    scores.sort(key=lambda x: x[0], reverse=True)
+    n = len(scores)
+    cutoff_10pct_idx = max(1, int(n * 0.10))
+    cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.25))
 
-        if model_score_raw >= base_10pct:
+    # Use WFO gate to widen/narrow tiers
+    try:
+        wfo_state = get_current_wfo_state()
+        gate = wfo_state.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
+        if gate == "RED":
+            cutoff_10pct_idx = max(1, int(n * 0.05))
+            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.12))
+        elif gate == "AMBER":
+            cutoff_10pct_idx = max(1, int(n * 0.08))
+            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.20))
+    except Exception:
+        pass
+
+    cutoff_10pct = scores[cutoff_10pct_idx - 1][0] if n > 0 else 999
+    cutoff_8pct = scores[min(cutoff_8pct_idx - 1, n - 1)][0] if n > 0 else 999
+
+    for i, (score_val, c) in enumerate(scores):
+        if i < cutoff_10pct_idx:
             c["_target_tier"] = "10pct"
             c["_tier_label"] = "10% TARGET TIER"
-        elif model_score_raw >= base_8pct:
+        elif i < cutoff_8pct_idx:
             c["_target_tier"] = "8pct"
             c["_tier_label"] = "8% COMPOUND TIER"
         else:
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
+
+    print(f"[EnrichTiers] {n} candidates scored | 10% cutoff={cutoff_10pct:.4f} ({cutoff_10pct_idx} stocks) | 8% cutoff={cutoff_8pct:.4f} ({cutoff_8pct_idx} stocks)")
 
 
 def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: dict,
@@ -11006,8 +11047,6 @@ def _scheduled_uat_health_report():
 
 
 def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
-    # ── Every-15min position monitor alerts SUPPRESSED — position checks still run, alerts disabled ──
-    return
     try:
         now = datetime.utcnow()
         min_interval_minutes = max(1, int(os.getenv("PAPER_MONITOR_MIN_INTERVAL_MIN", "10")))
@@ -11849,8 +11888,9 @@ def _scheduled_self_learning_loop():
                 WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
             """)).fetchall()
 
-            if len(trades) < 8:
-                print(f"[SelfLearning] Need ≥8 closed trades for PID (have {len(trades)}).")
+            min_trades = 3 if PAPER_BOOTSTRAP_MODE else 8
+            if len(trades) < min_trades:
+                print(f"[SelfLearning] Need ≥{min_trades} closed trades for PID (have {len(trades)}).")
                 return
 
             win_count = 0
@@ -12183,6 +12223,24 @@ def _scheduled_daily_ai_pipeline():
                 if size["warnings"]:
                     warn_note = "\n⚠️ " + ", ".join(size["warnings"])
 
+                # ── Bootstrapping auto-execute: create paper trade automatically ──
+                auto_trade_id = None
+                if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
+                    gate = _wfo_position_gate()
+                    if gate["allowed"]:
+                        auto_trade_id = _auto_create_paper_trade(
+                            uid, sym, market, qty, price,
+                            source_reason="wealth_builder_bootstrap",
+                            notes="AI auto-executed bootstrap paper trade"
+                        )
+                        if auto_trade_id:
+                            print(f"[DailyAI] Auto-executed bootstrap paper trade: {sym} x{qty} @ ${price:.2f} (id={auto_trade_id})")
+                            warn_note += "\n🤖 AUTO-EXECUTED (bootstrap mode)"
+                        else:
+                            print(f"[DailyAI] Auto-execute failed for {sym}")
+                    else:
+                        warn_note += f"\n⛔ Bootstrap gate: {gate['reason']}"
+
                 buy_msg = (
                     f"<b>✅ AI-APPROVED — {tier}</b>\n"
                     f"{sym} — {cand.get('name', sym)}\n\n"
@@ -12317,6 +12375,10 @@ def get_current_wfo_state() -> dict:
 def _wfo_position_gate(user_id: str = None) -> dict:
     """Enforce WFO capital deployment limits before opening a new position.
 
+    When PAPER_BOOTSTRAP_MODE is active, paper trades bypass the WFO gate so the
+    system can accumulate evaluation data and self-learn without manual intervention.
+    Real capital deployment is never allowed during bootstrapping.
+
     Returns:
         {"allowed": bool, "max_positions": int, "max_pct": int, "reason": str}
     """
@@ -12325,6 +12387,34 @@ def _wfo_position_gate(user_id: str = None) -> dict:
     rules = wfo["rules"]
 
     if not rules["allow_new_positions"]:
+        # ── Paper bootstrapping bypass: allow paper trades to accumulate data ──
+        if PAPER_BOOTSTRAP_MODE:
+            bootstrap_count = 0
+            try:
+                with db_conn() as conn:
+                    count_row = conn.execute(text(
+                        "SELECT COUNT(*) FROM paper_trades WHERE status = 'open' AND (source_reason LIKE 'wealth_builder%' OR source_reason = 'telegram_buy')"
+                    )).fetchone()
+                    bootstrap_count = count_row[0] if count_row else 0
+            except Exception:
+                pass
+            if bootstrap_count < PAPER_BOOTSTRAP_MAX_POSITIONS:
+                paper_cap = max(1, PAPER_BOOTSTRAP_MAX_POSITIONS - bootstrap_count)
+                return {
+                    "allowed": True,
+                    "max_positions": PAPER_BOOTSTRAP_MAX_POSITIONS,
+                    "max_single_pct": 8,
+                    "max_sector_pct": 40,
+                    "reason": f"WFO state {state}: bootstrapping ({bootstrap_count}/{PAPER_BOOTSTRAP_MAX_POSITIONS} paper positions). New entries allowed.",
+                }
+            else:
+                return {
+                    "allowed": False,
+                    "max_positions": 0,
+                    "max_single_pct": 0,
+                    "max_sector_pct": 0,
+                    "reason": f"WFO state {state}: bootstrapping cap reached ({bootstrap_count}/{PAPER_BOOTSTRAP_MAX_POSITIONS}). {rules['description']}",
+                }
         return {
             "allowed": False,
             "max_positions": 0,
@@ -12338,7 +12428,7 @@ def _wfo_position_gate(user_id: str = None) -> dict:
     try:
         with db_conn() as conn:
             count_row = conn.execute(text(
-                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open' AND source LIKE 'wealth_builder%'"
+                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open' AND (source_reason LIKE 'wealth_builder%' OR source_reason = 'telegram_buy')"
             )).fetchone()
             open_count = count_row[0] if count_row else 0
     except Exception:
@@ -13406,7 +13496,8 @@ def _send_telegram_reply(chat_id: str, text: str) -> None:
         pass
 
 
-def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: float, entry_price: float) -> Optional[str]:
+def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: float, entry_price: float,
+                             source_reason: str = "telegram_buy", notes: str = None) -> Optional[str]:
     """Create a paper trade with sensible defaults for auto-monitoring.
     Returns the trade_id or None on failure.
     """
@@ -13419,6 +13510,7 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
         take_profit_price = round(target_price, 3)
         trade_id = str(uuid4())
         now = datetime.utcnow()
+        trade_notes = notes or f'Auto-created from {source_reason}'
         with db_conn() as conn:
             conn.execute(text("""
                 INSERT INTO paper_trades
@@ -13429,9 +13521,9 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 VALUES
                     (:id, :user_id, :symbol, :market, 'LONG', :quantity, :entry_price, :entry_price,
                      :target_price, 'open', :signal_score, :signal_trend, NULL,
-                     'Auto-created from Telegram BUY command', :entry_price,
+                     :notes, :entry_price,
                      :stop_loss, :take_profit, 3.0, :review_date,
-                     'entered', 'BUY', 'telegram_buy', :now)
+                     'entered', 'BUY', :source_reason, :now)
             """), {
                 "id": trade_id, "user_id": user_id, "symbol": symbol, "market": market,
                 "quantity": quantity, "entry_price": entry_price,
@@ -13441,11 +13533,13 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 "stop_loss": stop_loss_price, "take_profit": take_profit_price,
                 "review_date": now + timedelta(days=14),
                 "now": now,
+                "source_reason": source_reason,
+                "notes": trade_notes,
             })
         log_position_event(trade_id, user_id, "opened",
-                           f"Auto-opened from Telegram BUY {symbol}",
+                           f"Auto-opened via {source_reason}: {symbol}",
                            {"entry_price": entry_price, "stop_loss": stop_loss_price,
-                            "take_profit": take_profit_price})
+                            "take_profit": take_profit_price, "source_reason": source_reason})
         return trade_id
     except Exception:
         return None

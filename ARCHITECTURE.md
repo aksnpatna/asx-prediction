@@ -1,10 +1,11 @@
 # ASX Prediction — Layer 1 + Layer 2 Architecture
 
-> **Date:** 2026-07-27  
+> **Date:** 2026-07-28  
 > **Model:** 59-feature ensemble (30% Ridge + 40% LightGBM + 30% RandomForest) with sample weighting  
 > **Target:** 8% peak return within 63 days (10% premium tier)  
 > **Training data:** 1,553 ASX tickers × 9 years (2017–2026) = 1.65M labelled examples (100K trained, 20K test)  
-> **Infrastructure:** Docker Compose (FastAPI + React + PostgreSQL) behind Cloudflare Tunnel
+> **Infrastructure:** Docker Compose (FastAPI + React + PostgreSQL) behind Cloudflare Tunnel  
+> **Bootstrapping:** Paper-trade auto-execute mode for cold-start / WFO INSUFFICIENT_DATA
 
 ---
 
@@ -79,6 +80,11 @@ The 3% model was essentially "buy anything in a bull market" — 79% of stocks h
 | Live scoring | Broken (1.5e14 scores) | **Calibrated (Ridge + StandardScaler)** | 0.2–0.6 score range |
 | yfinance resilience | Fragile .txt file | **YFinanceService (circuit breaker + 30d TTL)** | No pipeline crashes |
 | Adaptive thresholds | Fixed cutoffs | **WFO gate (GREEN/AMBER/RED)** | Auto-reduces exposure |
+| Tier classification | Hardcoded 0.22/0.155 thresholds | **Percentile-based (top 10% / next 15%)** | Immune to scaler drift |
+| Scaler corruption | Volume spike mean=115B (broken) | **Sanity check + raw fallback** | Zero-score collapse fixed |
+| Paper trade monitor | Suppressed (early return) | **Re-enabled (every 15 min)** | Stop-loss/take-profit active |
+| Bootstrapping | WFO INSUFFICIENT_DATA = gate locked | **Auto-execute paper trades** | Self-learning from day 1 |
+| Self-learning PID | Needs 8 closed trades | **3 in bootstrap mode** | Calibration starts earlier |
 
 ---
 
@@ -128,21 +134,25 @@ PE inverse, forward PE, market cap, dividend yield, analyst upside, analyst rec,
 
 ---
 
-## Tier Classification (Adaptive — WFO Gate)
+## Tier Classification (Percentile-Based — WFO Gate Adaptive)
 
-| WFO Gate | 8% Tier | 10% Tier |
-|---|---|---|
-| GREEN / INSUFFICIENT | score ≥ 0.155 | score ≥ 0.22 |
-| AMBER | score ≥ 0.18 | score ≥ 0.25 |
-| RED | score ≥ 0.25 | score ≥ 0.35 |
+Model scores are an uncalibrated dot-product of Ridge coefficients via 59-feature vectors. The absolute score scale drifts between training runs because coefficient magnitudes depend on the underlying data distribution at train time. Hardcoded thresholds (0.22 / 0.155) break when the scaler or feature distribution shifts.
 
-When the model underperforms OOS (gate AMBER/RED), thresholds auto-adjust upward → fewer picks qualify → reduced exposure. Default (GREEN) thresholds below:
+**Fix (July 28):** Tier cutoffs are now **percentile-based** within each scan batch. This makes tiering immune to score-scale drift — the top performers always surface regardless of whether model scores range from 2–5 or −2 to 0.
 
-| Model Score | Tier | Target | Allocation |
+| WFO Gate | 10pct Tier | 8pct Tier | Description |
 |---|---|---|---|
-| ≥ 0.22 (GREEN) | 🚀 **10% Target** | +10% peak / 63d | 30% of capital |
-| ≥ 0.155 (GREEN) | 📈 **8% Compound** | +8% peak / 63d | 70% of capital |
-| < threshold | ⏳ Watch | — | Not alerted |
+| GREEN / INSUFFICIENT | Top 10% | Next 15% | Standard allocation |
+| AMBER | Top 8% | Next 12% | Tighten when edge unproven |
+| RED | Top 5% | Next 7% | Minimal exposure until edge returns |
+
+**Scaler corruption protection (July 28):** Before applying StandardScaler, the code checks that `volume_spike` mean is < 1,000 (sane values are 0.5–5). If the scaler was trained on corrupted training data (e.g., 115B mean from micro-cap volume division-by-zero), it falls back to the raw (unstandardized) dot-product path. Training matrix now clips volume_spike, volume_ratio, cmf, rsi_vol_adj, mom_per_vol, and bb_squeeze_ratio to prevent future corruption.
+
+| Model Score Rank | Tier | Target | Allocation |
+|---|---|---|---|
+| Top 10% | 🚀 **10% Target** | +10% peak / 63d | 30% of capital |
+| Next 15% | 📈 **8% Compound** | +8% peak / 63d | 70% of capital |
+| Bottom 75% | ⏳ Watch | — | Not alerted |
 
 ---
 
@@ -161,19 +171,21 @@ All personas emit structured `VERDICT: BUY | HOLD | SELL` tags. Consensus counte
 
 ---
 
-## Daily Schedule (Only 8AM Alerts Fire)
+## Daily Schedule
 
 | Time | Job | Alert? |
 |---|---|---|
 | 03:00 | OHLC incremental update (EODHD bulk API) | No |
-| 05:00 | Broad scan: 1,553 tickers → 59-feature ensemble scoring | **No** (suppressed) |
+| 05:00 | Broad scan: 1,553 tickers → 59-feature ensemble scoring → percentile-based tiering | No |
 | 07:00 | Model retraining + fundamental enrichment + macro feature composition | No |
-| 08:15 | AI deep-dive: 6 personas → approved picks with Buy buttons | **YES** (only alert) |
-| Every 15min | Paper trade monitor (earnings/triggers) | **No** (suppressed) |
-| 10AM–3PM | Auto positions monitor (stop-loss/profit) | **No** (suppressed) |
-| 4:30PM | UAT health report | **No** (suppressed) |
+| 08:15 | AI deep-dive: 6 personas → approved picks with Buy buttons + **auto-execute paper trades (bootstrap)** | **YES** |
+| Every 15min | Paper trade monitor (stop-loss, take-profit, trailing stop, earnings alerts) | Yes |
+| 10AM–3PM | Auto positions monitor (sentiment-driven alerts) | Yes |
+| 4:30PM | UAT health report | No |
 
-**Duplicate buy prevention:** Before sending buy alerts, the system checks if the user already has an open paper trade for that stock. Already-bought tickers are skipped.
+**Duplicate buy prevention:** Before sending buy alerts or auto-executing, the system checks if the user already has an open paper trade for that stock. Already-bought tickers are skipped.
+
+**Auto-execute (bootstrap mode, July 28):** When `PAPER_BOOTSTRAP_MODE=1`, AI-approved 10% and 8% tier stocks are auto-created as paper trades at the 8:15 AM pipeline. No manual Telegram `BUY` command required. Max 5 bootstrapping positions are kept open. The WFO gate is bypassed for paper trades during bootstrapping (real capital is never deployed). Once WFO graduates to GREEN, auto-execute naturally phases out.
 
 ---
 
@@ -184,6 +196,41 @@ Walk-Forward OOS tracks performance with:
 - **Peak-based** evaluation (matches training labels — tracks max within window, not close return)  
 - **Per-tier** tracking (10% and 8% tiers separately)  
 - **Capital gate** (GREEN/AMBER/RED) controlling position sizing
+
+---
+
+## Bootstrapping & Self-Learning Loop (July 28)
+
+The system has a cold-start problem: WFO defaults to INSUFFICIENT_DATA (max 0 positions) until 20+ evaluated signals accumulate at each horizon. Without manual trades, the gate stays locked — a chicken-and-egg deadlock.
+
+### Bootstrapping Mode (`PAPER_BOOTSTRAP_MODE=1`, on by default)
+
+| Env Var | Default | Controls |
+|---|---|---|
+| `PAPER_BOOTSTRAP_MODE` | `1` | Bypass WFO gate for paper trades during INSUFFICIENT_DATA/RED |
+| `PAPER_BOOTSTRAP_MAX_POSITIONS` | `5` | Max paper positions to auto-open |
+| `PAPER_BOOTSTRAP_AUTO_EXECUTE` | `1` | Auto-create paper trades in AI pipeline without manual BUY |
+
+**Flow:**
+```
+5AM Broad Scan → percentile tiering → 8:15AM AI pipeline →
+  APPROVE stocks → auto-create paper trades (source_reason=wealth_builder_bootstrap) →
+  15min paper trade monitor (stop-loss/take-profit active) →
+    Trades close → self-learning evaluates → PID adjusts DYNAMIC_PENALTIES →
+      WFO sees evaluation data → ~30 days → graduates to GREEN
+```
+
+### Self-Learning PID Loop (Sunday 2AM)
+
+Evaluates closed trades and uses a PID controller to adjust `DYNAMIC_PENALTIES` (VIX, PE, short interest penalties):
+
+| Win Rate vs Target | Action |
+|---|---|
+| < 50% (error > 5pp) | Tighten penalties by 0.03 |
+| > 60% (error < −5pp) | Loosen penalties by 0.02 |
+| 50–60% (±5pp of 55% target) | Strategy calibrated — hold steady |
+
+**Minimum trades:** 8 in production, **3 in bootstrap mode**. Floor/ceiling bounds prevent penalties from going ≤0.3 or ≥0.95.
 
 ---
 
@@ -226,21 +273,25 @@ Walk-Forward OOS tracks performance with:
 
 ## Performance Comparison: Old vs New
 
-| Metric | Original (June 2026) | July 24 (55 feat) | July 27 (59 feat) | Change |
-|---|---|---|---|---|
-| Model type | Ridge only (41 feat) | Ensemble (55 feat) | Ensemble (59 feat) | +4 macro features |
-| Training window | 5yr (2021–2026) | 9yr (2017–2026) | 9yr (2017–2026) | — |
-| Target threshold | 3% peak / 63d | 8% peak / 63d | 8% peak / 63d | — |
-| Baseline hit rate | 79.1% | 61.0% | 58.0% | More room to discriminate |
-| OOS R² (8% target) | 0.0185 | 0.127 | **0.142** | +11.6% from macro |
-| LightGBM OOS R² (8%) | −0.005 | 0.121 | **0.155** | +28% from macro |
-| OOS R² (10% target) | — | — | **0.166** | Premium tier discriminates better |
-| Bear market lift | Untested | **+28.7%** | — | — |
-| Fundamentals coverage | 737 symbols | 1,295 symbols | 1,295 symbols | — |
-| yfinance resilience | Manual .txt | 30-day TTL | 30-day TTL | — |
-| Adaptive thresholds | No | Yes | Yes | WFO-gated |
-| Macro features | Persona context | 4 XJO features | 8 total (XJO + pure macro) | Former items #3, 4 done |
-| AI deep-dive cadence | 6 slots/day | 1 (8AM only) | 1 (8AM only) | Reduced noise |
+| Metric | Original (June 2026) | July 24 (55 feat) | July 27 (59 feat) | July 28 (59 feat) | Change |
+|---|---|---|---|---|---|
+| Model type | Ridge only (41 feat) | Ensemble (55 feat) | Ensemble (59 feat) | Ensemble (59 feat) | — |
+| Training window | 5yr (2021–2026) | 9yr (2017–2026) | 9yr (2017–2026) | 9yr (2017–2026) | — |
+| Target threshold | 3% peak / 63d | 8% peak / 63d | 8% peak / 63d | 8% peak / 63d | — |
+| Baseline hit rate | 79.1% | 61.0% | 58.0% | 58.0% | — |
+| OOS R² (8% target) | 0.0185 | 0.127 | **0.142** | **0.142** | +11.6% from macro |
+| LightGBM OOS R² (8%) | −0.005 | 0.121 | **0.155** | **0.155** | +28% from macro |
+| OOS R² (10% target) | — | — | **0.166** | **0.166** | Premium tier |
+| Bear market lift | Untested | **+28.7%** | — | — | — |
+| Fundamentals coverage | 737 symbols | 1,295 symbols | 1,295 symbols | 1,295 symbols | — |
+| yfinance resilience | Manual .txt | 30-day TTL | 30-day TTL | 30-day TTL | — |
+| Adaptive thresholds | No | Yes | Yes | Yes | WFO-gated |
+| Macro features | Persona context | 4 XJO features | 8 total (XJO + macro) | 8 total | #3, 4 done |
+| AI deep-dive cadence | 6 slots/day | 1 (8AM only) | 1 (8AM only) | 1 (8AM only) | Reduced noise |
+| Tier classification | Fixed 0.22/0.155 | Fixed cutoffs | Fixed cutoffs | **Percentile-based** | Immune to drift |
+| Paper trade auto-execute | No | No | No | **Yes (bootstrap)** | Self-learning day 1 |
+| Scaler corruption guard | No | No | No | **Yes** | Volume ratio clip |
+| Self-learning min trades | — | 8 | 8 | **3 (bootstrap)** | Faster calibration |
 
 ---
 
@@ -252,5 +303,7 @@ Walk-Forward OOS tracks performance with:
 
 ## Recently Completed
 
+- **Percentile-based tiering + scaler corruption guard** ✅ (July 28) — Hardcoded 0.22/0.155 tier thresholds replaced with percentile ranking (top 10% = 10pct, next 15% = 8pct). Scaler sanity check detects corrupted training data (volume_spike mean > 1000) and falls back to raw dot-product path. Training matrix now clips volume_spike, volume_ratio, cmf, rsi_vol_adj, mom_per_vol, and bb_squeeze_ratio to prevent future corruption. Corrupted scaler rows deleted from DB.
+- **Bootstrapping mode** ✅ (July 28) — `PAPER_BOOTSTRAP_MODE=1` bypasses WFO gate for paper trades during INSUFFICIENT_DATA. AI-approved stocks auto-execute as paper trades (no manual BUY command needed). Paper trade monitor re-enabled (was suppressed with early `return`). Self-learning PID minimum lowered from 8→3 trades in bootstrap mode. WFO gate SQL fixed (`source` → `source_reason` column). Max 5 bootstrapping positions.
 - **Macro features as model features** ✅ (July 27) — VIX, copper/gold ratio, AU yield curve slope, AUD/USD trend added as direct model features (59 total, $0 cost). AUD/USD and copper/gold are now the #1–2 features by weight. Ensemble R² improved from 0.127 → 0.142 (+11.6%).
 - **Adaptive thresholds** ✅ (July 24) — WFO gate (GREEN/AMBER/RED) auto-adjusts 8%/10% tier cutoffs to control exposure when OOS underperforms.

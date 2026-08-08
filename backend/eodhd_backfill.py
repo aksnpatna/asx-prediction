@@ -176,6 +176,9 @@ def backfill_asx_universe(batch_size: int = 500, max_workers: int = 4):
                     dt = d.get("date", "")
                     if not dt:
                         continue
+                    adjusted = d.get("adjusted_close")
+                    raw_close = d.get("close", 0)
+                    stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
                     rows.append(
                         (
                             symbol,
@@ -184,7 +187,7 @@ def backfill_asx_universe(batch_size: int = 500, max_workers: int = 4):
                             d.get("open"),
                             d.get("high"),
                             d.get("low"),
-                            d.get("close"),
+                            stored_close,
                             d.get("volume", 0),
                         )
                     )
@@ -246,6 +249,9 @@ def incremental_daily_update() -> dict:
                         continue
                     sym = code.replace(".AU", "").replace(".AX", "")
                     dt = item.get("date", date.today().isoformat())
+                    adjusted = item.get("adjusted_close")
+                    raw_close = item.get("close", 0)
+                    stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
                     rows.append(
                         (
                             sym,
@@ -254,7 +260,7 @@ def incremental_daily_update() -> dict:
                             item.get("open"),
                             item.get("high"),
                             item.get("low"),
-                            item.get("close"),
+                            stored_close,
                             item.get("volume", 0),
                         )
                     )

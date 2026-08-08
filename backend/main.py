@@ -731,6 +731,40 @@ def init_db():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sentiment_log_user_symbol ON position_sentiment_log(user_id, symbol, created_at DESC)"))
 
+        # ── SMSF v2 migrations ──────────────────────────────────────────────
+        for mt_sql in [
+            "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS hit_5pct_before_m5pct BOOLEAN",
+            "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS hit_8pct_before_m8pct BOOLEAN",
+            "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS close_5pct_63d BOOLEAN",
+        ]:
+            try:
+                conn.execute(text(mt_sql))
+            except Exception:
+                pass
+
+        for pt_sql in [
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS catastrophe_stop_price REAL",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS time_stop_date DATE",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_thesis TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sector TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_type TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_reason TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_date_parsed DATE",
+        ]:
+            try:
+                conn.execute(text(pt_sql))
+            except Exception:
+                pass
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS portfolio_peak_tracker (
+                id SERIAL PRIMARY KEY,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                peak_value REAL NOT NULL
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_peak_time ON portfolio_peak_tracker(recorded_at DESC)"))
+
 init_db()
 
 # Data models
@@ -13483,6 +13517,42 @@ def _parse_trade_command(text: str) -> Optional[dict]:
 
 
 def _send_telegram_reply(chat_id: str, text: str) -> None:
+    """Send a simple text message to a specific chat_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except Exception:
+        pass
+
+
+def _send_telegram_broadcast(message_html: str, message_type: str = "smsf") -> None:
+    """Send a message to all active Telegram recipients across all users. Fire-and-forget."""
+    if not TELEGRAM_BOT_TOKEN or not message_html:
+        return
+    try:
+        with db_conn() as conn:
+            recipients = conn.execute(text("""
+                SELECT DISTINCT chat_id FROM user_telegram_recipients WHERE is_active = TRUE
+            """)).fetchall()
+            for (chat_id,) in recipients:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": chat_id, "text": message_html, "parse_mode": "HTML"},
+                        timeout=8,
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _send_telegram_reply(chat_id: str, text: str) -> None:
     """Send a plain-text reply back to a Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
@@ -13500,8 +13570,20 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                              source_reason: str = "telegram_buy", notes: str = None) -> Optional[str]:
     """Create a paper trade with sensible defaults for auto-monitoring.
     Returns the trade_id or None on failure.
+    Prevents duplicate open positions for the same symbol.
     """
     try:
+        # ── Duplicate position guard ──────────────────────────────────────
+        with db_conn() as conn:
+            existing = conn.execute(text("""
+                SELECT COUNT(*) FROM paper_trades
+                WHERE user_id = :uid AND symbol = :sym AND status = 'open'
+            """), {"uid": user_id, "sym": symbol}).fetchone()
+            if existing and existing[0] > 0:
+                print(f"[AutoCreate] SKIP {symbol} — open position already exists")
+                return None
+        # ── End duplicate guard ───────────────────────────────────────────
+
         signal = get_probability_and_score(symbol)
         predicted = float(signal.get("predicted_price_3m") or 0)
         # For a LONG trade, target must be > entry. If the model is bearish, default to 12% upside.
@@ -13872,6 +13954,218 @@ def _scheduled_monthly_fundamentals():
         print(f"[FundFeeder] Failed: {e}")
 
 
+# ── SMSF v2 Pipeline Functions ─────────────────────────────────────────────
+
+def _scheduled_smsf_pipeline():
+    """7AM daily: run position sentinel + calendar gate check for all open positions."""
+    jid = _log_job_start("smsf_pipeline")
+    started = datetime.utcnow()
+    alerts = []
+    try:
+        from position_sentinel import evaluate_position
+        from calendar_gate import get_calendar_status
+        from macro_rotation import classify_regime, build_telegram_regime_report
+
+        users = _get_all_telegram_users()
+        for user in users:
+            uid = user["id"]
+            paper = list_paper_trades(uid)
+            open_positions = [p for p in paper if p.get("status") == "open"]
+            if not open_positions:
+                continue
+
+            # Calendar gate
+            wfo = get_current_wfo_state()
+            cal = get_calendar_status(
+                wfo_state=wfo["state"],
+                axjo_vs_sma200_pct=_get_axjo_vs_sma200(),
+                vix=_get_vix_level(),
+            )
+            if cal.get("stop_tighten_pct", 0) > 0:
+                alerts.append(f"📅 Calendar: {cal['reason']} — tighten stops by {cal['stop_tighten_pct']}%")
+
+            # Position sentinel
+            macro_note = ""
+            try:
+                regime = classify_regime({})
+                macro_note = regime.get("alert", "")
+            except Exception:
+                pass
+
+            for pos in open_positions:
+                try:
+                    result = evaluate_position(
+                        symbol=pos.get("symbol", ""),
+                        sector=pos.get("sector", "Unknown"),
+                        entry_date=pos.get("entry_date_parsed", date.today()),
+                        entry_price=float(pos.get("entry_price", 0)),
+                        current_price=float(pos.get("current_price", 0)),
+                    )
+                    if result.get("verdict") == "BROKEN":
+                        alerts.append(f"🚨 SENTINEL BROKEN: {result['symbol']} — {result.get('reason','')[:100]}")
+                        _auto_close_paper_trade(uid, result["symbol"], "AU",
+                                                float(pos.get("current_price", 0)))
+                    elif result.get("verdict") == "WEAKENED":
+                        alerts.append(f"⚠️ SENTINEL WEAKENED: {result['symbol']} — {result.get('reason','')[:100]}")
+                except Exception as e:
+                    print(f"[SMSF] Sentinel failed for {pos.get('symbol')}: {e}")
+
+        if alerts:
+            _send_telegram_broadcast("\n".join(alerts), "smsf_sentinel")
+        _log_job_finish(jid, rows_affected=len(alerts), started_at=started)
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[SMSF] Pipeline failed: {e}")
+
+
+def _scheduled_sunday_rotation():
+    """Sunday 6PM: Run macro rotation dashboard + Telegram regime report."""
+    jid = _log_job_start("sunday_rotation")
+    started = datetime.utcnow()
+    try:
+        from macro_rotation import classify_regime, build_telegram_regime_report
+        from calendar_gate import get_calendar_status
+
+        macro_data = {}
+        try:
+            macro_data = _fetch_macro_dashboard_data()
+        except Exception:
+            pass
+
+        regime = classify_regime(macro_data)
+        report = build_telegram_regime_report(regime)
+
+        cal = get_calendar_status()
+        report += f"\n\n📅 <b>Next Week Calendar Signal:</b> {cal.get('calendar_signal','NORMAL')} — {cal.get('reason','')}"
+
+        _send_telegram_broadcast(report, "sunday_rotation")
+        _log_job_finish(jid, started_at=started)
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[Rotation] Failed: {e}")
+
+
+def _scheduled_smsf_announcement_check():
+    """Every 60 min during market hours: check ASX announcements for open positions."""
+    try:
+        from announcement_monitor import check_all_open_positions, build_telegram_alert
+
+        users = _get_all_telegram_users()
+        for user in users:
+            paper = list_paper_trades(user["id"])
+            open_positions = [p for p in paper if p.get("status") == "open"]
+            if not open_positions:
+                continue
+            alerts = check_all_open_positions(open_positions)
+            critical = [a for a in alerts if a.get("status") == "CRITICAL_ANNOUNCEMENT"]
+            if critical:
+                msg = build_telegram_alert(alerts)
+                if msg:
+                    _send_telegram_broadcast(msg, "smsf_announcements")
+                    for a in critical:
+                        uid = a.get("user_id") or user.get("id")
+                        _auto_close_paper_trade(uid, a["code"], "AU",
+                                                float(a.get("current_price", 0)))
+    except Exception as e:
+        print(f"[AnnCheck] Failed: {e}")
+
+
+def _scheduled_smsf_eod_checks():
+    """4:35 PM: CGT timer + circuit breaker check + EOD daily summary."""
+    jid = _log_job_start("smsf_eod")
+    started = datetime.utcnow()
+    lines = ["📊 <b>SMSF End-of-Day Check</b>"]
+    try:
+        from tax_tracker import TaxTracker
+        from circuit_breaker import DrawdownCircuitBreaker, get_peak_value, persist_peak_value
+
+        users = _get_all_telegram_users()
+        for user in users:
+            uid = user["id"]
+            paper = list_paper_trades(uid)
+            closed = [p for p in paper if p.get("status") == "closed"]
+            open_positions = [p for p in paper if p.get("status") == "open"]
+
+            # Portfolio value
+            cash = _estimate_cash(uid)
+            satellite_value = sum(float(p.get("current_price", 0)) * float(p.get("quantity", 0))
+                                  for p in open_positions)
+            portfolio_value = cash + satellite_value
+            persist_peak_value(portfolio_value)
+
+            breaker = DrawdownCircuitBreaker(peak_value=get_peak_value())
+            state = breaker.check(portfolio_value)
+            lines.append(breaker.get_status_str(state))
+
+            # CGT
+            tracker = TaxTracker()
+            for status in tracker.batch_status(open_positions):
+                if status.get("alert"):
+                    lines.append(f"  ⏰ {status['alert']}")
+
+            # Positions summary
+            lines.append(f"\n💼 {len(open_positions)} open | {len(closed)} closed (lifetime)")
+            if open_positions:
+                lines.append("Open:")
+                for p in open_positions:
+                    pnl = (float(p.get("current_price", 0)) / float(p.get("entry_price", 1)) - 1) * 100
+                    lines.append(f"  {p['symbol']}: {pnl:+.1f}% ({p.get('days_held','?')}d)")
+
+        _send_telegram_broadcast("\n".join(lines), "smsf_eod")
+        _log_job_finish(jid, started_at=started)
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[SMSF EOD] Failed: {e}")
+
+
+def _get_all_telegram_users():
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(text("SELECT DISTINCT user_id as id FROM user_telegram_recipients")).fetchall()
+            return [{"id": r[0]} for r in rows] if rows else [{"id": "default"}]
+    except Exception:
+        return [{"id": "default"}]
+
+
+def _estimate_cash(user_id: str) -> float:
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text(
+                "SELECT COALESCE(total_investment_budget, 0) FROM users WHERE id = :uid"
+            ), {"uid": user_id}).fetchone()
+            return float(row[0]) if row else 200_000.0
+    except Exception:
+        return 200_000.0
+
+
+def _get_axjo_vs_sma200() -> float:
+    try:
+        from eodhd_backfill import get_ohlc_for_symbol
+        df = get_ohlc_for_symbol("XJO")
+        if not df.empty and len(df) > 200:
+            close = df["Close"].astype(float)
+            sma200 = close.rolling(200).mean().iloc[-1]
+            return (close.iloc[-1] / sma200 - 1) if sma200 > 0 else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_vix_level() -> float:
+    try:
+        import yfinance as yf
+        vix = yf.download("^VIX", period="5d", progress=False)
+        if not vix.empty:
+            return float(vix["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 18.0
+
+
+def _fetch_macro_dashboard_data() -> dict:
+    return {}
+
+
 if SCHEDULER_AVAILABLE:
 
     try:
@@ -13960,6 +14254,32 @@ if SCHEDULER_AVAILABLE:
             _scheduled_monthly_fundamentals, "cron",
             day="1", hour=4, minute=0,
             id="monthly_fundamentals",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_smsf_pipeline, "cron",
+            minute=0, hour=7,
+            day_of_week="mon-fri",
+            id="smsf_pipeline_7am",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_sunday_rotation, "cron",
+            day_of_week="sun", hour=18, minute=0,
+            id="sunday_rotation",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_smsf_announcement_check, "cron",
+            minute="0", id="smsf_ann_check",
+            max_instances=1,
+            hour="10-15", day_of_week="mon-fri",
+        )
+        scheduler.add_job(
+            _scheduled_smsf_eod_checks, "cron",
+            minute=35, hour=16,
+            day_of_week="mon-fri",
+            id="smsf_eod_checks",
             max_instances=1,
         )
         scheduler.start()

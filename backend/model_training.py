@@ -51,6 +51,8 @@ FEATURE_COLS = [
     "relative_strength_vs_xjo",
     # Pure macro features (VIX, copper/gold, yield curve, AUD/USD) — $0 API cost
     "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
+    # New timing features (SMSF v2)
+    "mean_reversion_score", "squeeze_duration", "rsi_during_squeeze",
 ]
 
 
@@ -172,6 +174,31 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["rsi_macd_div"] = (rsi_z - macd_z).clip(-100, 100)
     fm["vol_confirm"] = fm["volume_spike"].fillna(1) * np.sign(fm["momentum_20d"].fillna(0))
     fm["bb_squeeze_ratio"] = (fm["bb_width"].fillna(0.05) / (fm["atr_pct"].fillna(0.01) + 1e-9)).clip(0.1, 50.0)
+
+    # ── Mean Reversion Score (SMSF v2) ─────────────────────────────────────
+    rsi_low_10d = rsi_series.rolling(10).min()
+    rsi_now = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
+    rsi_recovering = ((rsi_low_10d < 35) & (rsi_now > 40)).astype(float)
+    vol_20d_avg = vol.rolling(20).mean().shift(1)
+    vol_dry_up = (1 - vol / (vol_20d_avg + 1e-9)).clip(0, 1)
+    high_52w = close.rolling(252).max()
+    pct_from_high = (close / (high_52w + 1e-9) - 1) * 100
+    in_sweet_spot = ((-40 <= pct_from_high) & (pct_from_high <= -15)).astype(float)
+    daily_range = (high - low) / (close + 1e-9)
+    range_narrowing = (daily_range.rolling(5).mean() < daily_range.rolling(60).mean() * 0.7).astype(float)
+    fm["mean_reversion_score"] = (
+        rsi_recovering * 0.35 + vol_dry_up * 0.25 +
+        in_sweet_spot * 0.25 + range_narrowing * 0.15
+    ).fillna(0).clip(0, 1)
+
+    # ── Squeeze Duration + RSI during squeeze (SMSF v2) ────────────────────
+    bb_w = fm["bb_width"].fillna(0.05)
+    bb_w_threshold = bb_w.rolling(252).quantile(0.20).fillna(bb_w.median())
+    in_squeeze_s = (bb_w < bb_w_threshold).astype(float)
+    squeeze_dur = in_squeeze_s * (in_squeeze_s.groupby(in_squeeze_s.diff().ne(0).cumsum()).cumsum())
+    fm["squeeze_duration"] = squeeze_dur.fillna(0)
+    fm["rsi_during_squeeze"] = (fm["rsi"].fillna(50) * in_squeeze_s).rolling(10, min_periods=1).mean().fillna(50)
+
 
     # ── Market regime features ────────────────────────────────────────────────
     sma_alignment = np.where(close > sma20, 0.33, 0) + np.where(sma20 > sma50, 0.33, 0) + np.where(sma50 > sma200, 0.34, 0)
@@ -569,10 +596,16 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
                 hit_10pct_63d = fwd_peak >= 10.0
                 direction_correct = fwd_ret > 0
 
+                # ── Path-aware labels (SMSF v2): hit target BEFORE hitting stop ──
+                hit_5pct_before_m5pct = fwd_peak >= 5.0 and fwd_dd > -5.0
+                hit_8pct_before_m8pct = fwd_peak >= 8.0 and fwd_dd > -8.0
+                close_5pct_63d = fwd_ret >= 5.0
+
                 rows_to_insert.append((symbol, market, signal_date, entry_price,
                     json.dumps(feat_row), fwd_ret, fwd_peak, fwd_dd,
                     hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
-                    hit_8pct_63d, hit_10pct_63d, direction_correct))
+                    hit_8pct_63d, hit_10pct_63d, direction_correct,
+                    hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d))
 
             if rows_to_insert:
                 try:
@@ -583,8 +616,10 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
                                 (symbol, market, signal_date, entry_price, features,
                                  forward_return_63d, forward_peak_return_63d, forward_max_drawdown_63d,
                                  hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
-                                 hit_8pct_63d, hit_10pct_63d, direction_correct)
-                                VALUES (:s,:m,:d,:p,:f,:fr,:fp,:fd,:h,:h14,:h30,:h5,:h8,:h10,:dc)
+                                 hit_8pct_63d, hit_10pct_63d, direction_correct,
+                                 hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d)
+                                VALUES (:s,:m,:d,:p,:f,:fr,:fp,:fd,:h,:h14,:h30,:h5,:h8,:h10,:dc,
+                                        :h5m5,:h8m8,:c5)
                                 ON CONFLICT (symbol, market, signal_date) DO UPDATE SET
                                 entry_price=EXCLUDED.entry_price, features=EXCLUDED.features,
                                 forward_return_63d=EXCLUDED.forward_return_63d,
@@ -596,11 +631,15 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
                                 hit_5pct_63d=EXCLUDED.hit_5pct_63d,
                                 hit_8pct_63d=EXCLUDED.hit_8pct_63d,
                                 hit_10pct_63d=EXCLUDED.hit_10pct_63d,
-                                direction_correct=EXCLUDED.direction_correct
+                                direction_correct=EXCLUDED.direction_correct,
+                                hit_5pct_before_m5pct=EXCLUDED.hit_5pct_before_m5pct,
+                                hit_8pct_before_m8pct=EXCLUDED.hit_8pct_before_m8pct,
+                                close_5pct_63d=EXCLUDED.close_5pct_63d
                             """), {"s": row[0], "m": row[1], "d": row[2], "p": row[3], "f": row[4],
                                    "fr": row[5], "fp": row[6], "fd": row[7], "h": row[8],
                                    "h14": row[9], "h30": row[10], "h5": row[11],
-                                   "h8": row[12], "h10": row[13], "dc": row[14]})
+                                   "h8": row[12], "h10": row[13], "dc": row[14],
+                                   "h5m5": row[15], "h8m8": row[16], "c5": row[17]})
                         conn.commit()
                     inserted += len(rows_to_insert)
                 except Exception as e:
@@ -627,8 +666,8 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
     return {"rows_inserted": inserted, "errors": errors, "symbols_processed": total_symbols}
 
 
-def fit_model_weights(target_col: str = "hit_8pct_63d", min_samples: int = MIN_TRAINING_SAMPLES) -> Optional[dict]:
-    """Fit ensemble regression (Ridge + LightGBM + RandomForest) on 8% hit classification.
+def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: int = MIN_TRAINING_SAMPLES) -> Optional[dict]:
+    """Fit ensemble regression (Ridge + LightGBM + RandomForest) on +8% before -8% path-aware label.
 
     Uses chronological train/test split: earliest 80% train, most recent 20% validate.
     Blends predictions: 0.30×Ridge + 0.40×LightGBM + 0.30×RandomForest.

@@ -1,0 +1,1 @@
+"""SMSF configuration package."""

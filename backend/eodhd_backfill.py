@@ -27,7 +27,7 @@ _EODHD_KEY = ""
 _DAILY_CALL_LIMIT = 50000
 _SAFETY_MARGIN = 0.80
 
-BACKFILL_YEARS = 9
+BACKFILL_YEARS = 11  # 2015 → present
 FROM_DATE = (date.today() - timedelta(days=int(BACKFILL_YEARS * 365))).isoformat()
 
 

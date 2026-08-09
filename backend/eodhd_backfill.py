@@ -94,7 +94,9 @@ def _insert_ohlc_batch(conn, rows: list):
                 f"""
             INSERT INTO eod_ohl_history (symbol, market, trade_date, open, high, low, close, volume)
             VALUES {values_clause}
-            ON CONFLICT (symbol, market, trade_date) DO NOTHING
+            ON CONFLICT (symbol, market, trade_date) DO UPDATE SET
+            open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+            close = EXCLUDED.close, volume = EXCLUDED.volume
         """
             ),
             params,

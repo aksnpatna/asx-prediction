@@ -5932,6 +5932,145 @@ async def health_check():
     }
 
 
+@app.get("/api/smsf/dashboard")
+async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
+    """SMSF v2 Driver Dashboard — consolidated view of strategy, positions, risk, and pipeline state."""
+    uid = current_user["id"]
+    result = {
+        "portfolio": {"value": 0, "cash": 0, "pnl_pct": 0, "open_count": 0, "closed_count": 0},
+        "circuit_breaker": {"level": "NORMAL", "drawdown_pct": 0, "peak_value": 0, "description": "Normal"},
+        "calendar": {"signal": "NEUTRAL", "emoji": "📅", "score_multiplier": 1.0, "allow_new": True, "max_new": 12},
+        "model": {"target": "hit_8pct_before_m8pct", "feature_count": 62, "weights_age_hours": 0},
+        "regime": {"regime": "NEUTRAL", "alert": "Normal regime", "color": "#1a2235", "sector_weights": {}},
+        "cgt_alerts": [],
+        "positions": [],
+        "announcements": [],
+        "backfill_complete": True,
+        "data_from": "2017",
+        "data_to": "2026",
+    }
+
+    try:
+        # Portfolio
+        paper = list_paper_trades(uid)
+        open_positions = [p for p in paper if p.get("status") == "open"]
+        closed_positions = [p for p in paper if p.get("status") == "closed"]
+
+        cash = 0
+        try:
+            with db_conn() as c:
+                row = c.execute(text("SELECT total_investment_budget FROM users WHERE id = :uid"), {"uid": uid}).fetchone()
+                if row: cash = float(row[0])
+        except: pass
+        if cash == 0: cash = 200_000
+
+        satellite_value = sum(float(p.get("current_price", 0)) * float(p.get("quantity", 0)) for p in open_positions)
+        total_value = cash + satellite_value
+
+        result["portfolio"] = {
+            "value": round(total_value, 0), "cash": round(cash, 0),
+            "pnl_pct": round((total_value / 200_000 - 1) * 100, 1),
+            "open_count": len(open_positions), "closed_count": len(closed_positions),
+        }
+
+        # Circuit breaker
+        from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
+        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), 200000))
+        breaker_state = breaker.check(total_value)
+        result["circuit_breaker"] = {
+            "level": breaker_state["level"], "drawdown_pct": breaker_state.get("drawdown_pct", 0),
+            "peak_value": breaker_state.get("peak_value", total_value),
+            "description": breaker_state.get("description", ""),
+        }
+
+        # Calendar gate
+        from calendar_gate import get_calendar_status
+        cal = get_calendar_status(wfo_state=get_current_wfo_state()["state"])
+        result["calendar"] = {
+            "signal": cal.get("calendar_signal", "NEUTRAL"),
+            "emoji": {"STRONG": "🟢", "MODERATE": "🔵", "NEUTRAL": "⚪", "CAUTION": "🟡", "AVOID": "🔴", "SUPPRESSED": "⛔"}.get(cal.get("calendar_signal", ""), "📅"),
+            "score_multiplier": cal.get("score_multiplier", 1.0),
+            "allow_new": cal.get("allow_new_entries", True),
+            "max_new": cal.get("max_new_positions", 12),
+        }
+
+        # Model
+        try:
+            with db_conn() as c:
+                latest = c.execute(text("SELECT MAX(trained_at), LEFT(notes, 200) FROM model_weights_by_date WHERE model_type='pathaware_v2' OR model_type='ridge'")).fetchone()
+                if latest and latest[0]:
+                    age_h = (datetime.utcnow() - latest[0].replace(tzinfo=None) if hasattr(latest[0], 'replace') else 24).total_seconds() / 3600
+                    result["model"]["weights_age_hours"] = round(max(0, age_h) if not isinstance(age_h, complex) else 24, 1)
+                    result["model"]["feature_count"] = 62
+        except: pass
+
+        # Macro regime
+        try:
+            from macro_rotation import classify_regime
+            regime = classify_regime({})
+            result["regime"] = {
+                "regime": regime.get("regime", "NEUTRAL"),
+                "alert": regime.get("alert", ""),
+                "color": {"RISK_ON_COMMODITY": "#2d5016", "RISK_ON_GROWTH": "#1a3a5c", "RISK_OFF": "#5c1a1a", "CARRY_UNWIND": "#5c4a1a"}.get(regime.get("regime", ""), "#1a2235"),
+                "sector_weights": regime.get("sector_weights", {}),
+            }
+        except: pass
+
+        # CGT Alerts
+        try:
+            from tax_tracker import TaxTracker
+            tracker = TaxTracker()
+            result["cgt_alerts"] = [
+                s for s in tracker.batch_status([
+                    {"symbol": p.get("symbol",""), "entry_price": p.get("entry_price",0),
+                     "current_price": p.get("current_price",0), "id": p.get("id",""),
+                     "entry_date": p.get("entry_date") or p.get("created_at")}
+                    for p in open_positions
+                ]) if s.get("alert")
+            ][:5]
+        except: pass
+
+        # Positions (no LLM call per position — uses cached sentinel from DB if available)
+        for p in open_positions:
+            ep = float(p.get("entry_price", 0))
+            cp = float(p.get("current_price", 0))
+            ed_str = p.get("entry_date_parsed") or p.get("created_at") or ""
+            days_held = 0
+            try:
+                from datetime import date
+                if ed_str:
+                    if isinstance(ed_str, str):
+                        ed = date.fromisoformat(ed_str[:10])
+                    else:
+                        ed = ed_str.date() if hasattr(ed_str, 'date') else date.today()
+                    days_held = (date.today() - ed).days
+            except: pass
+
+            sentinel_verdict = p.get("position_stage", "entered")
+            if sentinel_verdict not in ("INTACT", "WEAKENED", "BROKEN"):
+                sentinel_verdict = "INTACT"
+
+            result["positions"].append({
+                "symbol": p.get("symbol",""),
+                "entry_price": round(ep, 3),
+                "current_price": round(cp, 3),
+                "pnl_pct": round((cp / ep - 1) * 100, 2) if ep > 0 else 0,
+                "days_held": days_held,
+                "sentinel_verdict": sentinel_verdict,
+                "exit_signal": "HOLD",
+                "exit_reason": None,
+                "cgt_defer": False,
+            })
+
+        # Data state
+        result["data_from"] = "2015"
+        result["data_to"] = datetime.utcnow().strftime("%Y-%m")
+
+        return result
+    except Exception as e:
+        return {"error": str(e), **result}
+
+
 @app.get("/api/v1/market/pulse")
 async def market_pulse(current_user: dict = Depends(get_current_user)):
     del current_user
@@ -14170,118 +14309,59 @@ if SCHEDULER_AVAILABLE:
 
     try:
         scheduler = BackgroundScheduler(timezone=_get_scheduler_timezone())
-        cron_expr = os.getenv("WEEKLY_GENERATION_CRON", "0 8 * * 1")  # Monday 8AM
-        parts = cron_expr.split()
-        scheduler.add_job(
-            _scheduled_weekly_generation, "cron",
-            minute=int(parts[0]) if len(parts) > 0 else 0,
-            hour=int(parts[1]) if len(parts) > 1 else 8,
-            day_of_week="mon",
-        )
-        scheduler.add_job(
-            _scheduled_paper_trade_monitor, "cron",
-            minute="0,15,30,45"
-        )
-        scheduler.add_job(
-            _scheduled_positions_monitor, "cron",
-            minute="0", hour="10-15", day_of_week="mon-fri",
-            id="positions_monitor_2h",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_broad_scan_precompute, "cron",
-            minute=0, hour=5,
-            day_of_week="mon-fri",
-            id="broad_scan_5am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_wealth_builder_evaluate, "cron",
-            minute=5, hour=16,
-            day_of_week="mon-fri",
-            id="wealth_builder_evaluate",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_self_learning_loop, "cron",
-            day_of_week="sun", hour=2, minute=0,
-            id="self_learning_loop",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_daily_ai_pipeline, "cron",
-            minute=15, hour=8,
-            day_of_week="mon-fri",
-            id="daily_ai_pipeline",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_walk_forward_oos, "cron",
-            minute=15, hour=16,
-            day_of_week="mon-fri",
-            id="walk_forward_oos",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_uat_health_report, "cron",
-            minute=30, hour=16,
-            day_of_week="mon-fri",
-            id="uat_health_report",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_inc_update, "cron",
-            minute=0, hour=3,
-            day_of_week="mon-fri",
-            id="inc_update_3am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_model_training, "cron",
-            minute=0, hour=8,
-            day_of_week="mon-fri",
-            id="model_training_8am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_channel_calibration, "cron",
-            minute=0, hour=9,
-            day_of_week="mon-fri",
-            id="channel_cal_9am",
-            max_instances=1,
-        )
-        scheduler.add_job(
-            _scheduled_monthly_fundamentals, "cron",
-            day="1", hour=4, minute=0,
-            id="monthly_fundamentals",
-            max_instances=1,
-        )
+
+        # ── SMSF v2 Core Pipeline ────────────────────────────────────────
         scheduler.add_job(
             _scheduled_smsf_pipeline, "cron",
-            minute=0, hour=7,
-            day_of_week="mon-fri",
-            id="smsf_pipeline_7am",
-            max_instances=1,
+            minute=0, hour=7, day_of_week="mon-fri",
+            id="smsf_pipeline_7am", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_sunday_rotation, "cron",
             day_of_week="sun", hour=18, minute=0,
-            id="sunday_rotation",
-            max_instances=1,
+            id="sunday_rotation", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_smsf_announcement_check, "cron",
-            minute="0", id="smsf_ann_check",
-            max_instances=1,
-            hour="10-15", day_of_week="mon-fri",
+            minute="0", hour="10-15", day_of_week="mon-fri",
+            id="smsf_ann_check", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_smsf_eod_checks, "cron",
-            minute=35, hour=16,
-            day_of_week="mon-fri",
-            id="smsf_eod_checks",
-            max_instances=1,
+            minute=35, hour=16, day_of_week="mon-fri",
+            id="smsf_eod_checks", max_instances=1,
         )
+
+        # ── Paper Trade Monitoring ───────────────────────────────────────
+        scheduler.add_job(
+            _scheduled_paper_trade_monitor, "cron",
+            minute="0,15,30,45", id="paper_trade_monitor",
+        )
+
+        # ── Essential Data Pipeline ──────────────────────────────────────
+        scheduler.add_job(
+            _scheduled_inc_update, "cron",
+            minute=0, hour=3, day_of_week="mon-fri",
+            id="inc_update_3am", max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_model_training, "cron",
+            minute=0, hour=8, day_of_week="mon-fri",
+            id="model_training_8am", max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_monthly_fundamentals, "cron",
+            day="1", hour=4, minute=0,
+            id="monthly_fundamentals", max_instances=1,
+        )
+
+        # ── Walk-Forward OOS Validation ──────────────────────────────────
+        scheduler.add_job(
+            _scheduled_walk_forward_oos, "cron",
+            minute=15, hour=16, day_of_week="mon-fri",
+            id="walk_forward_oos", max_instances=1,
+        )
+
         scheduler.start()
 
         # ── Startup Catch-Up Engine ───────────────────────────────────────────

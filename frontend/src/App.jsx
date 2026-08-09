@@ -3,6 +3,7 @@ import axios from 'axios'
 import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
+import SmsfTab from './SmsfTab'
 import DiscoverTab from './DiscoverTab'
 import NewsSentimentMonitor from './NewsSentimentMonitor'
 import StrategyTab from './StrategyTab'
@@ -906,7 +907,7 @@ function App() {
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [activeTab, setActiveTab] = useState('tracker')
+  const [activeTab, setActiveTab] = useState('smsf')
 
   const [topUniverse, setTopUniverse] = useState([])
   const [aiQuery, setAiQuery] = useState('Find ASX shares with strong momentum and low volatility')
@@ -1902,23 +1903,20 @@ function App() {
           </div>
           <div className="nav-scroll-wrap">
           <nav className="nav">
+            <button className={`nav-btn ${activeTab === 'smsf' ? 'active' : ''}`} onClick={() => setActiveTab('smsf')} title="SMSF Dashboard"><span className="nav-icon">🏠</span><span className="nav-label-text">SMSF</span></button>
             <button className={`nav-btn ${activeTab === 'tracker' ? 'active' : ''}`} onClick={() => setActiveTab('tracker')} title="Strategy"><span className="nav-icon">📋</span><span className="nav-label-text">Strategy</span></button>
-            <button className={`nav-btn ${activeTab === 'wealth' ? 'active' : ''}`} onClick={() => setActiveTab('wealth')} title="Wealth Builder"><span className="nav-icon">🏦</span><span className="nav-label-text">Wealth</span></button>
-            <button className={`nav-btn ${activeTab === 'market' ? 'active' : ''}`} onClick={() => setActiveTab('market')} title="Market"><span className="nav-icon">📊</span><span className="nav-label-text">Market</span></button>
             <button className={`nav-btn ${activeTab === 'analyze' ? 'active' : ''}`} onClick={() => setActiveTab('analyze')} title="Analyze"><span className="nav-icon">🔍</span><span className="nav-label-text">Analyze</span></button>
+            <button className={`nav-btn ${activeTab === 'market' ? 'active' : ''}`} onClick={() => setActiveTab('market')} title="Market"><span className="nav-icon">📊</span><span className="nav-label-text">Market</span></button>
             <button className={`nav-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')} title="Portfolio"><span className="nav-icon">💼</span><span className="nav-label-text">Portfolio</span></button>
-            <button className={`nav-btn ${activeTab === 'weekly' ? 'active' : ''}`} onClick={() => { setActiveTab('weekly'); if (!weeklyData) fetchWeeklyDigest(); if (!weeklySectors) fetchWeeklySectors() }} title="Weekly"><span className="nav-icon">📅</span><span className="nav-label-text">Weekly</span></button>
-            <button className={`nav-btn ${activeTab === 'candidates' ? 'active' : ''}`} onClick={() => setActiveTab('candidates')} title="Candidates"><span className="nav-icon">⭐</span><span className="nav-label-text">Candidates</span></button>
-            <button className={`nav-btn ${activeTab === 'crypto' ? 'active' : ''}`} onClick={() => { setActiveTab('crypto'); if (!cryptoMarket) fetchCryptoMarket(); fetchCryptoWatchlist() }} title="Crypto"><span className="nav-icon">🪙</span><span className="nav-label-text">Crypto</span></button>
-            <button className={`nav-btn ${activeTab === 'etf' ? 'active' : ''}`} onClick={() => { setActiveTab('etf'); if (!etfList) fetchEtfList(); if (!etfSpotlight) fetchEtfSpotlight() }} title="ETFs"><span className="nav-icon">📈</span><span className="nav-label-text">ETFs</span></button>
+            <button className={`nav-btn ${activeTab === 'wealth' ? 'active' : ''}`} onClick={() => setActiveTab('wealth')} title="Wealth"><span className="nav-icon">🏦</span><span className="nav-label-text">Wealth</span></button>
             <button className={`nav-btn ${activeTab === 'explain' ? 'active' : ''}`} onClick={() => setActiveTab('explain')} title="Analytics"><span className="nav-icon">📉</span><span className="nav-label-text">Analytics</span></button>
             <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} className="market-selector-nav">
-              {['AU', 'US', 'IN'].map(m => (
+              {['AU'].map(m => (
                 <button key={m}
                   className={`nav-btn ${preferredMarket === m ? 'active' : ''}`}
                   onClick={() => updateMarket(m)}
                   title={EXCHANGE_LABELS[m]}>
-                  <span className="nav-icon">{MARKET_FLAGS[m]}</span><span className="nav-label-text">{m}</span>
+                  <span className="nav-icon">{MARKET_FLAGS[m]}</span><span className="nav-label-text">ASX</span>
                 </button>
               ))}
             </div>
@@ -1941,6 +1939,7 @@ function App() {
             <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6 }}>{aiBanner.summary}</p>
           </div>
         )}
+        {activeTab === 'smsf' && <SmsfTab />}
         {activeTab === 'tracker' && <StrategyTab token={token} preferredMarket={preferredMarket} />}
         {activeTab === 'candidates' && (
             <>

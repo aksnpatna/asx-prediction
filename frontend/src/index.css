@@ -578,3 +578,76 @@ body {
   .wealth-controls .add-btn { width: 100%; justify-content: center; }
   .legend-row { flex-direction: column !important; gap: 4px !important; }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   SMSF v2 Driver Dashboard
+   ══════════════════════════════════════════════════════════════ */
+.smsf-dashboard { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+.smsf-header { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+.smsf-header h1 { margin: 0; font-size: 1.8rem; color: #fff; }
+.smsf-badge { background: var(--ig-blue-accent); color: #000; padding: 2px 12px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+.smsf-date { color: #888; font-size: 0.85rem; margin-left: auto; }
+
+.smsf-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+.smsf-card { background: var(--bg-card); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 1.25rem; backdrop-filter: blur(8px); }
+.smsf-card .card-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 0.5rem; }
+.smsf-card .card-value { font-size: 2rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: #fff; }
+.smsf-card .card-sub { font-size: 0.85rem; color: #aaa; margin-top: 0.25rem; }
+.smsf-card .card-meta { font-size: 0.75rem; color: #666; margin-top: 0.5rem; }
+.smsf-card .separator { margin: 0 8px; color: #444; }
+.smsf-card.card-green { border-left: 3px solid var(--ig-gain); }
+.smsf-card.card-yellow { border-left: 3px solid var(--ig-warning); }
+.smsf-card.card-orange { border-left: 3px solid #FF8C00; }
+.smsf-card.card-red { border-left: 3px solid var(--ig-red); }
+.smsf-card.card-blue { border-left: 3px solid var(--ig-blue-accent); }
+.smsf-card.card-accent { border-left: 3px solid #6C5CE7; }
+
+.smsf-row { display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+.smsf-panel { background: var(--bg-card); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 1.25rem; }
+.smsf-panel h3 { margin: 0 0 1rem; font-size: 1rem; color: #ccc; }
+
+.regime-badge { display: inline-block; padding: 4px 14px; border-radius: 16px; font-weight: 700; font-size: 0.9rem; color: #fff; margin-bottom: 0.5rem; }
+.regime-alert { font-size: 0.8rem; color: #999; margin-bottom: 0.75rem; }
+
+.sector-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.sector-chip { padding: 3px 10px; border-radius: 10px; font-size: 0.75rem; background: rgba(255,255,255,0.05); color: #999; }
+.sector-chip.overweight { background: rgba(0,210,135,0.15); color: var(--ig-gain); }
+.sector-chip.underweight { background: rgba(255,51,51,0.12); color: var(--ig-red); }
+
+.alert-item { padding: 6px 10px; border-radius: 6px; margin-bottom: 4px; font-size: 0.85rem; }
+.alert-item.alert-warn { background: rgba(255,184,0,0.1); border-left: 2px solid var(--ig-warning); }
+.alert-item.alert-info { background: rgba(0,163,255,0.08); border-left: 2px solid var(--ig-blue-accent); }
+.alert-item.alert-critical { background: rgba(255,51,51,0.12); border-left: 2px solid var(--ig-red); }
+.alert-item.alert-watch { background: rgba(255,184,0,0.08); border-left: 2px solid var(--ig-warning); }
+.alert-item.muted { color: #666; }
+.keyword-tag { background: var(--ig-red); color: #fff; padding: 1px 6px; border-radius: 4px; font-size: 0.7rem; margin-left: 6px; }
+
+.smsf-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.smsf-table th { text-align: left; color: #888; padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); font-weight: 500; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px; }
+.smsf-table td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); color: #ccc; }
+.smsf-table .gain { color: var(--ig-gain); font-weight: 600; }
+.smsf-table .loss { color: var(--ig-red); font-weight: 600; }
+.smsf-table .text-small { font-size: 0.78rem; color: #888; }
+
+.row-broken { background: rgba(255,51,51,0.08) !important; }
+.row-weakened { background: rgba(255,184,0,0.06) !important; }
+
+.sentinel-badge { padding: 2px 8px; border-radius: 8px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+.sentinel-badge.sentinel-intact { background: rgba(0,210,135,0.15); color: var(--ig-gain); }
+.sentinel-badge.sentinel-weakened { background: rgba(255,184,0,0.15); color: var(--ig-warning); }
+.sentinel-badge.sentinel-broken { background: rgba(255,51,51,0.18); color: var(--ig-red); }
+
+.exit-alert { background: rgba(255,51,51,0.15); color: var(--ig-red); padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+.cgt-defer { color: var(--ig-blue-accent); }
+
+.pipeline-status { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: #888; flex-wrap: wrap; }
+.pipeline-status .separator { margin: 0 6px; color: #444; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot-green { background: var(--ig-gain); }
+.dot-yellow { background: var(--ig-warning); }
+.dot-red { background: var(--ig-red); }
+
+.alert-panel { border: 1px solid rgba(255,51,51,0.2); }
+
+.loading-spinner { padding: 3rem; text-align: center; color: #888; font-size: 1rem; }
+.error-banner { background: rgba(255,51,51,0.12); color: var(--ig-red); padding: 1rem; border-radius: 8px; text-align: center; }

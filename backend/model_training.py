@@ -929,8 +929,8 @@ def daily_training_pipeline() -> dict:
     t0 = time.time()
     matrix = build_training_matrix()
     results = {}
-    for target, label in [("hit_8pct_63d", "8% hit"),
-                           ("hit_10pct_63d", "10% hit"),
+    for target, label in [("hit_8pct_before_m8pct", "8% before -8%"),
+                           ("hit_8pct_63d", "8% peak (legacy)"),
                            ("hit_3pct_14d", "14d hit (3%)"),
                            ("hit_3pct_30d", "30d hit (3%)")]:
         print(f"[TrainPipeline] Fitting {label}...")

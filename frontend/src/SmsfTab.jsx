@@ -16,7 +16,7 @@ export default function SmsfTab() {
 
   const fetchSmsfData = async () => {
     try {
-      const token = localStorage.getItem('token')
+      const token = localStorage.getItem('asx_token')
       const { data } = await axios.get(`${API}/smsf/dashboard`, {
         headers: { Authorization: `Bearer ${token}` }
       })

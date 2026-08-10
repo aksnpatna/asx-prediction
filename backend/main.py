@@ -1882,18 +1882,22 @@ PORTFOLIO_MAX_ADV_PCT = float(os.getenv("MAX_ADV_PCT", "5"))
 PORTFOLIO_ASX_MIN_PARCEL = float(os.getenv("ASX_MIN_PARCEL", "500"))
 
 
-def get_starting_capital() -> float:
+def get_starting_capital(uid: str = None) -> float:
     try:
         with db_conn() as conn:
-            row = conn.execute(text("SELECT total_investment_budget FROM users LIMIT 1")).fetchone()
+            if uid:
+                row = conn.execute(text("SELECT total_investment_budget FROM users WHERE id = :uid"), {"uid": uid}).fetchone()
+            else:
+                row = conn.execute(text("SELECT total_investment_budget FROM users ORDER BY total_investment_budget DESC LIMIT 1")).fetchone()
+            
             if row and row[0] > 0:
                 return float(row[0])
     except Exception:
         pass
     return PORTFOLIO_STARTING_CAPITAL
 
-def _compute_portfolio_state() -> dict:
-    start_cap = get_starting_capital()
+def _compute_portfolio_state(uid: str = None) -> dict:
+    start_cap = get_starting_capital(uid)
     try:
         with db_conn() as conn:
             closed_pnl = conn.execute(text(
@@ -5967,7 +5971,7 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         open_positions = [p for p in paper if p.get("status") == "open"]
         closed_positions = [p for p in paper if p.get("status") == "closed"]
 
-        portfolio_state = _compute_portfolio_state()
+        portfolio_state = _compute_portfolio_state(uid)
         starting_capital = portfolio_state["starting_capital"]
         cash = portfolio_state["available_cash"]
         total_value = portfolio_state["total_equity"]
@@ -12254,11 +12258,10 @@ def _scheduled_daily_ai_pipeline():
                 continue
             tech = calculate_technical_indicators(hist)
             tech_compact = {k: v for k, v in tech.items() if k in [
-                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
-                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
-                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
-                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
-                "block_volume_detected", "bb_pct_b",
+                "rsi", "rsi_slope", "stoch_rsi", "macd", "macd_signal", "sma_200",
+                "ema_9", "ema_20", "ema_50", "volatility", "momentum_20", "adx",
+                "dmi_bullish", "atr_pct", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b", "cmf", "ttm_squeeze_on"
             ]}
             confluence = cand.get("confluence", {})
 
@@ -12533,11 +12536,10 @@ def _scheduled_v2_daily_scan():
                 continue
             tech = calculate_technical_indicators(hist)
             tech_compact = {k: v for k, v in tech.items() if k in [
-                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
-                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
-                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
-                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
-                "block_volume_detected", "bb_pct_b",
+                "rsi", "rsi_slope", "stoch_rsi", "macd", "macd_signal", "sma_200",
+                "ema_9", "ema_20", "ema_50", "volatility", "momentum_20", "adx",
+                "dmi_bullish", "atr_pct", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b", "cmf", "ttm_squeeze_on"
             ]}
             confluence = cand.get("confluence", {})
             val["model_tier"] = cand.get("_target_tier", "none")
@@ -14591,8 +14593,8 @@ if SCHEDULER_AVAILABLE:
         )
         scheduler.add_job(
             _scheduled_model_training, "cron",
-            minute=0, hour=8, day_of_week="mon-fri",
-            id="model_training_8am", max_instances=1,
+            minute=0, hour=7, day_of_week="mon-fri",
+            id="model_training_7am", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_monthly_fundamentals, "cron",
@@ -14603,8 +14605,8 @@ if SCHEDULER_AVAILABLE:
         # ── Walk-Forward OOS Validation ──────────────────────────────────
         scheduler.add_job(
             _scheduled_v2_daily_scan, "cron",
-            minute=30, hour=9, day_of_week="mon-fri",
-            id="v2_daily_scan_noon", max_instances=1,
+            minute=0, hour=8, day_of_week="mon-fri",
+            id="v2_daily_scan_8am", max_instances=1,
         )
 
         scheduler.add_job(
@@ -14797,7 +14799,7 @@ if SCHEDULER_AVAILABLE:
 
             # ── 8.5 V2 Daily Scan ────────────────────────────────────────────────
             try:
-                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 9:
+                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 8:
                     print(f"[StartupCatchup] Running V2 daily scan...")
                     _scheduled_v2_daily_scan()
                     tasks_run.append("v2_daily_scan")

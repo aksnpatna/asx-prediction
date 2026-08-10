@@ -14603,7 +14603,7 @@ if SCHEDULER_AVAILABLE:
         # ── Walk-Forward OOS Validation ──────────────────────────────────
         scheduler.add_job(
             _scheduled_v2_daily_scan, "cron",
-            minute=0, hour=12, day_of_week="mon-fri",
+            minute=30, hour=9, day_of_week="mon-fri",
             id="v2_daily_scan_noon", max_instances=1,
         )
 
@@ -14797,7 +14797,7 @@ if SCHEDULER_AVAILABLE:
 
             # ── 8.5 V2 Daily Scan ────────────────────────────────────────────────
             try:
-                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 12:
+                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 9:
                     print(f"[StartupCatchup] Running V2 daily scan...")
                     _scheduled_v2_daily_scan()
                     tasks_run.append("v2_daily_scan")

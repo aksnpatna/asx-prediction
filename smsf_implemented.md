@@ -222,8 +222,8 @@ provides genuine selection edge above base rates.
 |---|---|---|---|
 | Mon-Fri 03:00 | `inc_update_3am` | `_scheduled_inc_update` | EODHD incremental OHLC update (adjusted_close) |
 | Mon-Fri 07:00 | `smsf_pipeline_7am` | `_scheduled_smsf_pipeline` | Position sentinel (INTACT/WEAKENED/BROKEN) + calendar gate check |
-| Mon-Fri 08:00 | `model_training_8am` | `_scheduled_model_training` | Rebuild training matrix + retrain ensemble |
-| Mon-Fri 12:00 | `v2_daily_scan_noon` | `_scheduled_v2_daily_scan` | Generate Layer 1 predictions + AI agentic deep-dive + auto-execute paper trades |
+| Mon-Fri 07:00 | `model_training_8am` | `_scheduled_model_training` | Rebuild training matrix + retrain ensemble |
+| Mon-Fri 08:00 | `v2_daily_scan_noon` | `_scheduled_v2_daily_scan` | Generate Layer 1 predictions + AI agentic deep-dive + auto-execute paper trades |
 | Mon-Fri 10–15 hrly | `smsf_ann_check` | `_scheduled_smsf_announcement_check` | ASX announcement polling for open positions |
 | Mon-Fri 16:15 | `walk_forward_oos` | `_scheduled_walk_forward_oos` | Walk-forward OOS Sharpe validation |
 | Mon-Fri 16:35 | `smsf_eod_checks` | `_scheduled_smsf_eod_checks` | CGT timer + circuit breaker + EOD summary |

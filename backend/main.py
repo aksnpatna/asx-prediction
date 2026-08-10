@@ -5975,7 +5975,7 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
 
         # Circuit breaker
         from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
-        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), 200000))
+        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), PORTFOLIO_STARTING_CAPITAL))
         breaker_state = breaker.check(total_value)
         result["circuit_breaker"] = {
             "level": breaker_state["level"], "drawdown_pct": breaker_state.get("drawdown_pct", 0),

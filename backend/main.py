@@ -14785,7 +14785,8 @@ if SCHEDULER_AVAILABLE:
                 train_today = False
                 if _row and _row[0]:
                     _td = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    train_today = _td.date() == now_utc.date()
+                    _td_local = _td.replace(tzinfo=timezone.utc).astimezone(tz) if _td.tzinfo is None else _td.astimezone(tz)
+                    train_today = _td_local.date() == now_local.date()
                 if not train_today:
                     print(f"[StartupCatchup] Model not trained today — running training pipeline …")
                     _scheduled_model_training()
@@ -14815,7 +14816,8 @@ if SCHEDULER_AVAILABLE:
                 cal_today = False
                 if _row and _row[0]:
                     _cd = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    cal_today = _cd.date() == now_utc.date() if hasattr(_cd, 'date') else False
+                    _cd_local = _cd.replace(tzinfo=timezone.utc).astimezone(tz) if _cd.tzinfo is None else _cd.astimezone(tz)
+                    cal_today = _cd_local.date() == now_local.date()
                 if not cal_today:
                     print(f"[StartupCatchup] Channel calibration not run today — running …")
                     _scheduled_channel_calibration()

@@ -1882,7 +1882,18 @@ PORTFOLIO_MAX_ADV_PCT = float(os.getenv("MAX_ADV_PCT", "5"))
 PORTFOLIO_ASX_MIN_PARCEL = float(os.getenv("ASX_MIN_PARCEL", "500"))
 
 
+def get_starting_capital() -> float:
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text("SELECT total_investment_budget FROM users LIMIT 1")).fetchone()
+            if row and row[0] > 0:
+                return float(row[0])
+    except Exception:
+        pass
+    return PORTFOLIO_STARTING_CAPITAL
+
 def _compute_portfolio_state() -> dict:
+    start_cap = get_starting_capital()
     try:
         with db_conn() as conn:
             closed_pnl = conn.execute(text(
@@ -1894,17 +1905,17 @@ def _compute_portfolio_state() -> dict:
             )).fetchall()
         total_pnl = float(closed_pnl[0] or 0)
         invested = sum(float(r[1] or 0) for r in open_rows)
-        equity = PORTFOLIO_STARTING_CAPITAL + total_pnl
+        equity = start_cap + total_pnl
         available = equity - invested
         return {
-            "starting_capital": PORTFOLIO_STARTING_CAPITAL,
+            "starting_capital": start_cap,
             "total_equity": round(equity, 2),
             "invested": round(invested, 2),
             "available_cash": round(available, 2),
             "realized_pnl": round(total_pnl, 2),
         }
     except Exception:
-        return {"total_equity": PORTFOLIO_STARTING_CAPITAL, "available_cash": PORTFOLIO_STARTING_CAPITAL,
+        return {"total_equity": start_cap, "available_cash": start_cap,
                 "invested": 0, "realized_pnl": 0}
 
 
@@ -5956,26 +5967,21 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         open_positions = [p for p in paper if p.get("status") == "open"]
         closed_positions = [p for p in paper if p.get("status") == "closed"]
 
-        cash = 0
-        try:
-            with db_conn() as c:
-                row = c.execute(text("SELECT total_investment_budget FROM users WHERE id = :uid"), {"uid": uid}).fetchone()
-                if row: cash = float(row[0])
-        except: pass
-        if cash == 0: cash = 200_000
-
-        satellite_value = sum(float(p.get("current_price", 0)) * float(p.get("quantity", 0)) for p in open_positions)
-        total_value = cash + satellite_value
+        portfolio_state = _compute_portfolio_state()
+        starting_capital = portfolio_state["starting_capital"]
+        cash = portfolio_state["available_cash"]
+        total_value = portfolio_state["total_equity"]
+        pnl_pct = (total_value / starting_capital - 1) * 100 if starting_capital > 0 else 0
 
         result["portfolio"] = {
             "value": round(total_value, 0), "cash": round(cash, 0),
-            "pnl_pct": round((total_value / 200_000 - 1) * 100, 1),
+            "pnl_pct": round(pnl_pct, 1),
             "open_count": len(open_positions), "closed_count": len(closed_positions),
         }
 
         # Circuit breaker
         from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
-        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), PORTFOLIO_STARTING_CAPITAL))
+        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), starting_capital))
         breaker_state = breaker.check(total_value)
         result["circuit_breaker"] = {
             "level": breaker_state["level"], "drawdown_pct": breaker_state.get("drawdown_pct", 0),

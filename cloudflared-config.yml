@@ -33,4 +33,14 @@ ingress:
     service: tcp://host.docker.internal:53472
   - hostname: realestate.akstest.win
     service: http://realestate-engine:80
+  - hostname: navalarch.akstest.win
+    path: /api
+    service: http://host.docker.internal:8004
+  - hostname: navalarch.akstest.win
+    service: http://host.docker.internal:5175
+  - hostname: invoice.akstest.win
+    path: /api
+    service: http://host.docker.internal:8005
+  - hostname: invoice.akstest.win
+    service: http://host.docker.internal:5174
   - service: http_status:404

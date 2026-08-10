@@ -471,7 +471,7 @@ def _enrich_fundamentals():
         return 0
 
 
-def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict:
+def build_training_matrix(market: str = "AU", lookback_days: int = 2268, incremental: bool = True) -> dict:
     """Build the full model_training_set from eod_ohl_history.
 
     Vectorized: pre-computes all features in one pandas pass per symbol.
@@ -486,6 +486,17 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
     try:
         with db_conn() as conn:
             cutoff_days_ago = date.today() - timedelta(days=30)
+            
+            # Fetch max dates for incremental mode
+            max_dates = {}
+            if incremental:
+                max_date_rows = conn.execute(text(
+                    "SELECT symbol, MAX(signal_date) FROM model_training_set WHERE market = :mkt GROUP BY symbol"
+                ), {"mkt": market}).fetchall()
+                for row in max_date_rows:
+                    if row[1]:
+                        max_dates[row[0]] = row[1] if isinstance(row[1], date) else date.fromisoformat(str(row[1]).split()[0])
+
             symbols = conn.execute(
                 text(
                     """SELECT DISTINCT symbol FROM eod_ohl_history o
@@ -531,7 +542,7 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
         return {"rows_inserted": 0, "errors": 1}
 
     total_symbols = len(symbols)
-    print(f"[Train] Build training matrix: {total_symbols} symbols, {lookback_days}d lookback (vectorized).")
+    print(f"[Train] Build training matrix: {total_symbols} symbols, {lookback_days}d lookback (incremental={incremental}).")
 
     for sym_idx, (symbol,) in enumerate(symbols):
         t0 = time.time()
@@ -550,7 +561,16 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268) -> dict
             max_date_idx = len(fm) - FORWARD_WINDOW_DAYS - 1
             warmup = 50
 
+            cutoff_date = None
+            if incremental and symbol in max_dates:
+                # We want to re-process the last 65 days of known signals to update forward-looking labels (like 63d returns)
+                cutoff_date = max_dates[symbol] - timedelta(days=65)
+
             for idx in range(warmup, min(max_date_idx, len(fm) - 5)):
+                signal_date = fm.index[idx].date()
+                if cutoff_date and signal_date < cutoff_date:
+                    continue
+
                 signal_date = fm.index[idx].date()
                 entry_price = float(close.iloc[idx])
 
@@ -927,7 +947,7 @@ def get_latest_weights() -> dict:
 def daily_training_pipeline() -> dict:
     print("[TrainPipeline] Starting daily training pipeline...")
     t0 = time.time()
-    matrix = build_training_matrix()
+    matrix = build_training_matrix(incremental=True)
     results = {}
     for target, label in [("hit_8pct_before_m8pct", "8% before -8%"),
                            ("hit_8pct_63d", "8% peak (legacy)"),

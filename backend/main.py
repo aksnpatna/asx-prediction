@@ -12462,6 +12462,245 @@ def _scheduled_daily_ai_pipeline():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+def _scheduled_v2_daily_scan():
+    """V2 Daily Scan (replaces broad_scan and daily_ai_pipeline).
+    
+    1. Fetches top 500 liquid symbols (core + broad universe).
+    2. Scores them using the V2 ensemble model.
+    3. Runs the 6-persona AI deep dive on the top candidates.
+    4. Auto-creates paper trades and broadcasts to Telegram.
+    """
+    if not run_agentic_analysis:
+        print("[V2DailyScan] Agentic brain not available — skipping.")
+        return
+
+    print("[V2DailyScan] Starting V2 daily scan pipeline...")
+    market = "AU"
+    today_key = datetime.utcnow().date().isoformat()
+
+    try:
+        from config.universe import get_universe_symbols
+        # Fetch 500 liquid symbols (core + broad)
+        core_symbols = get_universe_symbols("core")
+        broad_symbols = get_universe_symbols("broad")
+        symbol_pool = list(set(core_symbols + broad_symbols))
+        print(f"[V2DailyScan] Found {len(symbol_pool)} liquid symbols in universe.")
+    except Exception as e:
+        print(f"[V2DailyScan] Failed to load universe: {e}")
+        return
+
+    if not symbol_pool:
+        return
+
+    # Run V2 model scoring concurrently (similar to wealth_builder_signals)
+    import concurrent.futures
+    print("[V2DailyScan] Scoring candidates using V2 models...")
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_score_wealth_candidate_safe, sym, market): sym for sym in symbol_pool}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                candidates.append(res)
+    
+    # Filter for top tier candidates
+    valid_candidates = [c for c in candidates if (c.get("prob_ge_5pct") or 0) >= 55.0]
+    pool = sorted(valid_candidates, key=lambda x: x.get("wealth_rank", 0), reverse=True)
+    
+    MAX_AI = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "0"))
+    if MAX_AI > 0:
+        selected = pool[:MAX_AI]
+    else:
+        # Default cap if unlimited is risky: only deep dive top 5
+        selected = pool[:5]
+
+    print(f"[V2DailyScan] Selected {len(selected)} top-tier candidates for AI deep-dive.")
+
+    ai_results = []
+    for i, cand in enumerate(selected):
+        sym = cand["symbol"]
+        print(f"[V2DailyScan] Deep-dive {i+1}/{len(selected)}: {sym} ...")
+        try:
+            val = get_valuation_metrics(sym)
+            hist = get_historical_data(sym, period="1y")
+            if len(hist) < 60:
+                continue
+            tech = calculate_technical_indicators(hist)
+            tech_compact = {k: v for k, v in tech.items() if k in [
+                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
+                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
+                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
+                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b",
+            ]}
+            confluence = cand.get("confluence", {})
+            val["model_tier"] = cand.get("_target_tier", "none")
+            val["model_score"] = cand.get("_model_score", 0)
+            val["model_tier_label"] = cand.get("_tier_label", "")
+
+            result = run_agentic_analysis(sym, market, tech_compact, val, confluence)
+            result["candidate"] = cand
+            ai_results.append(result)
+
+            if i < len(selected) - 1:
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"[V2DailyScan] Deep-dive failed for {sym}: {e}")
+            continue
+
+    print(f"[V2DailyScan] Completed {len(ai_results)} deep-dives. Approved: {sum(1 for r in ai_results if r.get('decision')=='APPROVE')}")
+    if not ai_results:
+        print("[V2DailyScan] No AI results — skipping broadcast.")
+        return
+
+    # Build broadcast logic (similar to old pipeline)
+    approved = [r for r in ai_results if r.get("decision") == "APPROVE"]
+    rejected = [r for r in ai_results if r.get("decision") == "REJECT"]
+
+    lines = [
+        f"<b>🤖 V2 AI DAILY SCAN — {today_key}</b>",
+        f"",
+        f"📊 Layer 1 scored {len(candidates)} symbols → Layer 2 AI analyzed top {len(selected)}",
+        f"",
+    ]
+    if approved:
+        lines.append(f"<b>✅ AI-APPROVED ({len(approved)})</b>")
+        for a in approved:
+            cand = a.get("candidate", {})
+            lines.append("")
+            lines.append(_format_ai_report_for_telegram(a, cand))
+    if rejected:
+        lines.append(f"\n<b>⛔ AI-REJECTED ({len(rejected)})</b>")
+        for a in rejected[:4]:
+            cand = a.get("candidate", {})
+            lines.append("")
+            lines.append(_format_ai_report_for_telegram(a, cand))
+        if len(rejected) > 4:
+            lines.append(f"  ... and {len(rejected) - 4} more rejected by AI")
+    
+    lines.append(f"\n<i>🖥️ Powered by V2 Ensemble Model & Layer 2 Agentic AI</i>")
+    message_html = "\n".join(lines)
+
+    try:
+        with db_conn() as conn:
+            users = conn.execute(text("SELECT id FROM users")).fetchall()
+        for user in users:
+            uid = user[0]
+            recipients = get_user_telegram_recipients(uid)
+            if not recipients:
+                continue
+            digest_key = f"v2_scan_{today_key}"
+            if not has_digest_been_sent(uid, market, digest_key):
+                _send_telegram_payload(
+                    message_html, recipients, user_id=uid,
+                    message_type="daily_digest", market=market,
+                    digest_key=digest_key, source="v2_daily_scan",
+                    delivery_mode="auto",
+                )
+    except Exception as e:
+        print(f"[V2DailyScan] Broadcast failed: {e}")
+
+    # Process buys
+    if approved:
+        pf = _compute_portfolio_state()
+        sector_exp = _get_sector_exposure()
+        num_approved = len(approved)
+        available_capital = pf["available_cash"]
+        print(f"[V2DailyScan] Portfolio: ${available_capital:.0f} available, {num_approved} approved. Processing buys...")
+
+        try:
+            with db_conn() as conn:
+                post_users = conn.execute(text("SELECT id FROM users")).fetchall()
+        except Exception:
+            post_users = []
+        for user in post_users:
+            uid = user[0]
+            recipients = get_user_telegram_recipients(uid)
+            if not recipients:
+                continue
+            for a in approved:
+                cand = a.get("candidate", {})
+                sym = a.get("symbol", "???")
+                tier = cand.get("_tier_label", "")
+                is_10pct = "10%" in tier
+                tier_pct = "+10%" if is_10pct else "+8%"
+                tier_emoji = "🚀" if is_10pct else "📈"
+                digest_key = f"ai_buy_{sym}_{today_key}"
+                if has_digest_been_sent(uid, market, digest_key):
+                    continue
+                
+                already_bought = False
+                try:
+                    with db_conn() as check_conn:
+                        existing = check_conn.execute(
+                            text("SELECT 1 FROM paper_trades WHERE symbol=:sym AND user_id=:uid AND status='open' LIMIT 1"),
+                            {"sym": sym, "uid": uid}
+                        ).fetchone()
+                        if existing:
+                            already_bought = True
+                except Exception:
+                    pass
+                if already_bought:
+                    continue
+                
+                price = float(cand.get("current_price", 1) or 1)
+                stop_pct = float(a.get("stop_loss_pct", 10) or 10)
+                adv = int(cand.get("avg_volume", 0) or 0)
+                sector = str((cand.get("valuation") or {}).get("sector", cand.get("sector", "Unknown")))
+
+                size = _calculate_position_size(
+                    price=price, stop_loss_pct=-abs(stop_pct),
+                    account_balance=available_capital, num_picks=num_approved,
+                    avg_volume=int(adv), current_sector_exposure=sector_exp,
+                    candidate_sector=sector,
+                )
+                qty = size["qty"]
+                cost = size["cost"]
+                risk = size["risk_amount"]
+                stop_p = size["stop_price"]
+
+                warn_note = ""
+                if size["warnings"]:
+                    warn_note = "\n⚠️ " + ", ".join(size["warnings"])
+
+                auto_trade_id = None
+                if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
+                    gate = _wfo_position_gate()
+                    if gate["allowed"]:
+                        auto_trade_id = _auto_create_paper_trade(
+                            uid, sym, market, qty, price,
+                            source_reason="v2_daily_scan",
+                            notes="V2 auto-executed bootstrap paper trade"
+                        )
+                        if auto_trade_id:
+                            warn_note += "\n🤖 AUTO-EXECUTED (bootstrap mode)"
+                    else:
+                        warn_note += f"\n⛔ Bootstrap gate: {gate['reason']}"
+
+                buy_msg = (
+                    f"<b>✅ V2 AI-APPROVED — {tier}</b>\n"
+                    f"{sym} — {cand.get('name', sym)}\n\n"
+                    f"{tier_emoji} <b>Target: {tier_pct} (2:1 R:R)</b>\n"
+                    f"💰 Price: ${price:.2f} | Stop: ${stop_p:.2f} (-{abs(stop_pct):.1f}%)\n"
+                    f"📊 {qty} shares = ${cost:.0f} ({size['pct_of_account']}% of portfolio)\n"
+                    f"🎯 Risk: ${risk:.0f} ({PORTFOLIO_RISK_PER_TRADE_PCT}% of capital per trade)\n"
+                    f"💼 Portfolio: ${available_capital:.0f} available | {num_approved} picks today{warn_note}\n\n"
+                    f"<i>AI: {a.get('reasoning','')[:120]}...</i>"
+                )
+                kb = {"inline_keyboard": [[
+                    {"text": f"🚀 Buy {qty} shares (~${cost:.0f})",
+                     "callback_data": f"buy_{sym}_{qty}"}
+                ]]}
+                _send_telegram_payload(
+                    buy_msg, recipients, user_id=uid, message_type="daily_digest",
+                    market=market, digest_key=digest_key, source="v2_ai_approved_buy",
+                    reply_markup=kb
+                )
+                time.sleep(0.3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
 # WFO CAPITAL DEPLOYMENT GATES — what each state mechanically controls
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -14357,6 +14596,12 @@ if SCHEDULER_AVAILABLE:
 
         # ── Walk-Forward OOS Validation ──────────────────────────────────
         scheduler.add_job(
+            _scheduled_v2_daily_scan, "cron",
+            minute=0, hour=12, day_of_week="mon-fri",
+            id="v2_daily_scan_noon", max_instances=1,
+        )
+
+        scheduler.add_job(
             _scheduled_walk_forward_oos, "cron",
             minute=15, hour=16, day_of_week="mon-fri",
             id="walk_forward_oos", max_instances=1,
@@ -14543,6 +14788,15 @@ if SCHEDULER_AVAILABLE:
                 print(f"[StartupCatchup] model_training failed: {_e}")
 
             _st.sleep(5)
+
+            # ── 8.5 V2 Daily Scan ────────────────────────────────────────────────
+            try:
+                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 12:
+                    print(f"[StartupCatchup] Running V2 daily scan...")
+                    _scheduled_v2_daily_scan()
+                    tasks_run.append("v2_daily_scan")
+            except Exception as _e:
+                print(f"[StartupCatchup] v2_daily_scan failed: {_e}")
 
             # ── 9. Channel calibration — run if not calibrated today ────────────
             try:

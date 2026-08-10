@@ -6,8 +6,7 @@ import './App.css'
 import SmsfTab from './SmsfTab'
 import DiscoverTab from './DiscoverTab'
 import NewsSentimentMonitor from './NewsSentimentMonitor'
-import StrategyTab from './StrategyTab'
-import WealthTab from './WealthTab'
+import GlobalMarketsTab from './GlobalMarketsTab'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
@@ -945,7 +944,6 @@ function App() {
   const [marketLoading, setMarketLoading] = useState(false)
   const [sentimentData, setSentimentData] = useState(null)
   const [sentimentSymbol, setSentimentSymbol] = useState('')
-  const [sentimentLoading, setSentimentLoading] = useState(false)
 
   const [analyzeSymbol, setAnalyzeSymbol] = useState('')
   const [analyzeMarket, setAnalyzeMarket] = useState('AU')
@@ -1000,7 +998,6 @@ function App() {
   const [budgetForm, setBudgetForm] = useState({ total_budget: '', max_position_pct: '10', currency: 'AUD' })
   const [hedgeSuggestions, setHedgeSuggestions] = useState(null)
   const [hedgeLoading, setHedgeLoading] = useState(false)
-  const [sentimentScan, setSentimentScan] = useState(null)
 
   const authHeaders = () => ({ headers: { Authorization: `Bearer ${token}` } })
   const selectedCount = useMemo(() => Object.values(selectedSymbols).filter(Boolean).length, [selectedSymbols])
@@ -1095,8 +1092,8 @@ function App() {
   const fetchMarketPulse = async () => {
     try {
       const r = await axios.get(`${API_BASE}/v1/market/pulse`, authHeaders())
-      setMarketPulse(r.data)
-    } catch { /* non-critical – market tab will show retry */ }
+      if (r.data) setMarketPulse(r.data)
+    } catch { setError('Failed to load market pulse') }
   }
   const fetchExplainability = async () => {
     const r = await axios.get(`${API_BASE}/v1/backtest/summary`, authHeaders())
@@ -1243,7 +1240,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (!token || activeTab !== 'tracker') return
+    if (!token || activeTab !== 'markets') return
     const timer = setInterval(() => {
       fetchAdviceActions()
     }, 15000)
@@ -1904,12 +1901,8 @@ function App() {
           <div className="nav-scroll-wrap">
           <nav className="nav">
             <button className={`nav-btn ${activeTab === 'smsf' ? 'active' : ''}`} onClick={() => setActiveTab('smsf')} title="SMSF Dashboard"><span className="nav-icon">🏠</span><span className="nav-label-text">SMSF</span></button>
-            <button className={`nav-btn ${activeTab === 'tracker' ? 'active' : ''}`} onClick={() => setActiveTab('tracker')} title="Strategy"><span className="nav-icon">📋</span><span className="nav-label-text">Strategy</span></button>
+            <button className={`nav-btn ${activeTab === 'markets' ? 'active' : ''}`} onClick={() => setActiveTab('markets')} title="Global Markets"><span className="nav-icon">🌍</span><span className="nav-label-text">Markets</span></button>
             <button className={`nav-btn ${activeTab === 'analyze' ? 'active' : ''}`} onClick={() => setActiveTab('analyze')} title="Analyze"><span className="nav-icon">🔍</span><span className="nav-label-text">Analyze</span></button>
-            <button className={`nav-btn ${activeTab === 'market' ? 'active' : ''}`} onClick={() => setActiveTab('market')} title="Market"><span className="nav-icon">📊</span><span className="nav-label-text">Market</span></button>
-            <button className={`nav-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')} title="Portfolio"><span className="nav-icon">💼</span><span className="nav-label-text">Portfolio</span></button>
-            <button className={`nav-btn ${activeTab === 'wealth' ? 'active' : ''}`} onClick={() => setActiveTab('wealth')} title="Wealth"><span className="nav-icon">🏦</span><span className="nav-label-text">Wealth</span></button>
-            <button className={`nav-btn ${activeTab === 'explain' ? 'active' : ''}`} onClick={() => setActiveTab('explain')} title="Analytics"><span className="nav-icon">📉</span><span className="nav-label-text">Analytics</span></button>
             <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} className="market-selector-nav">
               {['AU'].map(m => (
                 <button key={m}
@@ -1929,7 +1922,7 @@ function App() {
 
       <main className="main">
         {/* AI Weekly Banner */}
-        {aiBanner?.summary && activeTab === 'tracker' && (
+        {aiBanner?.summary && activeTab === 'markets' && (
           <div style={{ background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)', border: '1px solid #0f3460', borderRadius: 8, padding: '16px 20px', marginBottom: 16, color: '#e0e0e0' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
               <span style={{ fontSize: 20 }}>🤖</span>
@@ -1939,8 +1932,10 @@ function App() {
             <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6 }}>{aiBanner.summary}</p>
           </div>
         )}
-        {activeTab === 'smsf' && <SmsfTab />}
-        {activeTab === 'tracker' && <StrategyTab token={token} preferredMarket={preferredMarket} />}
+        <div style={{ display: activeTab === 'smsf' ? 'block' : 'none' }}>
+          <SmsfTab />
+        </div>
+        {activeTab === 'markets' && <GlobalMarketsTab />}
         {activeTab === 'candidates' && (
             <>
             <section className="tab-grid">
@@ -2039,118 +2034,7 @@ function App() {
 
             </>
         )}
-        {activeTab === 'market' && (
-          <>
-            <NewsSentimentMonitor 
-              sentimentScan={sentimentScan} 
-              sentimentLoading={sentimentLoading} 
-              fetchSentimentScan={fetchSentimentScan} 
-            />
-            {!marketPulse ? (
-              <section className="panel">
-                <div className="section-header"><h2>Market Pulse</h2></div>
-                <p className="section-note">⏳ Loading market data…
-                  <button className="btn-secondary" style={{ marginLeft: 12 }} onClick={fetchMarketPulse}>Retry</button>
-                </p>
-              </section>
-          ) : (
-          <>
-            <section className="stats-grid">
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">ASX Benchmark</span><span className="stat-value">{(marketPulse.metrics.asx200_ret ?? 0).toFixed(2)}%</span></div></div>
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">S&amp;P 500 Daily</span><span className="stat-value">{(marketPulse.metrics.sp500_ret ?? 0).toFixed(2)}%</span></div></div>
-              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Gold Daily</span><span className="stat-value">{(marketPulse.metrics.gold_ret ?? 0).toFixed(2)}%</span></div></div>
-              <div className="stat-card red"><div className="stat-content"><span className="stat-title">DXY Daily</span><span className="stat-value">{(marketPulse.metrics.dxy_ret ?? 0).toFixed(2)}%</span></div></div>
-            </section>
-            <section className="panel">
-              <div className="section-header"><h2>Regime Engine</h2></div>
-              <p className="section-note">Regime: <strong>{marketPulse.regime.name}</strong> ({(marketPulse.regime.confidence ?? 0).toFixed(1)}% confidence)</p>
-              <p className="regime-summary">{marketPulse.summary}</p>
-              <div className="ai-suggestions">{(marketPulse.regime.tags || []).map(tag => <span key={tag} className="suggest-pill">{tag}</span>)}</div>
-            </section>
-            <section className="panel">
-              <div className="section-header">
-                <h2>Market Analysis</h2>
-                <button style={btnGreen} onClick={refreshMarketAnalysis} disabled={marketLoading}>
-                  {marketLoading ? 'Analyzing...' : '🔄 Refresh Analysis'}
-                </button>
-              </div>
-              {marketAnalysis
-                ? <div className="ai-analysis"><p>{marketAnalysis}</p></div>
-                : <p className="section-note">Click refresh to get AI-powered market analysis</p>}
-            </section>
-          </>
-          )}
-          </>
-        )}
 
-        {activeTab === 'explain' && (
-          <>
-            <section className="panel">
-              <div className="section-header"><h2>Sentiment Analysis</h2></div>
-              <div style={{ display: 'flex', gap: 10, marginBottom: 15 }}>
-                <input style={inputStyle} type="text" placeholder="Enter symbol (e.g., BHP)"
-                  value={sentimentSymbol} onChange={e => setSentimentSymbol(e.target.value)}
-                  onKeyPress={e => e.key === 'Enter' && fetchSentiment()} />
-                <button onClick={fetchSentiment} disabled={sentimentLoading || !sentimentSymbol.trim()} style={{ ...btnGreen, background: sentimentLoading ? 'var(--ig-muted)' : 'var(--ig-gain)', cursor: sentimentLoading ? 'not-allowed' : 'pointer' }}>
-                  {sentimentLoading ? 'Analyzing...' : 'Analyze'}
-                </button>
-              </div>
-              {sentimentData && (
-                <div style={cardStyle}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 15, marginBottom: 15 }}>
-                    <span style={{ fontSize: 24, fontWeight: 'bold' }}>{sentimentData.symbol}</span>
-                    <span style={pillStyle(sentimentData.sentiment)}>{sentimentData.sentiment.toUpperCase()}</span>
-                    <span style={{ color: 'var(--ig-muted)' }}>Score: {sentimentData.score?.toFixed(2)}</span>
-                  </div>
-                  <p style={{ marginBottom: 10, lineHeight: 1.6 }}>{sentimentData.summary}</p>
-                  {sentimentData.themes?.length > 0 && (
-                    <div style={{ marginTop: 10 }}>
-                      <strong style={{ color: 'var(--ig-medium)' }}>Key Themes:</strong>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 5 }}>
-                        {sentimentData.themes.map((theme, i) => (
-                          <span key={i} style={{ background: 'var(--ig-light-grey)', border: '1px solid var(--ig-border)', padding: '3px 10px', borderRadius: 15, fontSize: 12 }}>{theme}</span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {sentimentData.news?.length > 0 && (
-                    <div style={{ marginTop: 15, borderTop: '1px solid var(--ig-border)', paddingTop: 10 }}>
-                      <strong style={{ color: 'var(--ig-medium)' }}>Latest News:</strong>
-                      <ul style={{ marginTop: 5, paddingLeft: 20, color: 'var(--ig-medium)', fontSize: 14 }}>
-                        {sentimentData.news.map((item, i) => <li key={i} style={{ marginBottom: 5 }}>{item.title}</li>)}
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              )}
-            </section>
-
-            <section className="stats-grid">
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">MAE</span><span className="stat-value">{explainability?.metrics?.mae_pct?.toFixed(2) || 0}%</span></div></div>
-              <div className="stat-card blue"><div className="stat-content"><span className="stat-title">RMSE</span><span className="stat-value">{explainability?.metrics?.rmse_pct?.toFixed(2) || 0}%</span></div></div>
-              <div className="stat-card red"><div className="stat-content"><span className="stat-title">MAPE</span><span className="stat-value">{explainability?.metrics?.mape_pct?.toFixed(2) || 0}%</span></div></div>
-              <div className="stat-card green"><div className="stat-content"><span className="stat-title">Directional Accuracy</span><span className="stat-value">{explainability?.metrics?.directional_accuracy_pct?.toFixed(2) || 0}%</span></div></div>
-            </section>
-
-            <section className="panel">
-              <div className="section-header"><h2>Calibration</h2></div>
-              <div className="table-wrap"><table className="data-table"><thead><tr><th>Bin</th><th>Predicted Avg</th><th>Realized Positive</th><th>Count</th></tr></thead><tbody>
-                {explainability.calibration.map(row => (
-                  <tr key={row.bin}><td>{row.bin}</td><td>{row.predicted_avg.toFixed(1)}%</td><td>{row.realized_positive_pct.toFixed(1)}%</td><td>{row.count}</td></tr>
-                ))}
-              </tbody></table></div>
-            </section>
-
-            <section className="panel">
-              <div className="section-header"><h2>Recent Evaluations</h2></div>
-              <div className="table-wrap"><table className="data-table"><thead><tr><th>Symbol</th><th>Start</th><th>Predicted 14D</th><th>Actual 14D</th><th>Bucket</th></tr></thead><tbody>
-                {explainability.recent.map(row => (
-                  <tr key={`${row.symbol}-${row.start_date}`}><td>{row.symbol}</td><td>{new Date(row.start_date).toLocaleDateString()}</td><td>{row.predicted_return_14d_pct.toFixed(2)}%</td><td>{row.actual_return_14d_pct.toFixed(2)}%</td><td>{row.bucket}</td></tr>
-                ))}
-              </tbody></table></div>
-            </section>
-          </>
-        )}
 
         {activeTab === 'analyze' && (
           <>
@@ -2671,12 +2555,6 @@ function App() {
 
           </>
         )}
-
-        {activeTab === 'portfolio' && (
-          <PortfolioTab token={token} preferredMarket={preferredMarket} />
-        )}
-
-        {activeTab === 'wealth' && <WealthTab token={token} preferredMarket={preferredMarket} />}
 
         {error && (
           <div className="error-toast">

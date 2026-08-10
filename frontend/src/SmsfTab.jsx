@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
+import NewsSentimentMonitor from './NewsSentimentMonitor'
 
 const API = import.meta.env.VITE_API_URL || '/api'
 
@@ -7,10 +8,49 @@ export default function SmsfTab() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [isEditingBudget, setIsEditingBudget] = useState(false)
+  const [budgetVal, setBudgetVal] = useState("")
+  const [sentimentScan, setSentimentScan] = useState(null)
+  const [sentimentLoading, setSentimentLoading] = useState(false)
+
+  const fetchSentimentScan = async () => {
+    setSentimentLoading(true)
+    try {
+      const token = localStorage.getItem('asx_token')
+      const r = await axios.get(`${API}/positions/sentiment-scan`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (r.data && !r.data.message) setSentimentScan(r.data)
+    } catch (e) {
+      console.error('Failed to load sentiment', e)
+    } finally {
+      setSentimentLoading(false)
+    }
+  }
+
+  const updateBudget = async () => {
+    try {
+      const token = localStorage.getItem('asx_token')
+      await axios.put(`${API}/user/investment-budget`, {
+        total_budget: parseFloat(budgetVal),
+        currency: 'AUD'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      setIsEditingBudget(false)
+      fetchSmsfData()
+    } catch (e) {
+      alert("Failed to update budget")
+    }
+  }
 
   useEffect(() => {
     fetchSmsfData()
-    const interval = setInterval(fetchSmsfData, 60000)
+    fetchSentimentScan()
+    const interval = setInterval(() => {
+      fetchSmsfData()
+      fetchSentimentScan()
+    }, 60000)
     return () => clearInterval(interval)
   }, [])
 
@@ -48,8 +88,21 @@ export default function SmsfTab() {
       <div className="smsf-cards">
         {/* Portfolio Card */}
         <div className={`smsf-card ${circuit_breaker?.level === 'NORMAL' ? 'card-green' : circuit_breaker?.level === 'YELLOW' ? 'card-yellow' : circuit_breaker?.level === 'ORANGE' ? 'card-orange' : 'card-red'}`}>
-          <div className="card-label">PORTFOLIO VALUE</div>
-          <div className="card-value">${(portfolio?.value || 0).toLocaleString()}</div>
+          <div className="card-label">PORTFOLIO VALUE (Starting: ${portfolio?.starting_capital?.toLocaleString()})</div>
+          <div className="card-value">
+            {isEditingBudget ? (
+              <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
+                $ <input type="number" value={budgetVal} onChange={e => setBudgetVal(e.target.value)} style={{ width: 120, background: 'var(--ig-bg)', color: 'var(--ig-text)', border: '1px solid var(--ig-border)', borderRadius: 4, padding: '2px 5px', fontSize: '1.2rem' }} />
+                <button onClick={updateBudget} style={{ background: 'var(--ig-gain)', border: 'none', color: '#fff', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 12 }}>Save</button>
+                <button onClick={() => setIsEditingBudget(false)} style={{ background: 'var(--ig-muted)', border: 'none', color: '#fff', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontSize: 12 }}>Cancel</button>
+              </div>
+            ) : (
+              <>
+                ${(portfolio?.value || 0).toLocaleString()}
+                <span style={{ fontSize: 14, cursor: 'pointer', marginLeft: 10, opacity: 0.7 }} onClick={() => { setBudgetVal(portfolio?.starting_capital || portfolio?.value || 0); setIsEditingBudget(true); }} title="Edit Starting Capital">✏️</span>
+              </>
+            )}
+          </div>
           <div className="card-sub">
             <span className={portfolio?.pnl_pct >= 0 ? 'gain' : 'loss'}>
               {portfolio?.pnl_pct >= 0 ? '+' : ''}{portfolio?.pnl_pct?.toFixed(1)}%
@@ -186,6 +239,14 @@ export default function SmsfTab() {
         ) : (
           <div className="muted" style={{ padding: '1rem' }}>No open positions. Paper trading will open positions as model signals arrive.</div>
         )}
+      </div>
+
+      <div style={{ marginTop: '24px' }}>
+        <NewsSentimentMonitor 
+          sentimentScan={sentimentScan} 
+          sentimentLoading={sentimentLoading} 
+          fetchSentimentScan={fetchSentimentScan} 
+        />
       </div>
 
       {/* ── Announcements ────────────────────────────────────────────── */}

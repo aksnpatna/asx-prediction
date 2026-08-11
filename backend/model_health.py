@@ -7,6 +7,7 @@ If < 35%, freeze new entries (model_freeze flag for kill switch).
 
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
+from sqlalchemy import text as sqlt
 
 
 INITIAL_OBSERVATIONS_NEEDED = 20
@@ -17,9 +18,9 @@ WARNING_THRESHOLD = 0.45
 def evaluate_signal_outcomes(conn) -> Dict:
     cutoff = date.today() - timedelta(days=56)
     rows = conn.execute(
-        "SELECT signal_score, current_price, entry_price, "
-        "created_at, status FROM paper_trades "
-        "WHERE status IN ('closed') AND created_at >= :cutoff",
+        sqlt("SELECT signal_score, current_price, entry_price, "
+             "created_at, status FROM paper_trades "
+             "WHERE status IN ('closed') AND created_at >= :cutoff"),
         {"cutoff": cutoff}
     ).fetchall()
 
@@ -80,11 +81,11 @@ def evaluate_signal_outcomes(conn) -> Dict:
 
 
 def persist_model_health(conn, result: Dict):
-    conn.execute("""
+    conn.execute(sqlt("""
         INSERT INTO model_health_metrics (recorded_at, status, hit_rate_pct, observations,
                                           evaluated, wins, freeze_active, warning_active, description)
         VALUES (NOW(), :status, :hit, :obs, :eval, :wins, :freeze, :warning, :desc)
-    """, {
+    """), {
         "status": result["status"],
         "hit": result["hit_rate"],
         "obs": result["observations"],

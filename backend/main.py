@@ -69,6 +69,56 @@ except ImportError as e:
     _CIRCUIT_BREAKER_AVAILABLE = False
 
 try:
+    from core_sleeve import (compute_core_sleeve_state, create_core_position,
+                             close_core_position, get_core_candidates, get_next_review_date)
+    _CORE_SLEEVE_AVAILABLE = True
+except ImportError as e:
+    print(f"Core Sleeve not loaded: {e}")
+    _CORE_SLEEVE_AVAILABLE = False
+    compute_core_sleeve_state = None
+    create_core_position = None
+    close_core_position = None
+    get_core_candidates = None
+    get_next_review_date = None
+
+try:
+    from devils_advocate import run_devils_advocate
+    _DEVILS_ADVOCATE_AVAILABLE = True
+except ImportError as e:
+    print(f"Devils Advocate not loaded: {e}")
+    _DEVILS_ADVOCATE_AVAILABLE = False
+    run_devils_advocate = None
+
+try:
+    from kill_switch import compute_kill_state, persist_kill_state, get_latest_kill_state, build_kill_switch_telegram
+    _KILL_SWITCH_AVAILABLE = True
+except ImportError as e:
+    print(f"Kill Switch not loaded: {e}")
+    _KILL_SWITCH_AVAILABLE = False
+    compute_kill_state = None
+
+try:
+    from model_health import evaluate_signal_outcomes, persist_model_health
+    _MODEL_HEALTH_AVAILABLE = True
+except ImportError as e:
+    print(f"Model Health not loaded: {e}")
+    _MODEL_HEALTH_AVAILABLE = False
+
+try:
+    from data_sanity import check_data_sanity, log_sanity_check
+    _DATA_SANITY_AVAILABLE = True
+except ImportError as e:
+    print(f"Data Sanity not loaded: {e}")
+    _DATA_SANITY_AVAILABLE = False
+
+try:
+    from stale_heartbeat import check_stale_sessions
+    _STALE_HEARTBEAT_AVAILABLE = True
+except ImportError as e:
+    print(f"Stale Heartbeat not loaded: {e}")
+    _STALE_HEARTBEAT_AVAILABLE = False
+
+try:
     from pypfopt import EfficientFrontier, risk_models, expected_returns, HRPOpt
     PYPFOPT_AVAILABLE = True
 except ImportError:
@@ -387,6 +437,20 @@ def _llm_chat(
             continue
 
     return None
+
+
+def _llm_chat_safe(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> Optional[str]:
+    """Non-blocking LLM call — returns None silently on any failure."""
+    try:
+        return _llm_chat(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=60,
+            dry_run_allowed=True,
+        )
+    except Exception:
+        return None
 
 
 def strip_think_tags(content: str) -> str:
@@ -790,6 +854,89 @@ def init_db():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_peak_time ON portfolio_peak_tracker(recorded_at DESC)"))
+
+        # ── Core Sleeve table ──────────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS core_positions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL DEFAULT 'AU',
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                sector TEXT,
+                thesis TEXT,
+                franking_pct REAL DEFAULT 0,
+                yield_est REAL DEFAULT 0,
+                next_review_date DATE,
+                status TEXT NOT NULL DEFAULT 'active',
+                exit_reason TEXT,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_core_positions_status ON core_positions(symbol, status)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_core_positions_open ON core_positions(symbol) WHERE status = 'active'"))
+
+        # ── Kill Switch state ──────────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS kill_switch_state (
+                id SERIAL PRIMARY KEY,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                halt_all BOOLEAN NOT NULL DEFAULT FALSE,
+                active_conditions TEXT,
+                breaker_level TEXT DEFAULT 'NORMAL',
+                model_freeze BOOLEAN DEFAULT FALSE,
+                data_quality_flag BOOLEAN DEFAULT FALSE,
+                description TEXT
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_kill_switch_time ON kill_switch_state(recorded_at DESC)"))
+
+        # ── Model Health metrics ───────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS model_health_metrics (
+                id SERIAL PRIMARY KEY,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL,
+                hit_rate_pct REAL,
+                observations INTEGER,
+                evaluated INTEGER,
+                wins INTEGER,
+                freeze_active BOOLEAN DEFAULT FALSE,
+                warning_active BOOLEAN DEFAULT FALSE,
+                description TEXT
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_model_health_time ON model_health_metrics(recorded_at DESC)"))
+
+        # ── Data Sanity log ────────────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS data_sanity_log (
+                id SERIAL PRIMARY KEY,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                symbol TEXT,
+                sane BOOLEAN NOT NULL DEFAULT TRUE,
+                gap_pct REAL,
+                eodhd_close REAL,
+                asx_close REAL,
+                reason TEXT,
+                is_stale BOOLEAN DEFAULT FALSE
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_data_sanity_time ON data_sanity_log(checked_at DESC)"))
+
+        # ── Sleeve column on paper_trades ──────────────────────────────────
+        for sleeve_sql in [
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sleeve TEXT DEFAULT 'satellite'",
+        ]:
+            try:
+                conn.execute(text(sleeve_sql))
+            except Exception:
+                pass
 
 init_db()
 
@@ -1905,7 +2052,7 @@ def _entry_timing_assessment(valuation: dict, indicators: dict, prediction: dict
 # PORTFOLIO-AWARE POSITION SIZING — Fixed-Fractional + Equal Allocation + ASX Rules
 # ═══════════════════════════════════════════════════════════════════════════════
 
-PORTFOLIO_STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "30000"))
+PORTFOLIO_STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "200000"))
 PORTFOLIO_RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.5"))
 PORTFOLIO_MAX_SECTOR_PCT = float(os.getenv("MAX_SECTOR_PCT", "25"))
 PORTFOLIO_MAX_ADV_PCT = float(os.getenv("MAX_ADV_PCT", "5"))
@@ -6106,9 +6253,125 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         result["data_from"] = "2015"
         result["data_to"] = datetime.utcnow().strftime("%Y-%m")
 
+        # ── Core Sleeve ───────────────────────────────────────────────────
+        if _CORE_SLEEVE_AVAILABLE and compute_core_sleeve_state:
+            try:
+                with db_conn() as c:
+                    nav = total_value
+                    core_state = compute_core_sleeve_state(c, nav)
+                    result["core_sleeve"] = core_state
+            except Exception as e:
+                result["core_sleeve"] = {"error": str(e), "positions": [], "total_value": 0}
+
+        # ── Model Health ──────────────────────────────────────────────────
+        if _MODEL_HEALTH_AVAILABLE:
+            try:
+                with db_conn() as c:
+                    mh = evaluate_signal_outcomes(c)
+                    result["model_health"] = mh
+            except Exception:
+                result["model_health"] = {"status": "unknown", "hit_rate": 0}
+
+        # ── Kill Switch ──────────────────────────────────────────────────
+        if _KILL_SWITCH_AVAILABLE:
+            try:
+                with db_conn() as c:
+                    ks = get_latest_kill_state(c)
+                    result["kill_switch"] = ks
+            except Exception:
+                result["kill_switch"] = {"halt_all": False}
+
+        # ── Stale Heartbeat ──────────────────────────────────────────────
+        if _STALE_HEARTBEAT_AVAILABLE:
+            try:
+                from config.universe import get_universe_symbols
+                core_syms = get_universe_symbols("core")
+                with db_conn() as c:
+                    sh = check_stale_sessions(c, core_syms[:50])
+                    result["stale_heartbeat"] = sh
+            except Exception:
+                result["stale_heartbeat"] = {"status": "unknown", "stale_pct": 0}
+
         return result
     except Exception as e:
         return {"error": str(e), **result}
+
+
+# ── Core Sleeve API ────────────────────────────────────────────────────────────
+@app.get("/api/smsf/core-sleeve")
+async def get_core_sleeve(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    nav = get_starting_capital(uid)
+    try:
+        with db_conn() as c:
+            state = compute_core_sleeve_state(c, nav)
+            candidates = get_core_candidates()
+            return {"core_sleeve": state, "candidates": candidates}
+    except Exception as e:
+        return {"error": str(e), "core_sleeve": {"positions": [], "total_value": 0}}
+
+
+class CorePositionRequest(BaseModel):
+    symbol: str
+    qty: float
+    entry_price: float
+    market: str = "AU"
+    notes: str = ""
+
+
+@app.post("/api/smsf/core-sleeve")
+async def add_core_position(req: CorePositionRequest, current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    try:
+        with db_conn() as c:
+            pos_id = create_core_position(c, uid, req.symbol.upper(), req.qty, req.entry_price,
+                                          req.market, req.notes)
+            c.commit()
+            if pos_id:
+                return {"ok": True, "id": pos_id, "symbol": req.symbol.upper()}
+            return {"ok": False, "error": "Position creation failed (duplicate or limit reached)"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/smsf/core-sleeve/{position_id}/close")
+async def close_core_pos(position_id: str, reason: str = "manual",
+                         current_user: dict = Depends(get_current_user)):
+    try:
+        with db_conn() as c:
+            ok = close_core_position(c, position_id, reason)
+            c.commit()
+            return {"ok": ok}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/smsf/sleeves")
+async def get_sleeve_breakdown(current_user: dict = Depends(get_current_user)):
+    uid = current_user["id"]
+    nav = get_starting_capital(uid)
+    try:
+        with db_conn() as c:
+            core = compute_core_sleeve_state(c, nav)
+
+            sat_rows = c.execute(
+                "SELECT symbol, COALESCE(entry_price,0)*COALESCE(qty,0) AS value FROM paper_trades WHERE status='open'"
+            ).fetchall()
+            sat_value = sum(r[1] for r in sat_rows)
+            sat_count = len(sat_rows)
+
+            cash = max(0, nav - core["total_value"] - sat_value)
+
+            return {
+                "nav": round(nav, 2),
+                "core": {"value": core["total_value"], "pct": core["pct_of_nav"], "count": core["position_count"],
+                         "target_pct": core["target_pct"]},
+                "satellite": {"value": round(sat_value, 2), "pct": round(sat_value/nav*100, 1), "count": sat_count,
+                              "max_positions": 8, "target_pct": 40},
+                "cash": {"value": round(cash, 2), "pct": round(cash/nav*100, 1)},
+            }
+    except Exception as e:
+        return {"error": str(e), "nav": nav, "core": {}, "satellite": {}, "cash": {}}
 
 
 @app.get("/api/v1/market/pulse")
@@ -12467,6 +12730,33 @@ def _scheduled_daily_ai_pipeline():
                 if size["warnings"]:
                     warn_note = "\n⚠️ " + ", ".join(size["warnings"])
 
+                # ── Devil's Advocate ──────────────────────────────────
+                if _DEVILS_ADVOCATE_AVAILABLE and run_devils_advocate:
+                    try:
+                        thesis = a.get("reasoning", "")[:500]
+                        da_result = run_devils_advocate(sym, thesis, llm_call_fn=_llm_chat_safe)
+                        if da_result.get("size_reduction_pct", 0) > 0:
+                            reduction = da_result["size_reduction_pct"]
+                            qty = int(qty * (1 - reduction))
+                            cost = qty * price
+                            warn_note += f"\n🛡️ Devil's advocate: {da_result.get('key_risk','')}"
+                            warn_note += f"\n⚠️ Size reduced {reduction*100:.0f}% ({da_result.get('risk_score',5)}/10 risk)"
+                            print(f"[DailyAI] Devil's advocate reduced {sym} by {reduction*100:.0f}%: {da_result.get('key_risk','')}")
+                    except Exception as e:
+                        print(f"[DailyAI] Devil's advocate skipped for {sym}: {e}")
+
+                # ── Kill Switch ──────────────────────────────────────
+                if _KILL_SWITCH_AVAILABLE and compute_kill_state:
+                    try:
+                        with db_conn() as ks_conn:
+                            ks = get_latest_kill_state(ks_conn)
+                            if ks.get("halt_all"):
+                                warn_note += "\n🔴 KILL SWITCH ACTIVE — auto-execute blocked"
+                                print(f"[DailyAI] KILL SWITCH blocked auto-execute for {sym}")
+                                auto_trade_id = None
+                    except Exception:
+                        pass
+
                 # ── Bootstrapping auto-execute: create paper trade automatically ──
                 auto_trade_id = None
                 if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
@@ -12732,6 +13022,20 @@ def _scheduled_v2_daily_scan():
                 warn_note = ""
                 if size["warnings"]:
                     warn_note = "\n⚠️ " + ", ".join(size["warnings"])
+
+                # ── Devil's Advocate ──────────────────────────────────
+                if _DEVILS_ADVOCATE_AVAILABLE and run_devils_advocate:
+                    try:
+                        thesis = a.get("reasoning", a.get("decision_reasoning", ""))[:500]
+                        da_result = run_devils_advocate(sym, thesis, llm_call_fn=_llm_chat_safe)
+                        if da_result.get("size_reduction_pct", 0) > 0:
+                            reduction = da_result["size_reduction_pct"]
+                            qty = int(qty * (1 - reduction))
+                            cost = qty * price
+                            warn_note += f"\n🛡️ Devil's advocate: {da_result.get('key_risk','')}"
+                            warn_note += f"\n⚠️ Size reduced {reduction*100:.0f}%"
+                    except Exception:
+                        pass
 
                 auto_trade_id = None
                 if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
@@ -14106,6 +14410,29 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
         except Exception as e:
             pass  # non-blocking if calendar_gate fails to import
 
+        # ── Data Sanity (EODHD vs ASX gap) ──────────────────────────────
+        if _DATA_SANITY_AVAILABLE and check_data_sanity:
+            try:
+                with db_conn() as ds_conn:
+                    sanity = check_data_sanity(ds_conn, symbol)
+                    if not sanity.get("sane", True):
+                        print(f"[AutoCreate] DATA SANITY BLOCKED {symbol}: {sanity['reason']} (gap: {sanity.get('gap_pct', 0):.1f}%)")
+                        log_sanity_check(ds_conn, sanity)
+                        return None
+            except Exception as e:
+                pass  # non-blocking
+
+        # ── Kill Switch ──────────────────────────────────────────────────
+        if _KILL_SWITCH_AVAILABLE and compute_kill_state and get_latest_kill_state:
+            try:
+                with db_conn() as ks_conn:
+                    ks = get_latest_kill_state(ks_conn)
+                    if ks.get("halt_all"):
+                        print(f"[AutoCreate] KILL SWITCH BLOCKED {symbol}: automation halted")
+                        return None
+            except Exception:
+                pass
+
         signal = get_probability_and_score(symbol)
         predicted = float(signal.get("predicted_price_3m") or 0)
         # For a LONG trade, target must be > entry. If the model is bearish, default to 12% upside.
@@ -14319,16 +14646,26 @@ async def telegram_bot_webhook(request: Request):
             if not gate["allowed"]:
                 monitoring_msg = f"\n\n<b>⛔ Position BLOCKED by WFO gate:</b> {gate['reason']}"
             else:
-                trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
-                if trade_id:
-                    stop = round(price * 0.92, 2)
-                    target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
+                # ── Manual trade cap: 2% NAV max ──────────────────────────
+                nav = get_starting_capital(user_id)
+                trade_value = quantity * price
+                if trade_value > nav * 0.02 and nav > 0:
                     monitoring_msg = (
-                        f"\n\n<b>Monitoring started</b>\n"
-                        f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
-                        f"Target: model forecast | Trailing stop: 3%\n"
-                        f"You'll get alerts if price hits stop, target, or goes flat 30 days."
+                        f"\n\n<b>⛔ BLOCKED: Manual trade ${trade_value:.0f} exceeds 2% NAV limit "
+                        f"(max ${nav*0.02:.0f} for ${nav:.0f} NAV)</b>\n"
+                        f"<i>Guardrail #17: all manual trades capped at 2% NAV.</i>"
                     )
+                else:
+                    trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
+                    if trade_id:
+                        stop = round(price * 0.92, 2)
+                        target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
+                        monitoring_msg = (
+                            f"\n\n<b>Monitoring started</b>\n"
+                            f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
+                            f"Target: model forecast | Trailing stop: 3%\n"
+                            f"You'll get alerts if price hits stop, target, or goes flat 30 days."
+                        )
 
         # Auto-close paper trade monitor on SELL/REDUCE
         closed_id = None
@@ -14633,8 +14970,66 @@ def _scheduled_smsf_eod_checks():
                     pnl = (float(p.get("current_price", 0)) / float(p.get("entry_price", 1)) - 1) * 100
                     lines.append(f"  {p['symbol']}: {pnl:+.1f}% ({p.get('days_held','?')}d)")
 
-        _send_telegram_broadcast("\n".join(lines), "smsf_eod")
-        _log_job_finish(jid, started_at=started)
+            _send_telegram_broadcast("\n".join(lines), "smsf_eod")
+
+            # ── Model Health + Stale Heartbeat + Kill Switch (after broadcast) ─
+            breaker_level_for_ks = "NORMAL"
+            try:
+                from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
+                b = DrawdownCircuitBreaker(peak_value=get_peak_value())
+                bs = b.check(portfolio_value)
+                breaker_level_for_ks = bs.get("level", "NORMAL")
+            except Exception:
+                pass
+
+            model_freeze = False
+            data_flag = False
+
+            if _MODEL_HEALTH_AVAILABLE:
+                try:
+                    with db_conn() as mh_conn:
+                        mh = evaluate_signal_outcomes(mh_conn)
+                        persist_model_health(mh_conn, mh)
+                        model_freeze = mh.get("freeze", False)
+                        if mh.get("freeze") or mh.get("warning"):
+                            _send_telegram_broadcast(
+                                f"📊 <b>Model Health Alert</b>\n"
+                                f"Hit rate: {mh['hit_rate']}% ({mh.get('wins',0)}/{mh.get('evaluated',0)})\n"
+                                f"Status: {'🔴 FREEZE' if mh.get('freeze') else '🟡 WARNING halve size'}\n"
+                                f"{mh['description']}",
+                                "model_health"
+                            )
+                except Exception as e:
+                    print(f"[SMSF EOD] Model health failed: {e}")
+
+            if _STALE_HEARTBEAT_AVAILABLE:
+                try:
+                    from config.universe import get_universe_symbols
+                    core_syms = get_universe_symbols("core")
+                    with db_conn() as sh_conn:
+                        sh = check_stale_sessions(sh_conn, core_syms[:50])
+                        data_flag = sh.get("freeze", False)
+                        if sh.get("freeze"):
+                            _send_telegram_broadcast(
+                                f"<b>⚠️ Stale Pipeline Alert</b>\n"
+                                f"{sh['stale_count']}/{sh['total_checked']} symbols stale ({sh['stale_pct']}%)\n"
+                                f"Action: FREEZE new entries",
+                                "stale_heartbeat"
+                            )
+                except Exception as e:
+                    print(f"[SMSF EOD] Stale heartbeat failed: {e}")
+
+            if _KILL_SWITCH_AVAILABLE:
+                try:
+                    with db_conn() as ks_conn:
+                        ks = compute_kill_state(breaker_level_for_ks, model_freeze, data_flag)
+                        persist_kill_state(ks_conn, ks)
+                        if ks["halt_all"]:
+                            _send_telegram_broadcast(build_kill_switch_telegram(ks), "kill_switch")
+                except Exception as e:
+                    print(f"[SMSF EOD] Kill switch failed: {e}")
+
+            _log_job_finish(jid, started_at=started)
     except Exception as e:
         _log_job_finish(jid, status="error", error=str(e), started_at=started)
         print(f"[SMSF EOD] Failed: {e}")

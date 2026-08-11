@@ -2078,10 +2078,10 @@ def _compute_portfolio_state(uid: str = None) -> dict:
     try:
         with db_conn() as conn:
             closed_pnl = conn.execute(text(
-                "SELECT COALESCE(SUM(current_pnl),0) FROM paper_trades WHERE status='closed'"
+                "SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) FROM paper_trades WHERE status='closed'"
             )).fetchone()
             open_rows = conn.execute(text(
-                "SELECT symbol, COALESCE(entry_price,0)*COALESCE(qty,0) AS cost "
+                "SELECT symbol, COALESCE(entry_price,0)*COALESCE(quantity,0) AS cost "
                 "FROM paper_trades WHERE status='open'"
             )).fetchall()
         total_pnl = float(closed_pnl[0] or 0)
@@ -14347,7 +14347,7 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 sector_map = {}
                 with db_conn() as conn:
                     rows = conn.execute(text(
-                        "SELECT symbol, COALESCE(entry_price,0)*COALESCE(qty,0) AS value FROM paper_trades WHERE status='open' AND user_id=:uid"
+                        "SELECT symbol, COALESCE(entry_price,0)*COALESCE(quantity,0) AS value FROM paper_trades WHERE status='open' AND user_id=:uid"
                     ), {"uid": user_id}).fetchall()
                     for sym, val in rows:
                         try:

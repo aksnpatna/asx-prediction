@@ -11085,31 +11085,18 @@ def _scheduled_broad_scan_precompute():
         _EODHD_MIN_INTERVAL_INTERNAL = 3.0
     else:
         _EODHD_MIN_INTERVAL_INTERNAL = _EODHD_MIN_INTERVAL
-    full_universe = get_asx_universe()  # up to 1,600+ with EODHD, 257 without
-    all_symbols = list(full_universe.keys())
-    # BROAD_SCAN_CAP=0 means unlimited — scan full universe
-    if broad_scan_cap <= 0:
-        broad_scan_cap = len(all_symbols)
-    # Guarantee priority stocks (large/mid cap and hardcoded) are always included
-    priority_symbols = set()
-    # Add large/mid caps
-    for cap_type in ["large_cap", "mid_cap", "etf", "crypto"]:
-        for sym in WEEKLY_UNIVERSE.get("AU", {}).get(cap_type, []):
-            priority_symbols.add(sym)
-            
-    # Add curated ASX_COMPANIES
-    for sym in ASX_COMPANIES.keys():
-        priority_symbols.add(sym)
-        
-    priority_pool = list(priority_symbols)
-    
-    # Remaining universe (strictly exclude non-ordinary shares/hybrids with length > 3)
-    remaining_pool = [s for s in all_symbols if s not in priority_symbols and len(s) <= 3]
-    random.shuffle(remaining_pool)
-    
-    # Combine (Priority first, then shuffled remaining up to cap)
-    symbol_pool = priority_pool + remaining_pool
-    symbol_pool = symbol_pool[:broad_scan_cap]
+    # Use config/universe.py liquid symbols (~467) instead of full 1661 EODHD universe
+    from config.universe import get_universe_symbols
+    core_syms = get_universe_symbols("core")
+    broad_syms = get_universe_symbols("broad")
+    symbol_pool = list(set(core_syms + broad_syms))
+    print(f"[BroadScan] Universe: {len(symbol_pool)} liquid symbols (core={len(core_syms)}, broad={len(broad_syms)})")
+    # Apply broad_scan_cap if set
+    if broad_scan_cap > 0 and broad_scan_cap < len(symbol_pool):
+        import random
+        random.shuffle(symbol_pool)
+        symbol_pool = symbol_pool[:broad_scan_cap]
+        print(f"[BroadScan] Capped to {broad_scan_cap} symbols")
 
     # yfinance dead ticker tracking via centralized YFinanceService
     from yfinance_service import YFinanceService
@@ -14944,6 +14931,156 @@ def _scheduled_smsf_announcement_check():
         print(f"[AnnCheck] Failed: {e}")
 
 
+def _scheduled_pipeline_health_report():
+    """4:30 PM: One-line health check per pipeline stage. Telegram summary."""
+    jid = _log_job_start("pipeline_health")
+    started = datetime.utcnow()
+    today = date.today()
+    results = []
+
+    def _ok(stage, detail=""): results.append(f"✅ {stage}" + (f" ({detail})" if detail else ""))
+    def _warn(stage, detail=""): results.append(f"⚠️ {stage}" + (f" ({detail})" if detail else ""))
+    def _fail(stage, detail=""): results.append(f"❌ {stage}" + (f" ({detail})" if detail else ""))
+
+    try:
+        with db_conn() as c:
+            # 1. Data capture (inc_update)
+            r = c.execute(text(
+                "SELECT MAX(trade_date) FROM eod_ohl_history"
+            )).fetchone()
+            latest_ohlc = r[0] if r else None
+            days_behind = (today - latest_ohlc).days if latest_ohlc and hasattr(latest_ohlc, 'date') else 99
+            if days_behind <= 1:
+                _ok("Data", f"latest {latest_ohlc}")
+            elif days_behind <= 2:
+                _warn("Data", f"{days_behind}d stale")
+            else:
+                _fail("Data", f"{days_behind}d behind")
+
+            # 2. Broad scan
+            r = c.execute(text(
+                "SELECT MAX(generated_at) FROM wealth_scan_cache"
+            )).fetchone()
+            scan_ts = r[0] if r else None
+            if scan_ts:
+                scan_date = scan_ts.date() if hasattr(scan_ts, 'date') else scan_ts
+                scan_age_d = (today - scan_date).days
+                if scan_age_d <= 1:
+                    _ok("Scan", f"scores fresh")
+                elif scan_age_d <= 2:
+                    _warn("Scan", f"{scan_age_d}d since last")
+                else:
+                    _fail("Scan", f"{scan_age_d}d stale")
+            else:
+                _fail("Scan", "never ran")
+
+            # 3. Model training
+            r = c.execute(text(
+                "SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='ridge'"
+            )).fetchone()
+            train_ts = r[0] if r else None
+            if train_ts:
+                train_date = train_ts.date() if hasattr(train_ts, 'date') else train_ts
+                train_age_d = (today - train_date).days
+                if train_age_d <= 1:
+                    wc = c.execute(text(
+                        "SELECT COUNT(*) FROM model_weights_by_date WHERE trained_at = (SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='ridge') AND model_type='ridge' AND weight IS NOT NULL AND weight != 0"
+                    )).fetchone()
+                    _ok("Model", f"{wc[0]} active features")
+                elif train_age_d <= 2:
+                    _warn("Model", f"{train_age_d}d since last")
+                else:
+                    _fail("Model", f"{train_age_d}d stale")
+            else:
+                _fail("Model", "never trained")
+
+            # 4. V2 AI scan
+            r = c.execute(text(
+                "SELECT MAX(run_date), SUM(ai_approved) FROM daily_ai_runs"
+            )).fetchone()
+            if r and r[0]:
+                scan_d = r[0] if isinstance(r[0], date) else r[0].date() if hasattr(r[0], 'date') else None
+                approved = r[1] or 0
+                age_d = (today - scan_d).days if scan_d else 99
+                if age_d <= 1:
+                    _ok("AI Scan", f"approved={approved}")
+                elif age_d <= 2:
+                    _warn("AI Scan", f"{age_d}d stale")
+                else:
+                    _fail("AI Scan", f"{age_d}d since last, approved={approved}")
+            else:
+                _fail("AI Scan", "never ran")
+
+            # 5. Paper trades
+            r = c.execute(text(
+                "SELECT COUNT(*) FILTER (WHERE status='open'), COUNT(*) FILTER (WHERE status='closed') FROM paper_trades"
+            )).fetchone()
+            open_n, closed_n = r if r else (0, 0)
+            if open_n > 0:
+                pnl_r = c.execute(text(
+                    "SELECT ROUND(AVG((current_price/entry_price-1)*100)::numeric,1) FROM paper_trades WHERE status='open'"
+                )).fetchone()
+                avg_pnl = pnl_r[0] if pnl_r else 0
+                emoji = "🟢" if (avg_pnl or 0) > 0 else "🔴"
+                _ok("Positions", f"{open_n} open {emoji}{avg_pnl}%")
+            else:
+                _warn("Positions", "0 open")
+
+            # 6. Scheduler
+            r = c.execute(text("SELECT COUNT(*) FROM apscheduler_jobs")).fetchone()
+            job_n = r[0] if r else 0
+            if job_n >= 10:
+                _ok("Scheduler", f"{job_n} jobs")
+            elif job_n > 0:
+                _warn("Scheduler", f"only {job_n} jobs")
+            else:
+                _fail("Scheduler", "no jobs")
+
+            # 7. Kill switch state
+            r = c.execute(text(
+                "SELECT halt_all, active_conditions FROM kill_switch_state ORDER BY recorded_at DESC LIMIT 1"
+            )).fetchone()
+            if r and r[0]:
+                _fail("Kill", f"ACTIVE: {r[1]}")
+            else:
+                _ok("Kill", "inactive")
+
+            # 8. Stale heartbeat
+            from stale_heartbeat import check_stale_sessions
+            from config.universe import get_universe_symbols
+            try:
+                core_syms = get_universe_symbols("core")[:50]
+                sh = check_stale_sessions(c, core_syms)
+                if sh["freeze"]:
+                    _fail("Heartbeat", f"{sh['stale_pct']}% stale")
+                elif sh["stale_pct"] > 2:
+                    _warn("Heartbeat", f"{sh['stale_pct']}%")
+                else:
+                    _ok("Heartbeat", "clean")
+            except Exception:
+                _warn("Heartbeat", "check failed")
+
+        # Build Telegram message
+        fail_count = sum(1 for r in results if r.startswith("❌"))
+        warn_count = sum(1 for r in results if r.startswith("⚠️"))
+        emoji = "🔴" if fail_count > 0 else ("🟡" if warn_count > 0 else "🟢")
+
+        msg = f"<b>{emoji} Pipeline Health — {today.strftime('%a %b %d')}</b>\n"
+        msg += "\n".join(results)
+        if fail_count > 0:
+            msg += f"\n\n<b>{fail_count} stage(s) failed</b> — check logs"
+        elif warn_count > 0:
+            msg += f"\n\n{warn_count} warning(s)"
+        else:
+            msg += "\n\nAll systems healthy"
+
+        _send_telegram_broadcast(msg, "pipeline_health")
+        _log_job_finish(jid, rows_affected=len(results), started_at=started)
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[PipelineHealth] Failed: {e}")
+
+
 def _scheduled_smsf_eod_checks():
     """4:35 PM: CGT timer + circuit breaker check + EOD daily summary."""
     jid = _log_job_start("smsf_eod")
@@ -15105,7 +15242,7 @@ if SCHEDULER_AVAILABLE:
         # Jobs survive Docker restarts by persisting state in PostgreSQL.
         # Falls back silently to in-memory if DB is unavailable at startup.
         from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
-        from apscheduler.executors.pool import ThreadPoolExecutor
+        from apscheduler.executors.pool import ThreadPoolExecutor as SchedulerExecutor
         from apscheduler.jobstores.memory import MemoryJobStore
 
         jobstores = {"default": MemoryJobStore()}
@@ -15122,7 +15259,7 @@ if SCHEDULER_AVAILABLE:
         scheduler = BackgroundScheduler(
             timezone=_get_scheduler_timezone(),
             jobstores=jobstores,
-            executors={"default": ThreadPoolExecutor(max_workers=8)},
+            executors={"default": SchedulerExecutor(max_workers=8)},
             job_defaults={"coalesce": True, "misfire_grace_time": 3600},
         )
 
@@ -15151,6 +15288,11 @@ if SCHEDULER_AVAILABLE:
             _scheduled_smsf_announcement_check, "cron",
             minute="0", hour="10-15", day_of_week="mon-fri",
             id="smsf_ann_check", max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_pipeline_health_report, "cron",
+            minute=30, hour=16, day_of_week="mon-fri",
+            id="pipeline_health_1630", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_smsf_eod_checks, "cron",
@@ -15432,6 +15574,13 @@ if SCHEDULER_AVAILABLE:
                 print(f"[StartupCatchup] channel_calibration failed: {_e}")
 
             print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}", flush=True)
+
+            # ── Pipeline health report — always at end of catchup ────────
+            try:
+                _scheduled_pipeline_health_report()
+                tasks_run.append("pipeline_health")
+            except Exception as _e:
+                print(f"[StartupCatchup] pipeline_health failed: {_e}")
 
         # Run catch-up in a background thread so it doesn't block FastAPI startup
         def _catchup_wrapper():

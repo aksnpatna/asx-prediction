@@ -11125,7 +11125,7 @@ def _scheduled_broad_scan_precompute():
     print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
 
     new_dead = set()
-    scan_workers = 2  # reduced from 3 to limit memory pressure (2GB container)
+    scan_workers = 5  # concurrency: 100K EODHD calls/day, ~500 tickers = ~100 calls/worker
     def _score_one(sym):
         try:
             r = _score_wealth_candidate(sym, market)
@@ -15101,9 +15101,42 @@ def _fetch_macro_dashboard_data() -> dict:
 if SCHEDULER_AVAILABLE:
 
     try:
-        scheduler = BackgroundScheduler(timezone=_get_scheduler_timezone())
+        # ── Scheduler persistence via SQLAlchemy ─────────────────────────────
+        # Jobs survive Docker restarts by persisting state in PostgreSQL.
+        # Falls back silently to in-memory if DB is unavailable at startup.
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        from apscheduler.executors.pool import ThreadPoolExecutor
+        from apscheduler.jobstores.memory import MemoryJobStore
+
+        jobstores = {"default": MemoryJobStore()}
+        try:
+            jobstores["default"] = SQLAlchemyJobStore(
+                url=DATABASE_URL,
+                tablename="apscheduler_jobs",
+                engine_options={"pool_size": 3, "max_overflow": 3},
+            )
+            print("[Scheduler] SQLAlchemyJobStore enabled — jobs persist across restarts.")
+        except Exception as e:
+            print(f"[Scheduler] SQLAlchemyJobStore unavailable ({e}) — falling back to memory.")
+
+        scheduler = BackgroundScheduler(
+            timezone=_get_scheduler_timezone(),
+            jobstores=jobstores,
+            executors={"default": ThreadPoolExecutor(max_workers=8)},
+            job_defaults={"coalesce": True, "misfire_grace_time": 3600},
+        )
 
         # ── SMSF v2 Core Pipeline ────────────────────────────────────────
+        scheduler.add_job(
+            _scheduled_inc_update, "cron",
+            minute=0, hour=3, day_of_week="mon-fri",
+            id="inc_update_3am", max_instances=1,
+        )
+        scheduler.add_job(
+            _scheduled_broad_scan_precompute, "cron",
+            minute=0, hour=5, day_of_week="mon-fri",
+            id="broad_scan_5am", max_instances=1,
+        )
         scheduler.add_job(
             _scheduled_smsf_pipeline, "cron",
             minute=0, hour=7, day_of_week="mon-fri",
@@ -15132,11 +15165,6 @@ if SCHEDULER_AVAILABLE:
         )
 
         # ── Essential Data Pipeline ──────────────────────────────────────
-        scheduler.add_job(
-            _scheduled_inc_update, "cron",
-            minute=0, hour=3, day_of_week="mon-fri",
-            id="inc_update_3am", max_instances=1,
-        )
         scheduler.add_job(
             _scheduled_model_training, "cron",
             minute=0, hour=7, day_of_week="mon-fri",
@@ -15179,7 +15207,7 @@ if SCHEDULER_AVAILABLE:
             hour_local = now_local.hour
             tasks_run = []
 
-            print(f"[StartupCatchup] Checking for missed jobs at {now_local.strftime('%a %H:%M %Z')} …")
+            print(f"[StartupCatchup] Checking for missed jobs at {now_local.strftime('%a %H:%M %Z')} …", flush=True)
 
             # ── 1. Paper trade monitor — always run immediately on startup ────
             try:
@@ -15192,6 +15220,28 @@ if SCHEDULER_AVAILABLE:
                 print(f"[StartupCatchup] paper_trade_monitor failed: {_e}")
 
             _st.sleep(5)  # Brief pause before heavy work
+
+            # ── 1.5 Incremental EODHD update — run if stale (>18 hours no update) ──
+            try:
+                with db_conn() as _conn:
+                    _row = _conn.execute(text(
+                        "SELECT MAX(updated_at) FROM eod_ohl_history"
+                    )).fetchone()
+                inc_stale = True
+                if _row and _row[0]:
+                    _gen = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
+                    inc_age_h = (now_utc - _gen.replace(tzinfo=None)).total_seconds() / 3600
+                    inc_stale = inc_age_h > 18
+                if inc_stale:
+                    print(f"[StartupCatchup] OHLC data may be stale — running incremental update …")
+                    _scheduled_inc_update()
+                    tasks_run.append("inc_update")
+                else:
+                    print(f"[StartupCatchup] OHLC data fresh — skipping incremental update.")
+            except Exception as _e:
+                print(f"[StartupCatchup] inc_update failed: {_e}")
+
+            _st.sleep(5)
 
             # ── 2. Broad wealth scan — re-run if cache is stale (>20 hours) ──
             try:
@@ -15346,10 +15396,18 @@ if SCHEDULER_AVAILABLE:
 
             # ── 8.5 V2 Daily Scan ────────────────────────────────────────────────
             try:
-                if now_utc.astimezone(timezone(_get_scheduler_timezone())).hour >= 8:
-                    print(f"[StartupCatchup] Running V2 daily scan...")
-                    _scheduled_v2_daily_scan()
-                    tasks_run.append("v2_daily_scan")
+                if now_local.hour >= 8:
+                    with db_conn() as _conn:
+                        _scanned = _conn.execute(text(
+                            "SELECT COUNT(*) FROM daily_ai_runs WHERE run_date = :today"
+                        ), {"today": now_local.date()}).fetchone()
+                    already_scanned = _scanned and _scanned[0] > 0
+                    if already_scanned:
+                        print(f"[StartupCatchup] V2 daily scan already ran today — skipping.")
+                    else:
+                        print(f"[StartupCatchup] Running V2 daily scan...")
+                        _scheduled_v2_daily_scan()
+                        tasks_run.append("v2_daily_scan")
             except Exception as _e:
                 print(f"[StartupCatchup] v2_daily_scan failed: {_e}")
 
@@ -15373,11 +15431,21 @@ if SCHEDULER_AVAILABLE:
             except Exception as _e:
                 print(f"[StartupCatchup] channel_calibration failed: {_e}")
 
-            print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}")
+            print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}", flush=True)
 
         # Run catch-up in a background thread so it doesn't block FastAPI startup
-        _catchup_thread = threading.Thread(target=_startup_catchup, daemon=True, name="startup-catchup")
+        def _catchup_wrapper():
+            import sys
+            print("[StartupCatchup] Background catchup thread starting...", flush=True, file=sys.stderr)
+            try:
+                _startup_catchup()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[StartupCatchup] CRITICAL: {e}", flush=True, file=sys.stderr)
+        _catchup_thread = threading.Thread(target=_catchup_wrapper, daemon=True, name="startup-catchup")
         _catchup_thread.start()
+        print("[StartupCatchup] Background catchup thread launched.", flush=True)
 
     except Exception:
         pass

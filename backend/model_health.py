@@ -17,9 +17,9 @@ WARNING_THRESHOLD = 0.45
 def evaluate_signal_outcomes(conn) -> Dict:
     cutoff = date.today() - timedelta(days=56)
     rows = conn.execute(
-        "SELECT predicted_score, current_price, entry_price, "
+        "SELECT signal_score, current_price, entry_price, "
         "created_at, status FROM paper_trades "
-        "WHERE created_at >= :cutoff",
+        "WHERE status IN ('closed') AND created_at >= :cutoff",
         {"cutoff": cutoff}
     ).fetchall()
 
@@ -30,7 +30,7 @@ def evaluate_signal_outcomes(conn) -> Dict:
             "hit_rate": 0,
             "freeze": False,
             "warning": False,
-            "description": f"Need {INITIAL_OBSERVATIONS_NEEDED} observations, have {len(rows)}",
+            "description": f"Need {INITIAL_OBSERVATIONS_NEEDED} closed trades, have {len(rows)}",
         }
 
     wins = 0
@@ -39,14 +39,11 @@ def evaluate_signal_outcomes(conn) -> Dict:
         score = row[0]
         cp = row[1] or 0
         entry = row[2] or 0
-        status = row[4]
         if entry <= 0 or cp <= 0:
             continue
         pnl_pct = (cp - entry) / entry * 100
-        if status == "open":
-            continue
         evaluated += 1
-        if pnl_pct > 0 and score and score > 50:
+        if pnl_pct > 0 and (score is not None and score > 50):
             wins += 1
 
     if evaluated == 0:

@@ -6,7 +6,7 @@ FastAPI + SQLAlchemy data layer + dual LLM providers (Local/OpenAI).
 import asyncio
 import base64
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, date
 import hashlib
 import hmac
 import json
@@ -40,6 +40,7 @@ from pydantic import BaseModel
 import jwt
 import requests
 from sqlalchemy import create_engine, text
+import sqlalchemy.exc
 from sqlalchemy.exc import SQLAlchemyError
 import yfinance as yf
 
@@ -48,6 +49,24 @@ try:
 except ImportError as e:
     print(f"Agentic Brain not loaded: {e}")
     run_agentic_analysis = None
+
+try:
+    from portfolio_gate import PortfolioGate, calculate_position_size as pg_calculate_position_size
+    _PORTFOLIO_GATE = PortfolioGate()
+    _PORTFOLIO_GATE_AVAILABLE = True
+except ImportError as e:
+    print(f"PortfolioGate not loaded: {e}")
+    _PORTFOLIO_GATE = None
+    _PORTFOLIO_GATE_AVAILABLE = False
+
+try:
+    from circuit_breaker import DrawdownCircuitBreaker
+    _CIRCUIT_BREAKER = DrawdownCircuitBreaker()
+    _CIRCUIT_BREAKER_AVAILABLE = True
+except ImportError as e:
+    print(f"CircuitBreaker not loaded: {e}")
+    _CIRCUIT_BREAKER = None
+    _CIRCUIT_BREAKER_AVAILABLE = False
 
 try:
     from pypfopt import EfficientFrontier, risk_models, expected_returns, HRPOpt
@@ -586,6 +605,13 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     closed_at TIMESTAMP
                 )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trades_open ON paper_trades(user_id, symbol, side) WHERE status = 'open'
                 """
             )
         )
@@ -1389,6 +1415,7 @@ def detect_market(symbol: str) -> str:
 def format_ticker(symbol: str, market: str = "AU") -> str:
     """Return the correct yfinance ticker for a symbol in a given market."""
     market = (market or "AU").upper()
+    symbol = symbol.lstrip("$")  # strip $ prefix (e.g. $^AXJO → ^AXJO, $AQI → AQI)
     if symbol.startswith("^"):
         return symbol  # index tickers already fully qualified
     if market == "AU":
@@ -1572,15 +1599,17 @@ def get_valuation_metrics(symbol: str) -> dict:
     # 2. Try EODHD fundamentals
     eodhd_data = _eodhd_fundamentals(s, market)
     
-    # 3. Fallback to yfinance (slow, serialized via lock)
-    with _YFINANCE_LOCK:
-        stock = yf.Ticker(format_ticker(s, market))
-    
-    try:
+    # 3. Fallback to yfinance ONLY if EODHD data is missing or empty
+    stock = None
+    info = {}
+    if not eodhd_data or not eodhd_data.get("market_cap"):
         with _YFINANCE_LOCK:
-            info = stock.info
-    except:
-        info = {}
+            stock = yf.Ticker(format_ticker(s, market))
+        try:
+            with _YFINANCE_LOCK:
+                info = stock.info
+        except:
+            pass
     
     # Handle dividend yield (comes as decimal like 0.042, convert to %)
     div_yield = info.get('dividendYield')
@@ -1618,25 +1647,26 @@ def get_valuation_metrics(symbol: str) -> dict:
     next_earnings_date = None
     days_to_earnings = None
     try:
-        cal = stock.calendar
-        if cal is not None:
-            if hasattr(cal, 'T'):
-                if 'Earnings Date' in cal.index:
-                    raw_ed = cal.loc['Earnings Date']
-                    raw_ed = raw_ed.dropna() if hasattr(raw_ed, 'dropna') else raw_ed
-                    if hasattr(raw_ed, 'iloc') and len(raw_ed) > 0:
-                        raw_ed = raw_ed.iloc[0]
-                    if hasattr(raw_ed, 'date'):
-                        next_earnings_date = str(raw_ed.date())
-            elif isinstance(cal, dict):
-                raw_ed = cal.get('Earnings Date')
-                if raw_ed:
-                    if isinstance(raw_ed, list) and len(raw_ed) > 0:
-                        raw_ed = raw_ed[0]
-                    if hasattr(raw_ed, 'date'):
-                        next_earnings_date = str(raw_ed.date())
-                    elif isinstance(raw_ed, str):
-                        next_earnings_date = raw_ed
+        if stock is not None:
+            cal = stock.calendar
+            if cal is not None:
+                if hasattr(cal, 'T'):
+                    if 'Earnings Date' in cal.index:
+                        raw_ed = cal.loc['Earnings Date']
+                        raw_ed = raw_ed.dropna() if hasattr(raw_ed, 'dropna') else raw_ed
+                        if hasattr(raw_ed, 'iloc') and len(raw_ed) > 0:
+                            raw_ed = raw_ed.iloc[0]
+                        if hasattr(raw_ed, 'date'):
+                            next_earnings_date = str(raw_ed.date())
+                elif isinstance(cal, dict):
+                    raw_ed = cal.get('Earnings Date')
+                    if raw_ed:
+                        if isinstance(raw_ed, list) and len(raw_ed) > 0:
+                            raw_ed = raw_ed[0]
+                        if hasattr(raw_ed, 'date'):
+                            next_earnings_date = str(raw_ed.date())
+                        elif isinstance(raw_ed, str):
+                            next_earnings_date = raw_ed
         if next_earnings_date:
             from datetime import date as _date
             ed = _date.fromisoformat(next_earnings_date[:10])
@@ -2075,7 +2105,7 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["max_drawdown_20d"] = feat["dist_from_sma50"] * 0.5
         # Macro features (approximate from market context)
         feat["xjo_momentum_63d"] = float(c.get("sector_perf_1mo", 0) or 0)
-        feat["xjo_sma_position"] = 1.0 if treem in ("BULLISH", "UP") else 0.0
+        feat["xjo_sma_position"] = 1.0 if str(c.get("trend", "")) in ("BULLISH", "UP") else 0.0
         feat["xjo_vol_20d"] = feat["hv_20d"]
         feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0)
         # Pure macro features (live values from cached macro data)
@@ -8435,15 +8465,8 @@ def init_phase6_tables():
                 UNIQUE(symbol, screened_at)
             )
         """))
-        conn.execute(text("""
-            ALTER TABLE wealth_builder_evaluations
-            ADD COLUMN IF NOT EXISTS target_tier VARCHAR(10),
-            ADD COLUMN IF NOT EXISTS model_score NUMERIC(10, 2)
-        """))
-        conn.execute(text("""
-            ALTER TABLE wealth_builder_evaluations
-            ADD COLUMN IF NOT EXISTS actual_return_63d NUMERIC(8, 2)
-        """))
+
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS eod_ohl_history (
                 id SERIAL PRIMARY KEY,
@@ -10517,10 +10540,11 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
 
     trade_id = str(uuid4())
 
-    with db_conn() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO paper_trades
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO paper_trades
                     (id, user_id, symbol, market, side, quantity, entry_price, current_price,
                      target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
                      stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
@@ -10556,6 +10580,8 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                 "updated_at": datetime.utcnow(),
             },
         )
+    except sqlalchemy.exc.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"You already have an open {side} position for {symbol}.")
 
     log_position_event(trade_id, current_user["id"], "opened", f"Opened {side} tracking position for {symbol}", {
         "symbol": symbol,
@@ -10810,9 +10836,9 @@ def _scheduled_broad_scan_precompute():
     # yfinance dead ticker tracking via centralized YFinanceService
     from yfinance_service import YFinanceService
     yfinance_dead = YFinanceService.get_dead_set()
-#     symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
-#     if yfinance_dead:
-#         print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")
+    if yfinance_dead:
+        symbol_pool = [s for s in symbol_pool if s not in yfinance_dead]
+        print(f"[BroadScan] Skipping {len(yfinance_dead)} tickers known to lack yfinance data")
 
     scanned = 0
     candidates = []
@@ -10821,7 +10847,7 @@ def _scheduled_broad_scan_precompute():
     print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
 
     new_dead = set()
-    scan_workers = 3
+    scan_workers = 2  # reduced from 3 to limit memory pressure (2GB container)
     def _score_one(sym):
         try:
             r = _score_wealth_candidate(sym, market)
@@ -11352,6 +11378,42 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                             f"Position is flat after {days_held}d ({pnl_pct:+.1f}%). "
                             f"Signal may have failed. Consider freeing capital for higher-conviction ideas."
                         )
+
+                    # ── Exit Engine (v2: catastrophe-stop / time-stop / CGT deferral) ──
+                    if stage_update is None:
+                        try:
+                            from exit_engine import compute_exit_plan
+                            atr_pct = 0.03
+                            try:
+                                hist = get_historical_data(symbol, period="3mo")
+                                if hist is not None and len(hist) >= 20:
+                                    ind = calculate_technical_indicators(hist)
+                                    atr_pct = (ind.get("atr_pct") or 3.0) / 100.0
+                            except Exception:
+                                atr_pct = 0.03
+                            entry_date_val = created_at.date() if created_at else date.today()
+                            exit_plan = compute_exit_plan(
+                                symbol=symbol,
+                                entry_date=entry_date_val,
+                                entry_price=entry_f,
+                                current_price=cp,
+                                atr_20d_pct=atr_pct,
+                                days_to_earnings=days_to_e,
+                                sentinel_verdict="INTACT",
+                                portfolio_breaker_level="NORMAL",
+                            )
+                            es = exit_plan.get("exit_signal", "HOLD")
+                            if es == "FORCE_EXIT" or es == "EXIT":
+                                stage_update = "exit_signal"
+                                alert = _rich_alert(
+                                    f"🚪 EXIT ENGINE: {exit_plan.get('exit_reason', 'EXIT')}",
+                                    f"Day {days_held}/63. "
+                                    f"Gain {pnl_pct:+.1f}%. Stop at ${exit_plan.get('cat_stop_price', 0):.2f}."
+                                )
+                            elif es == "HOLD_EXTEND":
+                                print(f"[PaperMonitor] {symbol}: CGT deferral — holding for discount")
+                        except Exception as e:
+                            pass  # exit engine non-blocking
 
                     conn.execute(text("""
                         UPDATE paper_trades
@@ -13969,6 +14031,80 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 print(f"[AutoCreate] SKIP {symbol} — open position already exists")
                 return None
         # ── End duplicate guard ───────────────────────────────────────────
+
+        # ── Portfolio Gate (hard risk limits) ──────────────────────────────
+        if _PORTFOLIO_GATE_AVAILABLE and _PORTFOLIO_GATE is not None:
+            try:
+                from portfolio_gate import PortfolioGate
+                pf = _compute_portfolio_state(user_id)
+                open_positions = []
+                sector_map = {}
+                with db_conn() as conn:
+                    rows = conn.execute(text(
+                        "SELECT symbol, COALESCE(entry_price,0)*COALESCE(qty,0) AS value FROM paper_trades WHERE status='open' AND user_id=:uid"
+                    ), {"uid": user_id}).fetchall()
+                    for sym, val in rows:
+                        try:
+                            vm = get_valuation_metrics(sym)
+                            sector = str(vm.get("sector", "Unknown"))
+                            sector_map[sym] = sector
+                        except Exception:
+                            sector = "Unknown"
+                        open_positions.append({"symbol": sym, "value": float(val or 0), "sector": sector})
+                
+                adv_20d = 0
+                try:
+                    sd = get_stock_data(symbol, market)
+                    adv_20d = float(sd.get("avg_volume", 0) or 0) * entry_price
+                except Exception:
+                    pass
+                
+                try:
+                    vm = get_valuation_metrics(symbol)
+                    sector = str(vm.get("sector", "Unknown"))
+                except Exception:
+                    sector = "Unknown"
+                
+                gate_result = _PORTFOLIO_GATE.can_open_position(
+                    proposed_symbol=symbol,
+                    proposed_sector=sector,
+                    proposed_value=quantity * entry_price,
+                    proposed_adv_20d=adv_20d,
+                    portfolio_total_value=pf["total_equity"],
+                    portfolio_cash=pf["available_cash"],
+                    open_positions=open_positions,
+                    is_core=False,
+                )
+                if not gate_result.get("approved", True):
+                    print(f"[AutoCreate] PORTFOLIO GATE BLOCKED {symbol}: {gate_result['reason']}")
+                    return None
+                print(f"[AutoCreate] Portfolio gate passed for {symbol}: {gate_result['reason']}")
+            except Exception as e:
+                print(f"[AutoCreate] Portfolio gate check failed (non-blocking): {e}")
+
+        # ── Circuit Breaker ───────────────────────────────────────────────
+        if _CIRCUIT_BREAKER_AVAILABLE and _CIRCUIT_BREAKER is not None:
+            try:
+                pf = _compute_portfolio_state(user_id)
+                breaker_state = _CIRCUIT_BREAKER.check(pf["total_equity"])
+                if not breaker_state.get("allow_new_entries", True):
+                    print(f"[AutoCreate] CIRCUIT BREAKER BLOCKED {symbol}: level={breaker_state.get('level')}, dd={breaker_state.get('drawdown_pct')}%")
+                    return None
+                if breaker_state.get("sell_all", False):
+                    print(f"[AutoCreate] CIRCUIT BREAKER RED - all satellite selling, no new entries for {symbol}")
+                    return None
+            except Exception as e:
+                print(f"[AutoCreate] Circuit breaker check failed (non-blocking): {e}")
+
+        # ── Calendar Gate (Friday / bear-market block) ──────────────────────
+        try:
+            from calendar_gate import get_calendar_status
+            cal = get_calendar_status()
+            if not cal.get("allow_new_entries", True):
+                print(f"[AutoCreate] CALENDAR GATE BLOCKED {symbol}: {cal.get('calendar_signal', 'blocked')} — {cal.get('reason', '')}")
+                return None
+        except Exception as e:
+            pass  # non-blocking if calendar_gate fails to import
 
         signal = get_probability_and_score(symbol)
         predicted = float(signal.get("predicted_price_3m") or 0)

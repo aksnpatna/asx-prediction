@@ -2641,6 +2641,18 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     except Exception:
         indicators['kde_rsi_prob'] = 0.5
     
+    # ── Stochastic RSI ─────────────────────────────────────
+    # Normalizes RSI between 0-100, easier for AI to detect overbought/oversold
+    # Uses 14-period lookback of RSI values
+    try:
+        stoch_rsi_lookback = 14
+        rsi_min = rsi_series.rolling(stoch_rsi_lookback).min()
+        rsi_max = rsi_series.rolling(stoch_rsi_lookback).max()
+        stoch_rsi = (rsi_series - rsi_min) / (rsi_max - rsi_min + 1e-9) * 100
+        indicators['stoch_rsi'] = round(float(stoch_rsi.iloc[-1]), 2)
+    except Exception:
+        indicators['stoch_rsi'] = 50.0
+    
     # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -2756,6 +2768,11 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
         true_range = np.max(ranges, axis=1)
         atr = true_range.rolling(14).mean()
         indicators['atr'] = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
+        if indicators['atr'] is not None and indicators['atr'] > 0:
+            close_current = float(df['Close'].iloc[-1])
+            indicators['atr_pct'] = round(float(indicators['atr'] / close_current * 100), 2) if close_current > 0 else 2.0
+        else:
+            indicators['atr_pct'] = 2.0
 
         # Supertrend (Basic approximation using ATR and Multiplier=3)
         hl2 = (df['High'] + df['Low']) / 2
@@ -7701,13 +7718,11 @@ async def deep_dive_analysis(query: SymbolQuery, current_user: dict = Depends(ge
         tech = {}
         if len(hist) > 0:
             tech = calculate_technical_indicators(hist)
-            # Expand context keys for the 6 personas (include all new Layer 1 indicators)
             tech = {k: v for k, v in tech.items() if k in [
-                "rsi", "rsi_slope", "macd", "macd_signal", "sma_20", "sma_50", "sma_200",
-                "ema_9", "ema_20", "ema_50", "donchian_high_20", "donchian_low_20",
-                "volatility", "momentum_20", "hacolt", "adx", "plus_di", "minus_di",
-                "dmi_bullish", "atr", "vwap_20", "above_vwap", "up_down_vol_ratio",
-                "block_volume_detected", "bb_pct_b",
+                "rsi", "rsi_slope", "stoch_rsi", "macd", "macd_signal", "sma_200",
+                "ema_9", "ema_20", "ema_50", "volatility", "momentum_20", "adx",
+                "dmi_bullish", "atr_pct", "vwap_20", "above_vwap", "up_down_vol_ratio",
+                "block_volume_detected", "bb_pct_b", "cmf", "ttm_squeeze_on",
             ]}
 
         # Build Layer 1 confluence snapshot

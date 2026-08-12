@@ -15260,7 +15260,7 @@ if SCHEDULER_AVAILABLE:
             timezone=_get_scheduler_timezone(),
             jobstores=jobstores,
             executors={"default": SchedulerExecutor(max_workers=8)},
-            job_defaults={"coalesce": True, "misfire_grace_time": 3600},
+            job_defaults={"coalesce": True, "misfire_grace_time": 86400},
         )
 
         # ── SMSF v2 Core Pipeline ────────────────────────────────────────
@@ -15332,6 +15332,22 @@ if SCHEDULER_AVAILABLE:
         )
 
         scheduler.start()
+
+        # ── Reschedule persisted jobs with past next_run_times ────────────
+        # When the container restarts, persisted jobs may have next_run_times
+        # in the past. APScheduler's misfire_grace_time handles this, but
+        # only at the moment the job was supposed to fire. If the container
+        # was down for hours, those windows are missed. This reschedules any
+        # past-due job to fire immediately on startup.
+        try:
+            from datetime import datetime as _dt
+            now = _dt.now(timezone.utc)
+            for job in scheduler.get_jobs():
+                if job.next_run_time and job.next_run_time < now:
+                    print(f"[Scheduler] Rescheduling missed job '{job.id}' from {job.next_run_time} to now", flush=True)
+                    scheduler.reschedule_job(job.id, trigger='date', run_date=now)
+        except Exception as e:
+            print(f"[Scheduler] Reschedule check failed: {e}", flush=True)
 
         # ── Startup Catch-Up Engine ───────────────────────────────────────────
         # This system runs on a mini-PC that is powered off overnight and may

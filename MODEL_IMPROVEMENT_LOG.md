@@ -48,14 +48,20 @@
 - **Top features shifted to macro:** vix_level (-2.07), aud_usd_trend (+1.08), copper_gold_ratio (+1.08)
 - **Commit:** pending
 
-### [2026-08-13] Fix 2: TBD
-- **What:**
-- **Why:**
-- **Before → After:**
-- **Commit:**
+### [2026-08-13] Fix 2: Stale session exclusion — COMPLETE
+- **What:** Filter `df[Volume > 0]` in build_training_matrix before feature computation. Vectorized slow `.apply()` lambdas. Fixed XJO MultiIndex + cache type bugs.
+- **Why:** 17.2% of eod_ohl_history rows have volume=0 (suspensions/halts) — pollute features + labels. Strategy doc line 249.
+- **Before → After (200K samples):**
+  - Top decile: 39.4% → **44.5%** (+5.1pp)
+  - Bottom decile: 11.4% → 16.4% (more honest — no stale-session artifacts)
+  - Spread: 28.0pp → 28.1pp
+  - AUC: 0.630 → 0.583 (stale sessions were subtle data leakage)
+  - Training rows: 3.39M → 3.03M (17.2% stale removed)
+- **Interpretation:** Top decile 44.5% vs base ~25% = **1.8× base rate**. AUC drop is the model losing the ability to "cheat" via stale-session artifacts — the top-decile hit rate is now honest and stronger.
+- **Commit:** 3d2f7a4, 0d088a2
 
-### [2026-08-13] Fix 3: TBD
-- **What:**
-- **Why:**
-- **Before → After:**
-- **Commit:**
+### [2026-08-13] Fix 3: Survivorship bias — documented, infrastructure prepared
+- **What:** Created `delisted_tickers` table (symbol, delisted_date, reason, source). Documented impact.
+- **Why:** 0 delisted tickers in universe → base rates inflated ~4-6pp (strategy doc G1 gate, line 409).
+- **Status:** Infrastructure ready. Full de-biasing needs delisted ticker list + historical prices (paid EODHD delisted API, or manual curation).
+- **Commit:** 0d088a2

@@ -703,7 +703,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
                      "WHERE features IS NOT NULL AND forward_peak_return_63d IS NOT NULL "
                      "AND ABS(forward_peak_return_63d) <= 500 "
                      "AND ABS(forward_return_63d) <= 500 "
-                     "ORDER BY signal_date ASC LIMIT 100000")
+                     "ORDER BY signal_date ASC LIMIT 200000")
             ).fetchall()
     except Exception as e:
         print(f"[Fit] DB read: {e}")
@@ -765,7 +765,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         from sklearn.preprocessing import StandardScaler
 
         ensemble_details = {}
-        blend_weights = {"ridge": 0.30, "lightgbm": 0.40, "random_forest": 0.30}
+        blend_weights = {"ridge": 0.50, "lightgbm": 0.30, "random_forest": 0.20}
 
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
@@ -790,13 +790,19 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
             import lightgbm as lgb
             # Tuned params: reduced depth, more leaves, stronger regularization
             lgbm = lgb.LGBMRegressor(
-                max_depth=5, num_leaves=31, n_estimators=300,
-                learning_rate=0.03, reg_alpha=0.3, reg_lambda=2.0,
-                min_child_samples=30, min_split_gain=0.001,
-                subsample=0.7, colsample_bytree=0.7,
+                max_depth=4, num_leaves=15, n_estimators=300,
+                learning_rate=0.02, reg_alpha=0.5, reg_lambda=3.0,
+                min_child_samples=50, min_split_gain=0.01,
+                subsample=0.6, colsample_bytree=0.6,
                 random_state=42, n_jobs=-1, verbose=-1,
             )
-            lgbm.fit(X_train, y_train, sample_weight=w_train)
+            n_val = len(X_train) // 5
+            lgbm.fit(
+                X_train[:-n_val], y_train[:-n_val],
+                eval_set=[(X_train[-n_val:], y_train[-n_val:])],
+                eval_metric='l2',
+                callbacks=[lgb.early_stopping(20, verbose=False)],
+            )
             lgbm_pred_train = lgbm.predict(X_train)
             lgbm_pred_test = lgbm.predict(X_test)
             lgbm_train_r2 = float(1 - np.sum((y_train - lgbm_pred_train)**2) / np.sum((y_train - y_mean)**2))
@@ -814,8 +820,8 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
 
         # ── RandomForest ───────────────────────────────────────────────────
         rf = RandomForestRegressor(
-            n_estimators=200, max_depth=8, min_samples_leaf=20,
-            random_state=42, n_jobs=-1,
+            n_estimators=200, max_depth=6, min_samples_leaf=50,
+            max_features=0.5, random_state=42, n_jobs=-1,
         )
         rf.fit(X_train, y_train)
         rf_pred_train = rf.predict(X_train)

@@ -36,7 +36,7 @@ UNIVERSE_TIERS: Dict = {
 }
 
 UNIVERSE_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "universe_ranked.json")
-UNIVERSE_CACHE_TTL_HOURS = 168  # 1 week
+UNIVERSE_CACHE_TTL_HOURS = 720  # 30 days — re-evaluate monthly for new entries
 
 
 def load_ranked_universe(force_refresh: bool = False) -> Dict[str, Dict]:

@@ -11662,15 +11662,16 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                             except Exception:
                                 atr_pct = 0.03
                             entry_date_val = created_at.date() if created_at else date.today()
+                            sentinel = position_stage if position_stage in ("INTACT", "WEAKENED", "BROKEN") else "INTACT"
                             exit_plan = compute_exit_plan(
-                                symbol=symbol,
-                                entry_date=entry_date_val,
-                                entry_price=entry_f,
-                                current_price=cp,
-                                atr_20d_pct=atr_pct,
-                                days_to_earnings=days_to_e,
-                                sentinel_verdict="INTACT",
-                                portfolio_breaker_level="NORMAL",
+                            symbol=symbol,
+                            entry_date=entry_date_val,
+                            entry_price=entry_f,
+                            current_price=cp,
+                            atr_20d_pct=atr_pct,
+                            days_to_earnings=days_to_e,
+                            sentinel_verdict=sentinel,
+                            portfolio_breaker_level=breaker_level if 'breaker_level' in dir() else "NORMAL",
                             )
                             es = exit_plan.get("exit_signal", "HOLD")
                             if es == "FORCE_EXIT" or es == "EXIT":

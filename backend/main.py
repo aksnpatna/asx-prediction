@@ -14023,8 +14023,24 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
     """Create a paper trade with sensible defaults for auto-monitoring.
     Returns the trade_id or None on failure.
     Prevents duplicate open positions for the same symbol.
+    Blocks trades if model quality is below threshold (R² < 0.05).
     """
     try:
+        # ── Model quality gate — block trades if model is random noise ──────
+        try:
+            with db_conn() as conn:
+                latest_r2 = conn.execute(text(
+                    "SELECT in_sample_hit_rate FROM model_weights_by_date "
+                    "WHERE model_type='ridge' AND feature_name='rsi' "
+                    "ORDER BY trained_at DESC LIMIT 1"
+                )).fetchone()
+                if latest_r2 and latest_r2[0] is not None and latest_r2[0] < 0.05:
+                    print(f"[AutoCreate] BLOCKED: Model R²={latest_r2[0]:.3f} < 0.05 threshold — no signal quality")
+                    return None
+        except Exception as e:
+            # Non-blocking — if we can't check R², allow trade but log warning
+            print(f"[AutoCreate] Model quality check failed (allowing trade): {e}")
+
         # ── Duplicate position guard ──────────────────────────────────────
         with db_conn() as conn:
             existing = conn.execute(text("""
@@ -14757,6 +14773,31 @@ def _scheduled_pipeline_health_report():
                     _ok("Heartbeat", "clean")
             except Exception:
                 _warn("Heartbeat", "check failed")
+
+            # 9. Pipeline activity check (failure alerting)
+            r = c.execute(text(
+                "SELECT COUNT(*) FROM job_execution_log WHERE started_at >= CURRENT_DATE"
+            )).fetchone()
+            jobs_today = r[0] if r else 0
+            if jobs_today == 0:
+                _fail("Pipeline", "no jobs ran today — system may be down")
+            elif jobs_today < 3:
+                _warn("Pipeline", f"only {jobs_today} jobs ran today")
+            else:
+                _ok("Pipeline", f"{jobs_today} jobs ran")
+
+            # 10. Memory usage check
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                if mem.percent > 85:
+                    _fail("Memory", f"{mem.percent}% — risk of OOM")
+                elif mem.percent > 75:
+                    _warn("Memory", f"{mem.percent}%")
+                else:
+                    _ok("Memory", f"{mem.percent}%")
+            except Exception:
+                _warn("Memory", "unable to check")
 
         # Build Telegram message
         fail_count = sum(1 for r in results if r.startswith("❌"))

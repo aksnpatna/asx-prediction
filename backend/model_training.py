@@ -282,7 +282,8 @@ _xjo_cache_lock = _thr.Lock()
 _macro_series_lock = _thr.Lock()
 
 def _get_xjo_data():
-    """Fetch ASX200 (XJO) benchmark data once per training run. Thread-safe cache."""
+    """Fetch ASX200 (XJO) benchmark data once per training run. Thread-safe cache.
+    Tries EODHD first, falls back to yfinance ^AXJO.AX."""
     global _XJO_CACHE
     with _xjo_cache_lock:
         if _XJO_CACHE:
@@ -294,6 +295,16 @@ def _get_xjo_data():
             xjo = xjo.sort_index()
             _XJO_CACHE = xjo
             return xjo
+    except Exception:
+        pass
+    # Fallback: yfinance ^AXJO (ASX200 index)
+    try:
+        import yfinance as yf
+        xjo_yf = yf.download("^AXJO", period="10y", progress=False)
+        if not xjo_yf.empty:
+            xjo_yf = xjo_yf.rename(columns={"Close": "Close"}).sort_index()
+            _XJO_CACHE = xjo_yf
+            return xjo_yf
     except Exception:
         pass
     return pd.DataFrame()
@@ -460,7 +471,8 @@ def _enrich_fundamentals():
                 )
                 FROM fundamental_snapshots f
                 WHERE f.symbol = mts.symbol
-                  AND NOT (mts.features ? 'fund_pe_inv')
+                  AND (NOT (mts.features ? 'fund_pe_inv') OR (mts.features->>'fund_pe_inv')::numeric = 0)
+                  AND f.trailing_pe IS NOT NULL
             """)).rowcount
             conn.commit()
             if updated > 0:
@@ -732,6 +744,18 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
     X = np.array(X_list)
     y = np.array(y_list)
 
+    # ── Drop zero-variance features (fundamental + XJO not populated yet) ──
+    nonzero_variance = np.std(X, axis=0) > 1e-8
+    active_features = [fe for fe, nz in zip(FEATURE_COLS, nonzero_variance) if nz]
+    dropped = len(FEATURE_COLS) - len(active_features)
+    if dropped > 0:
+        X = X[:, nonzero_variance]
+        print(f"[Fit] Dropped {dropped}/{len(FEATURE_COLS)} zero-variance features "
+              f"(kept {len(active_features)}: {', '.join([f for f in FEATURE_COLS if f not in active_features][:5])}...)")
+    else:
+        active_features = FEATURE_COLS
+    FEATURE_COLS_ACTIVE = active_features
+
     n_train = int(len(X) * 0.8)
     X_train, X_test = X[:n_train], X[n_train:]
     y_train, y_test = y[:n_train], y[n_train:]
@@ -776,7 +800,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         ridge.fit(X_train_scaled, y_train)
         ridge_pred_train = ridge.predict(X_train_scaled)
         ridge_pred_test = ridge.predict(X_test_scaled)
-        ridge_coefs = dict(zip(FEATURE_COLS, ridge.coef_))
+        ridge_coefs = dict(zip(FEATURE_COLS_ACTIVE, ridge.coef_))
         ensemble_details["ridge"] = {
             "train_r2": round(float(1 - np.sum((y_train - ridge_pred_train)**2) / np.sum((y_train - y_mean)**2)), 4),
             "test_r2": round(float(1 - np.sum((y_test - ridge_pred_test)**2) / np.sum((y_test - y_test.mean())**2)), 4),
@@ -801,7 +825,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
             lgbm_pred_test = lgbm.predict(X_test)
             lgbm_train_r2 = float(1 - np.sum((y_train - lgbm_pred_train)**2) / np.sum((y_train - y_mean)**2))
             lgbm_test_r2 = float(1 - np.sum((y_test - lgbm_pred_test)**2) / np.sum((y_test - y_test.mean())**2))
-            lgbm_importances = dict(zip(FEATURE_COLS, lgbm.feature_importances_))
+            lgbm_importances = dict(zip(FEATURE_COLS_ACTIVE, lgbm.feature_importances_))
             ensemble_details["lightgbm"] = {
                 "train_r2": round(lgbm_train_r2, 4),
                 "test_r2": round(lgbm_test_r2, 4),
@@ -822,7 +846,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         rf_pred_test = rf.predict(X_test)
         rf_train_r2 = float(1 - np.sum((y_train - rf_pred_train)**2) / np.sum((y_train - y_mean)**2))
         rf_test_r2 = float(1 - np.sum((y_test - rf_pred_test)**2) / np.sum((y_test - y_test.mean())**2))
-        rf_importances = dict(zip(FEATURE_COLS, rf.feature_importances_))
+        rf_importances = dict(zip(FEATURE_COLS_ACTIVE, rf.feature_importances_))
         ensemble_details["random_forest"] = {
             "train_r2": round(rf_train_r2, 4),
             "test_r2": round(rf_test_r2, 4),
@@ -847,7 +871,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         rf_max = max(abs(v) for v in rf_importances.values()) or 1e-9
 
         combined_coefs = {}
-        for fname in FEATURE_COLS:
+        for fname in FEATURE_COLS_ACTIVE:
             r_w = abs(ridge_coefs.get(fname, 0))
             l_w = abs(lgbm_importances.get(fname, 0))
             rf_w = abs(rf_importances.get(fname, 0))
@@ -883,7 +907,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
             scaler_stats = json.dumps({
                 "mean": scaler.mean_.tolist(),
                 "scale": scaler.scale_.tolist(),
-                "feature_order": FEATURE_COLS,
+                "feature_order": FEATURE_COLS_ACTIVE,
             })
             conn.execute(text(
                 "INSERT INTO model_weights_by_date (trained_at, feature_name, weight, coefficient, model_type, notes) "
@@ -904,7 +928,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
 
     except ImportError:
         corr_w = {}
-        for i, c in enumerate(FEATURE_COLS):
+        for i, c in enumerate(FEATURE_COLS_ACTIVE):
             if X[:, i].std() > 0:
                 corr = np.corrcoef(X[:, i], y)[0, 1]
                 corr_w[c] = round(corr, 6) if not np.isnan(corr) else 0.0

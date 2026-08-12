@@ -568,6 +568,14 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
             if df.empty or len(df) < FORWARD_WINDOW_DAYS + 50:
                 continue
 
+            # ── Exclude stale sessions (volume==0) — strategy doc line 249 ──
+            # Non-trading days (suspensions/halts) pollute features + labels.
+            # 17.2% of eod_ohl_history rows have volume=0.
+            if "Volume" in df.columns:
+                df = df[df["Volume"] > 0]
+                if len(df) < FORWARD_WINDOW_DAYS + 50:
+                    continue
+
             fm = _build_feature_matrix(df)
             fm = _add_macro_features(fm, df)
             close = df["Close"].astype(float)

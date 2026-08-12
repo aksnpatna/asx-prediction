@@ -8911,6 +8911,17 @@ def init_phase6_tables():
                     UNIQUE (symbol, fiscal_year)
                 )
             """))
+            # Delisted tickers (survivorship-bias de-biasing, G1 gate)
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS delisted_tickers (
+                    symbol VARCHAR(20) PRIMARY KEY,
+                    name TEXT,
+                    delisted_date DATE,
+                    delisted_reason TEXT,
+                    source TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
         except Exception:
             pass
 

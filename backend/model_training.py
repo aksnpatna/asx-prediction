@@ -218,19 +218,17 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["vol_regime_ratio"] = hv_5d / (fm["hv_20d"] + 1e-9)
 
     gk_var = 0.5 * (np.log(high / low)) ** 2 - (2 * np.log(2) - 1) * (np.log(close / open_)) ** 2
-    fm["garman_klass_vol"] = np.sqrt(gk_var.rolling(20).mean() * 252)
+    fm["garman_klass_vol"] = np.sqrt(np.maximum(gk_var.rolling(20).mean() * 252, 0))
 
     parkinson_var = (1 / (4 * np.log(2))) * (np.log(high / low)) ** 2
-    fm["parkinson_vol"] = np.sqrt(parkinson_var.rolling(20).mean() * 252)
+    fm["parkinson_vol"] = np.sqrt(np.maximum(parkinson_var.rolling(20).mean() * 252, 0))
 
     # ── Time-series structure features ────────────────────────────────────────
-    fm["autocorr_5d"] = rets.rolling(20).apply(lambda x: x.autocorr(lag=5) if len(x) > 5 else 0, raw=False)
+    fm["autocorr_5d"] = rets.rolling(20).corr(rets.shift(5))
 
     fm["skewness_20d"] = rets.rolling(20).skew()
     fm["kurtosis_20d"] = rets.rolling(20).kurt()
-    fm["max_drawdown_20d"] = close.rolling(20).apply(
-        lambda x: (x.min() / x.iloc[0] - 1) * 100 if len(x) > 0 else 0, raw=False
-    )
+    fm["max_drawdown_20d"] = (close.rolling(20).min() / close.shift(19) - 1) * 100
 
     # ── Fill NaN values with reasonable defaults ─────────────────────────────
     fm["sma_cross_20_50"] = fm["sma_cross_20_50"].fillna(0.5)
@@ -278,8 +276,8 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return fm
 
 
-_XJO_CACHE = {}
-_MACRO_SERIES_CACHE = {}
+_XJO_CACHE = None
+_MACRO_SERIES_CACHE = None
 import threading as _thr
 _xjo_cache_lock = _thr.Lock()
 _macro_series_lock = _thr.Lock()
@@ -289,7 +287,7 @@ def _get_xjo_data():
     Tries EODHD first, falls back to yfinance ^AXJO.AX."""
     global _XJO_CACHE
     with _xjo_cache_lock:
-        if _XJO_CACHE:
+        if _XJO_CACHE is not None:
             return _XJO_CACHE
     try:
         from eodhd_backfill import get_ohlc_for_symbol
@@ -305,7 +303,10 @@ def _get_xjo_data():
         import yfinance as yf
         xjo_yf = yf.download("^AXJO", period="10y", progress=False)
         if not xjo_yf.empty:
-            xjo_yf = xjo_yf.rename(columns={"Close": "Close"}).sort_index()
+            # Flatten MultiIndex columns (auto_adjust=True creates (Close, ^AXJO))
+            if isinstance(xjo_yf.columns, pd.MultiIndex):
+                xjo_yf.columns = xjo_yf.columns.get_level_values(0)
+            xjo_yf = xjo_yf[["Open", "High", "Low", "Close", "Volume"]].sort_index()
             _XJO_CACHE = xjo_yf
             return xjo_yf
     except Exception:
@@ -322,7 +323,7 @@ def _get_macro_series() -> dict:
     """
     global _MACRO_SERIES_CACHE
     with _macro_series_lock:
-        if _MACRO_SERIES_CACHE:
+        if _MACRO_SERIES_CACHE is not None:
             return _MACRO_SERIES_CACHE
 
     result = {}

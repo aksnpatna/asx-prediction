@@ -745,13 +745,14 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
     y = np.array(y_list)
 
     # ── Drop zero-variance features (fundamental + XJO not populated yet) ──
-    nonzero_variance = np.std(X, axis=0) > 1e-8
+    nonzero_variance = np.std(X, axis=0) > 1e-12
     active_features = [fe for fe, nz in zip(FEATURE_COLS, nonzero_variance) if nz]
     dropped = len(FEATURE_COLS) - len(active_features)
     if dropped > 0:
         X = X[:, nonzero_variance]
+        dropped_names = [f for f in FEATURE_COLS if f not in active_features]
         print(f"[Fit] Dropped {dropped}/{len(FEATURE_COLS)} zero-variance features "
-              f"(kept {len(active_features)}: {', '.join([f for f in FEATURE_COLS if f not in active_features][:5])}...)")
+              f"(kept {len(active_features)}): {', '.join(dropped_names[:8])}")
     else:
         active_features = FEATURE_COLS
     FEATURE_COLS_ACTIVE = active_features

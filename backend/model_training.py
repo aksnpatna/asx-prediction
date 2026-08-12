@@ -40,6 +40,9 @@ FEATURE_COLS = [
     "fund_div_yield", "fund_analyst_upside", "fund_analyst_rec_score",
     "fund_earnings_growth", "fund_revenue_growth", "fund_beta",
     "fund_pct_from_52w_high",
+    # Historical fundamental ratios (yfinance income/balance/cashflow, 4yr)
+    "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
+    "fund_hist_op_margin", "fund_hist_fcf_yield",
     # Market regime features
     "regime_sma_alignment", "vwap_position", "gap_detection",
     # Volatility structure features

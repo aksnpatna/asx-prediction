@@ -17,6 +17,60 @@ FUNDAMENTAL_FEATURES = [
     "fund_pct_from_52w_high",
 ]
 
+HISTORICAL_FEATURES = [
+    "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
+    "fund_hist_op_margin", "fund_hist_fcf_yield",
+]
+
+
+def _load_historical_fundamentals(db_conn) -> Dict[str, dict]:
+    """Load latest fiscal-year fundamental ratios per symbol (from income/balance/cashflow)."""
+    from sqlalchemy import text
+    result = {}
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(text("""
+                SELECT DISTINCT ON (symbol) symbol, fiscal_year,
+                    roe_pct, debt_equity, gross_margin_pct, op_margin_pct,
+                    fcf, market_cap_hint
+                FROM (
+                    SELECT fh.symbol, fh.fiscal_year, fh.roe_pct, fh.debt_equity,
+                           fh.gross_margin_pct, fh.op_margin_pct, fh.fcf,
+                           fs.market_cap as market_cap_hint
+                    FROM fundamental_history fh
+                    LEFT JOIN fundamental_snapshots fs ON fs.symbol = fh.symbol
+                ) x
+                ORDER BY symbol, fiscal_year DESC
+            """)).fetchall()
+        for r in rows:
+            sym, yr, roe, de, gm, om, fcf, mcap = r
+            result[sym] = {
+                "roe": float(roe) if roe else 0.0,
+                "debt_equity": float(de) if de else 0.0,
+                "gross_margin": float(gm) if gm else 0.0,
+                "op_margin": float(om) if om else 0.0,
+                "fcf": float(fcf) if fcf else 0.0,
+                "market_cap": float(mcap) if mcap else 0.0,
+            }
+    except Exception as e:
+        print(f"[FundHist] Load failed: {e}", flush=True)
+    return result
+
+
+def _fill_historical(feats: dict, symbol: str, hist_map: Dict[str, dict]) -> dict:
+    h = hist_map.get(symbol)
+    if not h:
+        return feats
+    feats.setdefault("fund_hist_roe", h["roe"])
+    feats.setdefault("fund_hist_debt_equity", h["debt_equity"])
+    feats.setdefault("fund_hist_gross_margin", h["gross_margin"])
+    feats.setdefault("fund_hist_op_margin", h["op_margin"])
+    if h["market_cap"] > 0 and h["fcf"] > 0:
+        feats.setdefault("fund_hist_fcf_yield", h["fcf"] / h["market_cap"] * 100)
+    else:
+        feats.setdefault("fund_hist_fcf_yield", 0.0)
+    return feats
+
 
 def _load_latest_fundamentals(db_conn) -> Dict[str, dict]:
     """Load latest fundamental snapshot per symbol into a dict."""
@@ -108,7 +162,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
 
     # Load latest fundamentals per symbol (in-memory, fast)
     fund_map = _load_latest_fundamentals(db_conn)
-    print(f"[Fund] Loaded {len(fund_map)} symbol fundamentals", flush=True)
+    hist_map = _load_historical_fundamentals(db_conn)
+    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical symbol fundamentals", flush=True)
 
     # Parse features + fill fundamentals
     X_list, y_list = [], []
@@ -119,6 +174,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             symbol, entry_price, feats_raw, label = row
             feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
             feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
+            feats = _fill_historical(feats, symbol, hist_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 skipped += 1; continue

@@ -8887,6 +8887,32 @@ def init_phase6_tables():
                 UNIQUE(symbol, snapshot_date)
             )
         """))
+        # Historical fundamental ratios (yfinance income/balance/cashflow, 4yr)
+        try:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fundamental_history (
+                    id SERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    fiscal_year INTEGER NOT NULL,
+                    revenue DOUBLE PRECISION,
+                    net_income DOUBLE PRECISION,
+                    eps DOUBLE PRECISION,
+                    roe_pct DOUBLE PRECISION,
+                    debt_equity DOUBLE PRECISION,
+                    gross_margin_pct DOUBLE PRECISION,
+                    op_margin_pct DOUBLE PRECISION,
+                    ocf DOUBLE PRECISION,
+                    fcf DOUBLE PRECISION,
+                    total_assets DOUBLE PRECISION,
+                    total_debt DOUBLE PRECISION,
+                    equity DOUBLE PRECISION,
+                    cash DOUBLE PRECISION,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (symbol, fiscal_year)
+                )
+            """))
+        except Exception:
+            pass
 
 try:
     init_phase6_tables()
@@ -14524,6 +14550,13 @@ def _scheduled_monthly_fundamentals():
     try:
         from fundamental_feeder import fetch_all_fundamentals
         result = fetch_all_fundamentals()
+        # Also fetch historical financial statements (income/balance/cashflow)
+        try:
+            from fundamental_history_feeder import fetch_historical_fundamentals
+            hist = fetch_historical_fundamentals()
+            result["historical"] = hist
+        except Exception as e:
+            print(f"[FundFeeder] Historical fetch failed: {e}")
         _log_job_finish(jid, rows_affected=result.get("fetched", 0), started_at=started)
         print(f"[FundFeeder] Monthly fundamentals: {result}")
     except Exception as e:

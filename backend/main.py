@@ -2102,12 +2102,14 @@ def _compute_portfolio_state(uid: str = None) -> dict:
                 "invested": 0, "realized_pnl": 0}
 
 
-def _get_sector_exposure() -> dict:
+def _get_sector_exposure(uid: str = None) -> dict:
     try:
         with db_conn() as conn:
+            uid_filter = " AND user_id = :uid" if uid else ""
+            params = {"uid": uid} if uid else {}
             open_syms = conn.execute(text(
-                "SELECT symbol FROM paper_trades WHERE status='open'"
-            )).fetchall()
+                f"SELECT symbol FROM paper_trades WHERE status='open'{uid_filter}"
+            ), params).fetchall()
     except Exception:
         return {}
     exposures = {}
@@ -12512,325 +12514,8 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
         f"{risks_block}"
     )
 
-def _scheduled_daily_ai_pipeline():
-    """Daily AI Analysis Pipeline (runs after 5AM broad scan is complete).
 
-    Layer 1 broad scan runs on full ASX universe (~1,600 shares) → confluence gate filters to ~50-100.
-    This pipeline deep-dives ALL Layer 1 candidates (TOPTIER_MAX_AI_DEEP_DIVES=0 = unlimited).
-    Set TOPTIIER_MAX_AI_DEEP_DIVES > 0 to impose a cap.
-
-    1. Reads cached wealth scan results from DB
-    2. Groups candidates by large/mid/small cap tier (sorted by wealth_rank)
-    3. Deep-dives all candidates with 6-persona agentic analysis
-    4. Builds consolidated Telegram report with AI verdicts
-    5. Broadcasts to all users with Telegram configured
-    """
-    if not run_agentic_analysis:
-        print("[DailyAI] Agentic brain not available — skipping.")
-        return
-
-    print("[DailyAI] Starting daily AI analysis pipeline...")
-    market = "AU"
-    today_key = datetime.utcnow().date().isoformat()
-
-    # 1. Read cached broad scan
-    try:
-        with db_conn() as conn:
-            row = conn.execute(text("""
-                SELECT picks FROM wealth_scan_cache
-                WHERE market = :market AND scan_mode = 'broad'
-                ORDER BY generated_at DESC LIMIT 1
-            """), {"market": market}).fetchone()
-        if not row or not row[0]:
-            print("[DailyAI] No cached broad scan available — skipping.")
-            return
-        candidates = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-    except Exception as e:
-        print(f"[DailyAI] Failed to read broad scan cache: {e}")
-        return
-
-    # 2. Group by cap tier
-    tiers: dict[str, list] = {"large_cap": [], "mid_cap": [], "small_cap": []}
-    for c in candidates:
-        mc = (c.get("valuation") or {}).get("market_cap")
-        tier = _cap_tier_from_market_cap(mc)
-        tiers[tier].append(c)
-
-    # 3. Select all Layer 1 candidates for AI deep-dive
-    #    Apply mechanical gate: P(>=5%) must be >= 55.0% to justify API credits
-    MAX_AI = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "0"))
-    selected = []
-    tier_order = ["large_cap", "mid_cap", "small_cap"]
-    for tier_name in tier_order:
-        # Filter out low probability trades before sorting
-        valid_candidates = [c for c in tiers.get(tier_name, []) if (c.get("prob_ge_5pct") or 0) >= 55.0]
-        pool = sorted(
-            valid_candidates,
-            key=lambda x: x.get("wealth_rank", 0), reverse=True
-        )
-        selected.extend(pool)
-    if MAX_AI > 0:
-        selected = selected[:MAX_AI]
-
-    print(f"[DailyAI] Selected {len(selected)} candidates ({sum(1 for s in selected if (s.get('confluence', {}).get('confidence', '') == 'high'))} high-confluence)")
-
-    # 4. Run Layer 2 deep-dive with rate-limit throttling
-    ai_results = []
-    for i, cand in enumerate(selected):
-        sym = cand["symbol"]
-        print(f"[DailyAI] Deep-dive {i+1}/{len(selected)}: {sym} ...")
-        try:
-            sd = get_stock_data(sym, market)
-            val = get_valuation_metrics(sym)
-            hist = get_historical_data(sym, period="1y")
-            if len(hist) < 60:
-                continue
-            tech = calculate_technical_indicators(hist)
-            tech_compact = {k: v for k, v in tech.items() if k in [
-                "rsi", "rsi_slope", "stoch_rsi", "macd", "macd_signal", "sma_200",
-                "ema_9", "ema_20", "ema_50", "volatility", "momentum_20", "adx",
-                "dmi_bullish", "atr_pct", "vwap_20", "above_vwap", "up_down_vol_ratio",
-                "block_volume_detected", "bb_pct_b", "cmf", "ttm_squeeze_on"
-            ]}
-            confluence = cand.get("confluence", {})
-
-            # ── Inject model tier context so AI personas can see it ──────────
-            val["model_tier"] = cand.get("_target_tier", "none")
-            val["model_score"] = cand.get("_model_score", 0)
-            val["model_tier_label"] = cand.get("_tier_label", "")
-
-            result = run_agentic_analysis(sym, market, tech_compact, val, confluence)
-            result["candidate"] = cand
-            ai_results.append(result)
-
-            # Gentle throttle — full-coverage deep-dives, 0.5s between calls
-            if i < len(selected) - 1:
-                time.sleep(0.5)
-
-        except Exception as e:
-            print(f"[DailyAI] Deep-dive failed for {sym}: {e}")
-            continue
-
-    print(f"[DailyAI] Completed {len(ai_results)} deep-dives. Approved: {sum(1 for r in ai_results if r.get('decision')=='APPROVE')}")
-
-    if not ai_results:
-        print("[DailyAI] No AI results — skipping broadcast.")
-        return
-
-    # 5. Build consolidated Telegram report
-    approved = [r for r in ai_results if r.get("decision") == "APPROVE"]
-    rejected = [r for r in ai_results if r.get("decision") == "REJECT"]
-
-    lines = [
-        f"<b>🤖 AI DAILY ANALYSIS — {today_key}</b>",
-        f"",
-        f"📊 Layer 1 screened {len(candidates)} ASX shares → Layer 2 AI analyzed top {len(selected)}",
-        f"",
-    ]
-
-    if approved:
-        lines.append(f"<b>✅ AI-APPROVED ({len(approved)})</b>")
-        for a in approved:
-            cand = a.get("candidate", {})
-            lines.append("")
-            lines.append(_format_ai_report_for_telegram(a, cand))
-
-    if rejected:
-        lines.append(f"\n<b>⛔ AI-REJECTED ({len(rejected)})</b>")
-        for a in rejected[:4]:  # cap at 4 rejected to avoid message bloat
-            cand = a.get("candidate", {})
-            lines.append("")
-            lines.append(_format_ai_report_for_telegram(a, cand))
-        if len(rejected) > 4:
-            lines.append(f"  ... and {len(rejected) - 4} more rejected by AI")
-
-    lines.append(f"\n<i>🖥️ Powered by DeepSeek V4 Flash · Layer 2 6-Persona Agentic AI</i>")
-
-    message_html = "\n".join(lines)
-
-    # 6. Broadcast to all users with Telegram
-    try:
-        with db_conn() as conn:
-            users = conn.execute(text("SELECT id FROM users")).fetchall()
-        for user in users:
-            uid = user[0]
-            recipients = get_user_telegram_recipients(uid)
-            if not recipients:
-                continue
-            digest_key = f"daily_ai_{today_key}"
-            if not has_digest_been_sent(uid, market, digest_key):
-                _send_telegram_payload(
-                    message_html, recipients, user_id=uid,
-                    message_type="daily_digest", market=market,
-                    digest_key=digest_key, source="daily_ai_pipeline",
-                    delivery_mode="auto",
-                )
-    except Exception as e:
-        print(f"[DailyAI] Broadcast failed: {e}")
-
-    # 7. Send per-stock Buy buttons for AI-APPROVED stocks (portfolio-aware sizing)
-    if approved:
-        num_approved = len(approved)
-        print(f"[DailyAI] {num_approved} approved. Processing per-user buy sizing...")
-
-        try:
-            with db_conn() as conn:
-                post_users = conn.execute(text("SELECT id FROM users")).fetchall()
-        except Exception:
-            post_users = []
-        for user in post_users:
-            uid = user[0]
-            recipients = get_user_telegram_recipients(uid)
-            if not recipients:
-                continue
-            for a in approved:
-                # Per-user portfolio state for correct position sizing
-                pf = _compute_portfolio_state(uid)
-                available_capital = pf["available_cash"]
-                if available_capital <= 0:
-                    print(f"[DailyAI] User {uid[:8]} has no available capital — skipping buys")
-                    continue
-
-                cand = a.get("candidate", {})
-                sym = a.get("symbol", "???")
-                tier = cand.get("_tier_label", "")
-                is_10pct = "10%" in tier
-                is_8pct = "8%" in tier
-                tier_pct = "+10%" if is_10pct else "+8%"
-                tier_emoji = "🚀" if is_10pct else "📈"
-                spot = "Top 3% of all ASX stocks" if is_10pct else "Top 10% of all ASX stocks"
-                digest_key = f"ai_buy_{sym}_{today_key}"
-                if has_digest_been_sent(uid, market, digest_key):
-                    continue
-                # Skip if user already has an open position in this stock
-                already_bought = False
-                try:
-                    with db_conn() as check_conn:
-                        existing = check_conn.execute(
-                            text("SELECT 1 FROM paper_trades WHERE symbol=:sym AND user_id=:uid AND status='open' LIMIT 1"),
-                            {"sym": sym, "uid": uid}
-                        ).fetchone()
-                        if existing:
-                            already_bought = True
-                            print(f"[DailyAI] Skipping {sym} for user {uid} — already have open position")
-                except Exception:
-                    pass
-                if already_bought:
-                    continue
-                price = float(cand.get("current_price", 1) or 1)
-                stop_pct = float(a.get("stop_loss_pct", 10) or 10)
-                adv = int(cand.get("avg_volume", 0) or 0)
-                sector = str((cand.get("valuation") or {}).get("sector",
-                           cand.get("sector", "Unknown")))
-
-                size = _calculate_position_size(
-                    price=price, stop_loss_pct=-abs(stop_pct),
-                    account_balance=available_capital, num_picks=num_approved,
-                    avg_volume=int(adv), current_sector_exposure=sector_exp,
-                    candidate_sector=sector,
-                )
-                qty = size["qty"]
-                cost = size["cost"]
-                risk = size["risk_amount"]
-                stop_p = size["stop_price"]
-
-                warn_note = ""
-                if size["warnings"]:
-                    warn_note = "\n⚠️ " + ", ".join(size["warnings"])
-
-                # ── Devil's Advocate ──────────────────────────────────
-                if _DEVILS_ADVOCATE_AVAILABLE and run_devils_advocate:
-                    try:
-                        thesis = a.get("reasoning", "")[:500]
-                        da_result = run_devils_advocate(sym, thesis, llm_call_fn=_llm_chat_safe)
-                        if da_result.get("size_reduction_pct", 0) > 0:
-                            reduction = da_result["size_reduction_pct"]
-                            qty = int(qty * (1 - reduction))
-                            cost = qty * price
-                            warn_note += f"\n🛡️ Devil's advocate: {da_result.get('key_risk','')}"
-                            warn_note += f"\n⚠️ Size reduced {reduction*100:.0f}% ({da_result.get('risk_score',5)}/10 risk)"
-                            print(f"[DailyAI] Devil's advocate reduced {sym} by {reduction*100:.0f}%: {da_result.get('key_risk','')}")
-                    except Exception as e:
-                        print(f"[DailyAI] Devil's advocate skipped for {sym}: {e}")
-
-                # ── Kill Switch ──────────────────────────────────────
-                if _KILL_SWITCH_AVAILABLE and compute_kill_state:
-                    try:
-                        with db_conn() as ks_conn:
-                            ks = get_latest_kill_state(ks_conn)
-                            if ks.get("halt_all"):
-                                warn_note += "\n🔴 KILL SWITCH ACTIVE — auto-execute blocked"
-                                print(f"[DailyAI] KILL SWITCH blocked auto-execute for {sym}")
-                                auto_trade_id = None
-                    except Exception:
-                        pass
-
-                # ── Bootstrapping auto-execute: create paper trade automatically ──
-                auto_trade_id = None
-                if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
-                    gate = _wfo_position_gate()
-                    if gate["allowed"]:
-                        auto_trade_id = _auto_create_paper_trade(
-                            uid, sym, market, qty, price,
-                            source_reason="wealth_builder_bootstrap",
-                            notes="AI auto-executed bootstrap paper trade"
-                        )
-                        if auto_trade_id:
-                            print(f"[DailyAI] Auto-executed bootstrap paper trade: {sym} x{qty} @ ${price:.2f} (id={auto_trade_id})")
-                            warn_note += "\n🤖 AUTO-EXECUTED (bootstrap mode)"
-                        else:
-                            print(f"[DailyAI] Auto-execute failed for {sym}")
-                    else:
-                        warn_note += f"\n⛔ Bootstrap gate: {gate['reason']}"
-
-                buy_msg = (
-                    f"<b>✅ AI-APPROVED — {tier}</b>\n"
-                    f"{sym} — {cand.get('name', sym)}\n\n"
-                    f"{tier_emoji} <b>Target: {tier_pct} (2:1 R:R)</b>\n"
-                    f"💰 Price: ${price:.2f} | Stop: ${stop_p:.2f} (-{abs(stop_pct):.1f}%)\n"
-                    f"📊 {qty} shares = ${cost:.0f} ({size['pct_of_account']}% of portfolio)\n"
-                    f"🎯 Risk: ${risk:.0f} ({PORTFOLIO_RISK_PER_TRADE_PCT}% of capital per trade)\n"
-                    f"💼 Portfolio: ${available_capital:.0f} available | {num_approved} picks today{warn_note}\n\n"
-                    f"<i>AI: {a.get('reasoning','')[:120]}...</i>"
-                )
-                kb = {"inline_keyboard": [[
-                    {"text": f"🚀 Buy {qty} shares (~${cost:.0f})",
-                     "callback_data": f"buy_{sym}_{qty}"}
-                ]]}
-                _send_telegram_payload(
-                    buy_msg, recipients, user_id=uid, message_type="daily_digest",
-                    market=market, digest_key=digest_key, source="ai_approved_buy",
-                    reply_markup=kb
-                )
-                time.sleep(0.3)
-
-    try:
-        with db_conn() as conn:
-            approved_count = sum(1 for r in ai_results if r.get("approved", False))
-            conn.execute(text("""
-                INSERT INTO daily_ai_runs (run_date, total_candidates, ai_approved, ai_rejected, approval_rate_pct)
-                VALUES (:rd, :tc, :aa, :ar, :apr)
-                ON CONFLICT (run_date) DO UPDATE SET
-                total_candidates = EXCLUDED.total_candidates,
-                ai_approved = EXCLUDED.ai_approved,
-                ai_rejected = EXCLUDED.ai_rejected,
-                approval_rate_pct = EXCLUDED.approval_rate_pct,
-                completed_at = NOW()
-            """), {
-                "rd": datetime.utcnow().date(),
-                "tc": len(selected),
-                "aa": approved_count,
-                "ar": len(selected) - approved_count,
-                "apr": round(approved_count / len(selected) * 100, 2) if selected else 0,
-            })
-            conn.commit()
-    except Exception as e:
-        print(f"[DailyAI] Tracking insert failed: {e}")
-
-    print(f"[DailyAI] Daily AI pipeline complete. {len(ai_results)} analyses, Approved: {sum(1 for r in ai_results if r.get('approved', False))}, broadcast to Telegram.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
+# V2 Daily Scan — single unified AI pipeline
 def _scheduled_v2_daily_scan():
     """V2 Daily Scan (replaces broad_scan and daily_ai_pipeline).
     
@@ -12921,7 +12606,7 @@ def _scheduled_v2_daily_scan():
         print("[V2DailyScan] No AI results — skipping broadcast.")
         return
 
-    # Build broadcast logic (similar to old pipeline)
+    # Build Telegram broadcast per approved stock
     approved = [r for r in ai_results if r.get("decision") == "APPROVE"]
     rejected = [r for r in ai_results if r.get("decision") == "REJECT"]
 
@@ -12968,13 +12653,10 @@ def _scheduled_v2_daily_scan():
     except Exception as e:
         print(f"[V2DailyScan] Broadcast failed: {e}")
 
-    # Process buys
+    # Process buys — per-user portfolio sizing
     if approved:
-        pf = _compute_portfolio_state()
-        sector_exp = _get_sector_exposure()
         num_approved = len(approved)
-        available_capital = pf["available_cash"]
-        print(f"[V2DailyScan] Portfolio: ${available_capital:.0f} available, {num_approved} approved. Processing buys...")
+        print(f"[V2DailyScan] {num_approved} approved. Processing per-user paper trades...")
 
         try:
             with db_conn() as conn:
@@ -12990,6 +12672,7 @@ def _scheduled_v2_daily_scan():
                 # Per-user portfolio state for correct position sizing
                 pf = _compute_portfolio_state(uid)
                 available_capital = pf["available_cash"]
+                sector_exp = _get_sector_exposure(uid)
                 if available_capital <= 0:
                     print(f"[DailyAI] User {uid[:8]} has no available capital — skipping buys")
                     continue

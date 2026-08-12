@@ -150,7 +150,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             rows = conn.execute(text(
                 f"SELECT symbol, entry_price, features, CAST({target_col} AS INTEGER) FROM model_training_set "
                 "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
-                "ORDER BY signal_date ASC LIMIT 100000"
+                "ORDER BY signal_date ASC LIMIT 200000"
             )).fetchall()
     except Exception as e:
         print(f"[Classifier] DB read failed: {e}", flush=True)

@@ -11109,7 +11109,7 @@ def _scheduled_broad_scan_precompute():
     candidates = []
 
     scan_start = datetime.utcnow()
-    print(f"[BroadScan] Universe: {len(full_universe)} tickers (EODHD={'yes' if EODHD_API_KEY else 'no'}) — scanning {len(symbol_pool)} this run at {scan_start.isoformat()}")
+    print(f"[BroadScan] Universe: {len(symbol_pool)} liquid tickers (EODHD storage={'yes' if EODHD_API_KEY else 'no'}) — scanning at {scan_start.isoformat()}")
 
     new_dead = set()
     scan_workers = 5  # concurrency: 100K EODHD calls/day, ~500 tickers = ~100 calls/worker
@@ -15383,7 +15383,7 @@ if SCHEDULER_AVAILABLE:
             try:
                 with db_conn() as _conn:
                     _row = _conn.execute(text(
-                        "SELECT MAX(updated_at) FROM eod_ohl_history"
+                        "SELECT MAX(trade_date) FROM eod_ohl_history"
                     )).fetchone()
                 inc_stale = True
                 if _row and _row[0]:
@@ -15612,8 +15612,11 @@ if SCHEDULER_AVAILABLE:
         _catchup_thread.start()
         print("[StartupCatchup] Background catchup thread launched.", flush=True)
 
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        print(f"[SCHEDULER] CRITICAL: Scheduler initialization failed: {e}", flush=True, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        SCHEDULER_AVAILABLE = False
 
 
 if __name__ == "__main__":

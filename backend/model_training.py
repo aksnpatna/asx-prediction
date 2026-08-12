@@ -960,11 +960,18 @@ def get_latest_weights() -> dict:
     from main import db_conn
     try:
         with db_conn() as conn:
+            # Prefer logistic classifier weights (newest), fallback to any
             rows = conn.execute(text(
                 "SELECT feature_name, weight FROM model_weights_by_date "
-                "WHERE trained_at=(SELECT MAX(trained_at) FROM model_weights_by_date) "
+                "WHERE model_type='logistic' "
+                "AND trained_at=(SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='logistic') "
                 "ORDER BY ABS(weight) DESC")).fetchall()
-        return {r[0]: r[1] for r in rows} if rows else {}
+            if not rows:
+                rows = conn.execute(text(
+                    "SELECT feature_name, weight FROM model_weights_by_date "
+                    "WHERE trained_at=(SELECT MAX(trained_at) FROM model_weights_by_date) "
+                    "ORDER BY ABS(weight) DESC")).fetchall()
+            return {r[0]: r[1] for r in rows} if rows else {}
     except Exception:
         return {}
 
@@ -974,12 +981,20 @@ def daily_training_pipeline() -> dict:
     t0 = time.time()
     matrix = build_training_matrix(incremental=True)
     results = {}
-    for target, label in [("hit_8pct_before_m8pct", "8% before -8%"),
-                           ("hit_8pct_63d", "8% peak (legacy)"),
-                           ("hit_3pct_14d", "14d hit (3%)"),
-                           ("hit_3pct_30d", "30d hit (3%)")]:
-        print(f"[TrainPipeline] Fitting {label}...")
-        results[label] = fit_model_weights(target_col=target)
+    # Primary classifier: LogisticRegression with decile-based evaluation
+    try:
+        from smsf_classifier import train_classifier
+        print("[TrainPipeline] Fitting LogisticRegression classifier...")
+        results["classifier"] = train_classifier(target_col="hit_8pct_before_m8pct")
+    except Exception as e:
+        print(f"[TrainPipeline] Classifier failed: {e}")
+        results["classifier"] = None
+    # Fallback: regression ensemble for continuity
+    try:
+        results["ensemble"] = fit_model_weights(target_col="hit_8pct_before_m8pct")
+    except Exception as e:
+        print(f"[TrainPipeline] Ensemble failed: {e}")
+        results["ensemble"] = None
     elapsed = round(time.time() - t0, 1)
     print(f"[TrainPipeline] Done in {elapsed}s.")
     return {"matrix": matrix, "models": results, "elapsed_s": elapsed}

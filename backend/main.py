@@ -14029,16 +14029,18 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
         # ── Model quality gate — block trades if model is random noise ──────
         try:
             with db_conn() as conn:
-                latest_r2 = conn.execute(text(
+                latest_auc = conn.execute(text(
                     "SELECT in_sample_hit_rate FROM model_weights_by_date "
-                    "WHERE model_type='ridge' AND feature_name='rsi' "
+                    "WHERE model_type='logistic' AND feature_name='rsi' "
                     "ORDER BY trained_at DESC LIMIT 1"
                 )).fetchone()
-                if latest_r2 and latest_r2[0] is not None and latest_r2[0] < 0.05:
-                    print(f"[AutoCreate] BLOCKED: Model R²={latest_r2[0]:.3f} < 0.05 threshold — no signal quality")
+                if latest_auc and latest_auc[0] is not None and latest_auc[0] < 0.52:
+                    print(f"[AutoCreate] BLOCKED: Model AUC={latest_auc[0]:.3f} < 0.52 threshold — no signal quality")
                     return None
+                elif latest_auc and latest_auc[0] is not None:
+                    print(f"[AutoCreate] Model quality OK: AUC={latest_auc[0]:.3f}")
         except Exception as e:
-            # Non-blocking — if we can't check R², allow trade but log warning
+            # Non-blocking — if we can't check AUC, allow trade but log warning
             print(f"[AutoCreate] Model quality check failed (allowing trade): {e}")
 
         # ── Duplicate position guard ──────────────────────────────────────
@@ -14690,17 +14692,18 @@ def _scheduled_pipeline_health_report():
 
             # 3. Model training
             r = c.execute(text(
-                "SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='ridge'"
+                "SELECT MAX(trained_at), ROUND(MAX(in_sample_hit_rate)::numeric,3) FROM model_weights_by_date WHERE model_type='logistic'"
             )).fetchone()
-            train_ts = r[0] if r else None
+            train_ts, model_auc = (r[0], r[1]) if r else (None, None)
             if train_ts:
                 train_date = train_ts.date() if hasattr(train_ts, 'date') else train_ts
                 train_age_d = (today - train_date).days
                 if train_age_d <= 1:
                     wc = c.execute(text(
-                        "SELECT COUNT(*) FROM model_weights_by_date WHERE trained_at = (SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='ridge') AND model_type='ridge' AND weight IS NOT NULL AND weight != 0"
+                        "SELECT COUNT(*) FROM model_weights_by_date WHERE trained_at = (SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='logistic') AND model_type='logistic' AND weight IS NOT NULL AND weight != 0"
                     )).fetchone()
-                    _ok("Model", f"{wc[0]} active features")
+                    auc_str = f", AUC={model_auc}" if model_auc is not None else ""
+                    _ok("Model", f"{wc[0]} features{auc_str}")
                 elif train_age_d <= 2:
                     _warn("Model", f"{train_age_d}d since last")
                 else:

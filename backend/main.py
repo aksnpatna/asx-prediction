@@ -2077,13 +2077,15 @@ def _compute_portfolio_state(uid: str = None) -> dict:
     start_cap = get_starting_capital(uid)
     try:
         with db_conn() as conn:
+            uid_filter = " AND user_id = :uid" if uid else ""
+            params = {"uid": uid} if uid else {}
             closed_pnl = conn.execute(text(
-                "SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) FROM paper_trades WHERE status='closed'"
-            )).fetchone()
+                f"SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) FROM paper_trades WHERE status='closed'{uid_filter}"
+            ), params).fetchone()
             open_rows = conn.execute(text(
-                "SELECT symbol, COALESCE(entry_price,0)*COALESCE(quantity,0) AS cost "
-                "FROM paper_trades WHERE status='open'"
-            )).fetchall()
+                f"SELECT symbol, COALESCE(entry_price,0)*COALESCE(quantity,0) AS cost "
+                f"FROM paper_trades WHERE status='open'{uid_filter}"
+            ), params).fetchall()
         total_pnl = float(closed_pnl[0] or 0)
         invested = sum(float(r[1] or 0) for r in open_rows)
         equity = start_cap + total_pnl
@@ -11092,9 +11094,9 @@ def _scheduled_broad_scan_precompute():
     symbol_pool = list(set(core_syms + broad_syms))
     print(f"[BroadScan] Universe: {len(symbol_pool)} liquid symbols (core={len(core_syms)}, broad={len(broad_syms)})")
     # Apply broad_scan_cap if set
+    # Apply broad_scan_cap — use deterministic sort (by symbol) for reproducible results
     if broad_scan_cap > 0 and broad_scan_cap < len(symbol_pool):
-        import random
-        random.shuffle(symbol_pool)
+        symbol_pool.sort()  # deterministic: alphabetical order, same results every run
         symbol_pool = symbol_pool[:broad_scan_cap]
         print(f"[BroadScan] Capped to {broad_scan_cap} symbols")
 
@@ -12668,11 +12670,8 @@ def _scheduled_daily_ai_pipeline():
 
     # 7. Send per-stock Buy buttons for AI-APPROVED stocks (portfolio-aware sizing)
     if approved:
-        pf = _compute_portfolio_state()
-        sector_exp = _get_sector_exposure()
         num_approved = len(approved)
-        available_capital = pf["available_cash"]
-        print(f"[DailyAI] Portfolio: ${available_capital:.0f} available, {num_approved} approved. Sending Buy alerts...")
+        print(f"[DailyAI] {num_approved} approved. Processing per-user buy sizing...")
 
         try:
             with db_conn() as conn:
@@ -12685,6 +12684,13 @@ def _scheduled_daily_ai_pipeline():
             if not recipients:
                 continue
             for a in approved:
+                # Per-user portfolio state for correct position sizing
+                pf = _compute_portfolio_state(uid)
+                available_capital = pf["available_cash"]
+                if available_capital <= 0:
+                    print(f"[DailyAI] User {uid[:8]} has no available capital — skipping buys")
+                    continue
+
                 cand = a.get("candidate", {})
                 sym = a.get("symbol", "???")
                 tier = cand.get("_tier_label", "")
@@ -12981,6 +12987,13 @@ def _scheduled_v2_daily_scan():
             if not recipients:
                 continue
             for a in approved:
+                # Per-user portfolio state for correct position sizing
+                pf = _compute_portfolio_state(uid)
+                available_capital = pf["available_cash"]
+                if available_capital <= 0:
+                    print(f"[DailyAI] User {uid[:8]} has no available capital — skipping buys")
+                    continue
+
                 cand = a.get("candidate", {})
                 sym = a.get("symbol", "???")
                 tier = cand.get("_tier_label", "")

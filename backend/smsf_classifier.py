@@ -5,7 +5,7 @@ Fills fundamental features in-memory from the latest snapshot per symbol
 (avoids the 3.3M-row SQL UPDATE timeout). Trains on path-aware labels.
 """
 
-import json, time, numpy as np
+import os, json, time, numpy as np
 from datetime import date
 from typing import Dict, List, Optional
 
@@ -106,6 +106,38 @@ def _load_latest_fundamentals(db_conn) -> Dict[str, dict]:
     return result
 
 
+EODHD_FEATURE_KEYS = [
+    "eps_surprise", "eps_estimate_revision", "analyst_count",
+    "pct_insiders", "pct_institutions", "insider_net_ratio",
+    "esg_governance", "esg_controversy", "payout_ratio",
+]
+
+
+def _load_eodhd_features() -> Dict[str, dict]:
+    """Load EODHD features from data/eodhd_features.json (or DB)."""
+    result = {}
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "eodhd_features.json")
+        if not os.path.exists(path):
+            path = "/app/data/eodhd_features.json"
+        if os.path.exists(path):
+            with open(path) as f:
+                result = json.load(f)
+    except Exception as e:
+        print(f"[EODHD] Load failed: {e}", flush=True)
+    return result
+
+
+def _fill_eodhd(feats: dict, symbol: str, eodhd_map: Dict[str, dict]) -> dict:
+    """Fill EODHD features (EPS, ownership, ESG, insider) from the feature map."""
+    f = eodhd_map.get(symbol)
+    if not f:
+        return feats
+    for key in EODHD_FEATURE_KEYS:
+        feats.setdefault(key, float(f.get(key, 0) or 0))
+    return feats
+
+
 def _fill_fundamentals(feats: dict, symbol: str, fund_map: Dict[str, dict],
                        entry_price: float) -> dict:
     """Fill zero fundamental features from the latest snapshot for the symbol."""
@@ -163,7 +195,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     # Load latest fundamentals per symbol (in-memory, fast)
     fund_map = _load_latest_fundamentals(db_conn)
     hist_map = _load_historical_fundamentals(db_conn)
-    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical symbol fundamentals", flush=True)
+    eodhd_map = _load_eodhd_features()
+    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD symbol features", flush=True)
 
     # Parse features + fill fundamentals
     X_list, y_list = [], []
@@ -175,6 +208,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
             feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
             feats = _fill_historical(feats, symbol, hist_map)
+            feats = _fill_eodhd(feats, symbol, eodhd_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 skipped += 1; continue

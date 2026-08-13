@@ -43,6 +43,10 @@ FEATURE_COLS = [
     # Historical fundamental ratios (yfinance income/balance/cashflow, 4yr)
     "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
     "fund_hist_op_margin", "fund_hist_fcf_yield",
+    # EODHD fundamentals features (paid $59.99 feed — EPS, ownership, ESG, insider)
+    "eps_surprise", "eps_estimate_revision", "analyst_count",
+    "pct_insiders", "pct_institutions", "insider_net_ratio",
+    "esg_governance", "esg_controversy", "payout_ratio",
     # Market regime features
     "regime_sma_alignment", "vwap_position", "gap_detection",
     # Volatility structure features

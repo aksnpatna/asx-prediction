@@ -141,6 +141,12 @@
   - Top decile: 41.5% → **42.2%** (+0.7pp)
   - Spread: 29.3pp → **30.4pp** (+1.1pp)
   - AUC: 0.6409 → 0.6406 (noise)
-  - Isolated sweep showed up to +4.4pp top decile at w=0.5 (46.3% vs 41.9%)
   - Regression head adds magnitude info (30% run vs 6% run) the binary label discards
-- **Commit:** pending
+- **Commit:** d25097d
+
+### [2026-08-14] Fix 12: Memory optimization 6GB → 4GB (streaming + float32)
+- **What:** Streaming DB cursor (yield_per 20K batches) + preallocated float32 arrays + int8 labels
+- **Why:** fetchall held 300K JSON rows (~2GB Python object spike) → OOM in 4GB container
+- **Result:** 300K training OOM at 4GB → **302MiB peak** (14x headroom); results identical (top decile 42.4%, AUC 0.6408)
+- **Container:** 8GB → 4GB limit
+- **Commit:** d7d0459

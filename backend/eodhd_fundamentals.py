@@ -187,6 +187,90 @@ def fetch_fundamentals(symbols: list) -> int:
     return fetched
 
 
+def fetch_eps_history(symbols: list) -> int:
+    """Fetch point-in-time EPS history (Earnings.History) for symbols.
+
+    Stores per-year EPS in fundamental_history.eps (already a column).
+    """
+    from sqlalchemy import text
+    from main import db_conn
+
+    key = _api_key()
+    fetched = 0
+    errors = 0
+    for i, sym in enumerate(symbols):
+        try:
+            r = requests.get(
+                f"{EODHD_BASE}/fundamentals/{sym}.AU",
+                params={"api_token": key, "fmt": "json"},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                errors += 1
+                continue
+            data = r.json()
+            earnings = data.get("Earnings", {}).get("History", {})
+            if not isinstance(earnings, dict):
+                errors += 1
+                continue
+
+            with db_conn() as conn:
+                for date_str, eps in earnings.items():
+                    try:
+                        yr = int(str(date_str)[:4])
+                        eps_val = float(eps.get("epsActual") or eps.get("eps") or 0)
+                        if eps_val:
+                            conn.execute(text(
+                                "UPDATE fundamental_history SET eps=:eps WHERE symbol=:sym AND fiscal_year=:yr"
+                            ), {"eps": eps_val, "sym": sym, "yr": yr})
+                    except Exception:
+                        pass
+                conn.commit()
+            fetched += 1
+        except Exception:
+            errors += 1
+        if (i + 1) % 50 == 0:
+            print(f"[EODHD-EPS] EPS history {i+1}/{len(symbols)} ({fetched} ok, {errors} errors)")
+        time.sleep(0.15)
+    print(f"[EODHD-EPS] EPS history done: {fetched} ok, {errors} errors.")
+    return fetched
+
+
+def fetch_insider_all(symbols: list) -> int:
+    """Fetch insider transactions for symbols, store as point-in-time snapshots."""
+    from sqlalchemy import text
+    from main import db_conn
+    from insider_features import fetch_insider_transactions, compute_insider_features
+
+    fetched = 0
+    errors = 0
+    for i, sym in enumerate(symbols):
+        try:
+            txns = fetch_insider_transactions(sym)
+            feats = compute_insider_features(txns)
+            with db_conn() as conn:
+                conn.execute(text(
+                    "INSERT INTO insider_snapshots (symbol, snapshot_date, net_ratio, buy_count, sell_count, net_value) "
+                    "VALUES (:sym, :d, :nr, :bc, :sc, :nv) "
+                    "ON CONFLICT (symbol, snapshot_date) DO UPDATE SET "
+                    "net_ratio=EXCLUDED.net_ratio, buy_count=EXCLUDED.buy_count, "
+                    "sell_count=EXCLUDED.sell_count, net_value=EXCLUDED.net_value"
+                ), {
+                    "sym": sym, "d": date.today(),
+                    "nr": feats["insider_net_ratio"], "bc": feats["insider_buy_count"],
+                    "sc": feats["insider_sell_count"], "nv": feats["insider_net_value"],
+                })
+                conn.commit()
+            fetched += 1
+        except Exception:
+            errors += 1
+        if (i + 1) % 50 == 0:
+            print(f"[EODHD-Insider] {i+1}/{len(symbols)} ({fetched} ok, {errors} errors)")
+        time.sleep(0.15)
+    print(f"[EODHD-Insider] Insider done: {fetched} ok, {errors} errors.")
+    return fetched
+
+
 def run_g1_delisted_backfill() -> dict:
     """Full G1 survivorship-bias fix: delisted tickers + OHLC backfill."""
     symbols = fetch_delisted_symbols()
@@ -207,14 +291,21 @@ def run_g1_delisted_backfill() -> dict:
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["delisted", "fundamentals", "all"], default="all")
+    ap.add_argument("--mode", choices=["delisted", "fundamentals", "eps", "insider", "all"], default="all")
     ap.add_argument("--symbols", nargs="*", default=None, help="specific symbols for fundamentals")
     args = ap.parse_args()
+
+    from config.universe import get_universe_symbols
+    syms = args.symbols or (get_universe_symbols("core") + get_universe_symbols("broad"))
 
     if args.mode in ("delisted", "all"):
         print(json.dumps(run_g1_delisted_backfill(), indent=2, default=str))
 
     if args.mode in ("fundamentals", "all"):
-        from config.universe import get_universe_symbols
-        syms = args.symbols or (get_universe_symbols("core") + get_universe_symbols("broad"))
         fetch_fundamentals(syms)
+
+    if args.mode in ("eps", "all"):
+        fetch_eps_history(syms)
+
+    if args.mode in ("insider", "all"):
+        fetch_insider_all(syms)

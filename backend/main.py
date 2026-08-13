@@ -8922,6 +8922,20 @@ def init_phase6_tables():
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
+            # Insider transaction snapshots (EODHD Fundamentals feed)
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS insider_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    snapshot_date DATE NOT NULL,
+                    net_ratio NUMERIC(8, 4),
+                    buy_count INTEGER,
+                    sell_count INTEGER,
+                    net_value NUMERIC(16, 2),
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (symbol, snapshot_date)
+                )
+            """))
         except Exception:
             pass
 

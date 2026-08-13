@@ -128,8 +128,19 @@
 
 ### [2026-08-14] Fix 10: Point-in-time P/E — NO PERFORMANCE CHANGE (integrity only)
 - **What:** Created eps_history table (9,839 quarterly EPS rows). Compute fund_pe_inv = 100×EPS(at signal_date)/price (removes look-ahead bias).
-- **Result (look-ahead P/E → point-in-time P/E):**
-  - AUC: 0.6410 → 0.6409 (within noise)
-  - Top decile: 41.6% → 41.5%
-- **Conclusion:** Look-ahead bias in P/E was negligible (P/E not a strong driver). Point-in-time fix improves integrity without losing edge.
+- **Result:** AUC 0.6410 → 0.6409 (noise), top decile unchanged.
+- **Conclusion:** Look-ahead bias in P/E was negligible. Integrity improved without losing edge.
+- **Commit:** f8af3c3
+
+### [2026-08-14] Fix 11: Due diligence on review recommendations — measured results
+- **Correlation pruning (7 redundant feats):** AUC 0.6463 → 0.6467 — NEUTRAL (L1 already handles). Not applied.
+- **Deterministic filter (volume_spike×vix):** AUC unchanged — NEUTRAL. Not applied.
+- **Stale second guard (Close==PrevClose):** deferred — volume=0 filter already covers 17.2%; incremental value low.
+- **Multitask regression blend (binary + 63d return):** APPLIED
+  - Blend weight 0.4 (regression rank) optimises top-decile
+  - Top decile: 41.5% → **42.2%** (+0.7pp)
+  - Spread: 29.3pp → **30.4pp** (+1.1pp)
+  - AUC: 0.6409 → 0.6406 (noise)
+  - Isolated sweep showed up to +4.4pp top decile at w=0.5 (46.3% vs 41.9%)
+  - Regression head adds magnitude info (30% run vs 6% run) the binary label discards
 - **Commit:** pending

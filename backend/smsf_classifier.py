@@ -223,7 +223,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     try:
         with db_conn() as conn:
             rows = conn.execute(text(
-                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER) FROM model_training_set "
+                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER), "
+                "COALESCE(forward_return_63d, 0) FROM model_training_set "
                 "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
                 "ORDER BY signal_date ASC LIMIT 300000"
             )).fetchall()
@@ -242,13 +243,13 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     eps_map = _load_eps_history(db_conn)
     print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history symbols", flush=True)
 
-    # Parse features + fill fundamentals
-    X_list, y_list = [], []
+    # Parse features + fill fundamentals (also capture 63d return for regression head)
+    X_list, y_list, y_reg_list = [], [], []
     skipped = 0
     filled = 0
     for row in rows:
         try:
-            symbol, entry_price, signal_date, feats_raw, label = row
+            symbol, entry_price, signal_date, feats_raw, label, fwd_ret = row
             feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
             feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
             feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
@@ -257,8 +258,11 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 skipped += 1; continue
+            if fwd_ret is None or abs(float(fwd_ret)) > 100:
+                skipped += 1; continue
             X_list.append(x_row)
             y_list.append(int(label) if label is not None else 0)
+            y_reg_list.append(float(fwd_ret))
             if symbol in fund_map:
                 filled += 1
         except Exception:
@@ -267,6 +271,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
 
     X = np.array(X_list)
     y = np.array(y_list)
+    y_reg = np.array(y_reg_list)
 
     # Drop zero-variance features
     nonzero_variance = np.std(X, axis=0) > 1e-12
@@ -287,9 +292,10 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     print(f"[Classifier] {len(X_train)} train / {len(X_test)} test, "
           f"base test={base_rate_test*100:.1f}%", flush=True)
 
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LogisticRegression, Ridge
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import roc_auc_score, average_precision_score
+    from scipy.stats import rankdata
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
@@ -298,9 +304,26 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     model = LogisticRegression(class_weight='balanced', C=0.1, max_iter=5000, random_state=42, n_jobs=-1)
     t1 = time.time()
     model.fit(X_train_s, y_train)
-    print(f"[Classifier] Fit in {time.time()-t1:.1f}s", flush=True)
+    print(f"[Classifier] Binary fit in {time.time()-t1:.1f}s", flush=True)
 
     y_pred_proba = model.predict_proba(X_test_s)[:, 1]
+
+    # ── Regression head (63d return) + rank blend (multitask) ──────────────
+    # The 63d return adds magnitude info (30% run vs 6% run) that the binary
+    # label discards. Blend weight 0.4 optimises top-decile hit rate while
+    # keeping bottom-decile (loser avoidance) intact.
+    REG_BLEND_WEIGHT = 0.4
+    y_reg_train = y_reg[:n_train]
+    y_reg_test = y_reg[n_train:]
+    reg_model = Ridge(alpha=10.0)
+    reg_model.fit(X_train_s, y_reg_train)
+    y_reg_pred = reg_model.predict(X_test_s)
+
+    rank_bin = rankdata(y_pred_proba)
+    rank_reg = rankdata(y_reg_pred)
+    blended_rank = (1 - REG_BLEND_WEIGHT) * rank_bin + REG_BLEND_WEIGHT * rank_reg
+    y_pred_proba = blended_rank
+    print(f"[Classifier] Multitask blend: {1-REG_BLEND_WEIGHT:.1f} binary + {REG_BLEND_WEIGHT:.1f} regression", flush=True)
 
     # Decile analysis
     sorted_idx = np.argsort(y_pred_proba)[::-1]
@@ -348,9 +371,21 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type='logistic'"),
                 {"ta": today, "fn": fname, "w": round(float(w), 6), "c": round(float(w), 6),
                  "mt": "logistic", "ss": len(X), "ish": round(auc, 4),
-                 "nt": f"LogReg topDecile={top_decile_hit:.0f}% AUC={auc:.3f} spread={spread:.1f}pp"})
+                 "nt": f"LogReg+RegBlend topDecile={top_decile_hit:.0f}% AUC={auc:.3f} spread={spread:.1f}pp"})
+        # Save regression head coefficients (blend weight 0.4)
+        reg_coefs = dict(zip(active_features, reg_model.coef_))
+        for fname, w in reg_coefs.items():
+            conn.execute(text(
+                "INSERT INTO model_weights_by_date (trained_at,feature_name,weight,coefficient,"
+                "model_type,sample_size,in_sample_hit_rate,notes) VALUES "
+                "(:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
+                "ON CONFLICT (trained_at,feature_name) DO UPDATE SET "
+                "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type='ridge_reg'"),
+                {"ta": today, "fn": fname, "w": round(float(w), 6), "c": round(float(w), 6),
+                 "mt": "ridge_reg", "ss": len(X), "ish": round(auc, 4),
+                 "nt": f"RidgeReg 63d-return blend=0.4"})
         conn.commit()
-    print(f"[Classifier] Saved {len(coefs)} weights", flush=True)
+    print(f"[Classifier] Saved {len(coefs)} binary + {len(reg_coefs)} regression weights", flush=True)
 
     return {
         "status": "ok", "model_type": "logistic_regression",

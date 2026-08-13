@@ -220,58 +220,83 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     print(f"[Classifier] Loading {target_col} data with fundamentals...", flush=True)
     t0 = time.time()
 
-    try:
-        with db_conn() as conn:
-            rows = conn.execute(text(
-                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER), "
-                "COALESCE(forward_return_63d, 0) FROM model_training_set "
-                "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
-                "ORDER BY signal_date ASC LIMIT 300000"
-            )).fetchall()
-    except Exception as e:
-        print(f"[Classifier] DB read failed: {e}", flush=True)
-        return None
-
-    if len(rows) < min_samples:
-        print(f"[Classifier] {len(rows)} < {min_samples} — insufficient", flush=True)
-        return None
-
-    # Load latest fundamentals per symbol (in-memory, fast)
+    # Load auxiliary maps first (small, in-memory)
     fund_map = _load_latest_fundamentals(db_conn)
     hist_map = _load_historical_fundamentals(db_conn)
     eodhd_map = _load_eodhd_features()
     eps_map = _load_eps_history(db_conn)
     print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history symbols", flush=True)
 
-    # Parse features + fill fundamentals (also capture 63d return for regression head)
-    X_list, y_list, y_reg_list = [], [], []
-    skipped = 0
-    filled = 0
-    for row in rows:
-        try:
-            symbol, entry_price, signal_date, feats_raw, label, fwd_ret = row
-            feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
-            feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
-            feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
-            feats = _fill_historical(feats, symbol, hist_map)
-            feats = _fill_eodhd(feats, symbol, eodhd_map)
-            x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
-            if any(np.isnan(v) or np.isinf(v) for v in x_row):
-                skipped += 1; continue
-            if fwd_ret is None or abs(float(fwd_ret)) > 100:
-                skipped += 1; continue
-            X_list.append(x_row)
-            y_list.append(int(label) if label is not None else 0)
-            y_reg_list.append(float(fwd_ret))
-            if symbol in fund_map:
-                filled += 1
-        except Exception:
-            skipped += 1
-    print(f"[Classifier] Parsed {len(X_list)} rows (fund-filled={filled}, skipped={skipped})", flush=True)
+    # Stream training rows in batches (server-side cursor) — avoids the ~2GB
+    # fetchall spike that OOMs a 4GB container. Preallocated float32 array.
+    MAX_ROWS = 300000
+    n_rows = MAX_ROWS
+    X = np.zeros((n_rows, len(FEATURE_COLS)), dtype=np.float32)
+    y = np.zeros(n_rows, dtype=np.int8)
+    y_reg = np.zeros(n_rows, dtype=np.float32)
+    valid = np.ones(n_rows, dtype=bool)
 
-    X = np.array(X_list)
-    y = np.array(y_list)
-    y_reg = np.array(y_reg_list)
+    try:
+        with db_conn() as conn:
+            result = conn.execution_options(stream_results=True, max_row_buffer=20000).execute(text(
+                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER), "
+                "COALESCE(forward_return_63d, 0) FROM model_training_set "
+                "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
+                "ORDER BY signal_date ASC LIMIT 300000"
+            ))
+            skipped = 0
+            filled = 0
+            i = 0
+            for row in result.yield_per(20000):
+                if i >= n_rows:
+                    break
+                try:
+                    symbol, entry_price, signal_date, feats_raw, label, fwd_ret = row
+                    feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
+                    feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
+                    feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
+                    feats = _fill_historical(feats, symbol, hist_map)
+                    feats = _fill_eodhd(feats, symbol, eodhd_map)
+                    bad = False
+                    for j, c in enumerate(FEATURE_COLS):
+                        v = feats.get(c, 0)
+                        if v != v or v == float('inf') or v == float('-inf'):
+                            bad = True
+                            break
+                        X[i, j] = v
+                    if bad:
+                        valid[i] = False
+                        skipped += 1
+                        i += 1
+                        continue
+                    if fwd_ret is None or abs(float(fwd_ret)) > 100:
+                        valid[i] = False
+                        skipped += 1
+                        i += 1
+                        continue
+                    y[i] = int(label) if label is not None else 0
+                    y_reg[i] = fwd_ret
+                    if symbol in fund_map:
+                        filled += 1
+                    i += 1
+                except Exception:
+                    valid[i] = False
+                    skipped += 1
+                    i += 1
+            n_rows = i
+    except Exception as e:
+        print(f"[Classifier] DB read failed: {e}", flush=True)
+        return None
+
+    # Compact: drop invalid rows
+    X = X[:n_rows][valid[:n_rows]]
+    y = y[:n_rows][valid[:n_rows]]
+    y_reg = y_reg[:n_rows][valid[:n_rows]]
+    print(f"[Classifier] Parsed {len(X)} rows (fund-filled={filled}, skipped={skipped})", flush=True)
+
+    if len(X) < min_samples:
+        print(f"[Classifier] {len(X)} < {min_samples} — insufficient", flush=True)
+        return None
 
     # Drop zero-variance features
     nonzero_variance = np.std(X, axis=0) > 1e-12

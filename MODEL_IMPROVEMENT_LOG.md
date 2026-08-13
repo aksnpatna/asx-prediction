@@ -65,3 +65,21 @@
 - **Why:** 0 delisted tickers in universe → base rates inflated ~4-6pp (strategy doc G1 gate, line 409).
 - **Status:** Infrastructure ready. Full de-biasing needs delisted ticker list + historical prices (paid EODHD delisted API, or manual curation).
 - **Commit:** 0d088a2
+
+### [2026-08-13] Fix 4: 300K training samples + 6GB memory
+- **What:** LIMIT 200000→300000; memory 4GB→6GB
+- **Why:** 200K = 6.6% of 3.03M training rows. More data → better generalization.
+- **Before → After (200K → 300K):**
+  - Top decile: 44.5% → **45.5%** (+1.0pp)
+  - Bottom decile: 16.4% → **8.9%**
+  - Spread: 28.1pp → **36.6pp** (+8.5pp)
+  - AUC: 0.583 → **0.688** (+0.105, huge)
+  - Deciles now perfectly monotonic: [45.5, 41.2, 36.8, 31.9, 24.8, 19.4, 17.0, 14.0, 11.5, 8.9]
+- **Top features:** momentum_20d (-0.44), rsi_vol_adj (+0.31), gap_detection (+0.24), rsi (-0.24)
+- **Commit:** pending
+
+### [2026-08-13] Fix 5: New features (dividends/earnings) — TBD
+- **What:**
+- **Why:**
+- **Before → After:**
+- **Commit:**

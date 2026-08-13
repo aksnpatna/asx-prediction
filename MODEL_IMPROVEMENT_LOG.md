@@ -104,5 +104,17 @@
   - AUC: 0.688 → **0.697** (+0.009)
 - **Feature coefficients:** pct_institutions +0.15 (strongest), esg_controversy +0.048, eps_surprise +0.033, pct_insiders +0.021, others ~0
 - **Ablation:** 4 strong features only = AUC 0.6966 (vs 0.6972 all 9) — weak features are neutral, keep all 9
-- **Key insight:** Institutional ownership is the strongest new signal (institutions do due diligence)
+- **Key insight:** Institutional ownership is the strongest new signal
 - **Commit:** 0424ae7
+
+### [2026-08-13] Fix 8: G1 survivorship de-biasing (delisted tickers) — HONEST BASELINE
+- **What:** Backfilled 1,858 delisted ASX tickers + 2.2M OHLC rows. Rebuilt training matrix including delisted.
+- **Result (survivorship-biased → honest):**
+  - Base rate: 25.0% → **31.5%** (delisted stocks raise the path-aware hit rate)
+  - Top decile: 47.8% → **41.6%** (−6.2pp, exactly matches strategy doc prediction of 4-6pp)
+  - AUC: 0.697 → **0.641**
+  - Spread: 39.8pp → 29.2pp
+- **Model's true edge:** top decile / base rate = 41.6/31.5 = **1.32×** (was 1.91× survivorship-inflated)
+- **EODHD features on honest data:** AUC 0.6409 (no EODHD) vs 0.6410 (EODHD) — marginal on G1 data
+- **Caveat:** Deciles non-monotonic [41.6, 47.4, 45.6, ...] — delisted data (truncated 2015-2026) may need quality review
+- **Commit:** dd62258

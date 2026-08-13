@@ -85,5 +85,13 @@
   - AUC: 0.688 → 0.686 (−0.003)
   - Spread: 36.6pp → 36.2pp
 - **Conclusion:** Dividend yield/growth/timing do NOT add signal — already captured by `fund_div_yield` snapshot + value/momentum features. Reverted features (kept module for future experiments).
-- **Lesson:** Not every hypothesis pans out — measured, documented, reverted. This is the traceable process working as intended.
+
+### [2026-08-13] Fix 6: 500K samples — TESTED, WORSE (reverted to 300K)
+- **What:** LIMIT 300000→500000, memory 6GB→8GB
+- **Result (300K → 500K):**
+  - Top decile: 45.5% → **34.3%** (−11.2pp)
+  - Spread: 36.5pp → 23.9pp
+  - AUC: 0.688 → **0.618** (−0.070)
+- **Conclusion:** 300K is the sweet spot. 500K pulls in older market regimes (2015-2017) whose patterns don't generalize to recent data (train/test regime drift). Reverted to 300K.
+- **Sample-size curve:** 100K (AUC 0.59) → 200K (0.63) → 300K (0.688) → 500K (0.618). Optimal = 300K.
 - **Commit:** pending

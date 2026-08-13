@@ -78,8 +78,12 @@
 - **Top features:** momentum_20d (-0.44), rsi_vol_adj (+0.31), gap_detection (+0.24), rsi (-0.24)
 - **Commit:** pending
 
-### [2026-08-13] Fix 5: New features (dividends/earnings) — TBD
-- **What:**
-- **Why:**
-- **Before → After:**
-- **Commit:**
+### [2026-08-13] Fix 5: Dividend features — TESTED, NO IMPROVEMENT (reverted)
+- **What:** Built dividend_features.py — point-in-time div_yield_ttm, div_growth_yoy, days_since_div from yfinance full dividend history (1988-2026). Tested as 3 new features.
+- **Result (300K baseline → +dividends):**
+  - Top decile: 45.5% → 45.1% (−0.4pp, within noise)
+  - AUC: 0.688 → 0.686 (−0.003)
+  - Spread: 36.6pp → 36.2pp
+- **Conclusion:** Dividend yield/growth/timing do NOT add signal — already captured by `fund_div_yield` snapshot + value/momentum features. Reverted features (kept module for future experiments).
+- **Lesson:** Not every hypothesis pans out — measured, documented, reverted. This is the traceable process working as intended.
+- **Commit:** pending

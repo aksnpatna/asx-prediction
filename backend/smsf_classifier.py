@@ -148,7 +148,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     try:
         with db_conn() as conn:
             rows = conn.execute(text(
-                f"SELECT symbol, entry_price, features, CAST({target_col} AS INTEGER) FROM model_training_set "
+                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER) FROM model_training_set "
                 "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
                 "ORDER BY signal_date ASC LIMIT 300000"
             )).fetchall()
@@ -171,7 +171,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     filled = 0
     for row in rows:
         try:
-            symbol, entry_price, feats_raw, label = row
+            symbol, entry_price, signal_date, feats_raw, label = row
             feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
             feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
             feats = _fill_historical(feats, symbol, hist_map)

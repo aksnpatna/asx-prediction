@@ -92,6 +92,17 @@
   - Top decile: 45.5% → **34.3%** (−11.2pp)
   - Spread: 36.5pp → 23.9pp
   - AUC: 0.688 → **0.618** (−0.070)
-- **Conclusion:** 300K is the sweet spot. 500K pulls in older market regimes (2015-2017) whose patterns don't generalize to recent data (train/test regime drift). Reverted to 300K.
-- **Sample-size curve:** 100K (AUC 0.59) → 200K (0.63) → 300K (0.688) → 500K (0.618). Optimal = 300K.
-- **Commit:** pending
+- **Conclusion:** 300K is the sweet spot. 500K pulls in older market regimes (2015-2017). Reverted to 300K.
+- **Sample-size curve:** 100K (0.59) → 200K (0.63) → 300K (0.688) → 500K (0.618). Optimal = 300K.
+- **Commit:** 9959df4
+
+### [2026-08-13] Fix 7: EODHD fundamentals features — IMPROVEMENT (kept)
+- **What:** 9 features from $59.99 feed (eps_surprise, eps_estimate_revision, analyst_count, pct_insiders, pct_institutions, insider_net_ratio, esg_governance, esg_controversy, payout_ratio)
+- **Result (300K → +EODHD):**
+  - Top decile: 45.4% → **47.8%** (+2.4pp)
+  - Spread: 36.5pp → 39.8pp
+  - AUC: 0.688 → **0.697** (+0.009)
+- **Feature coefficients:** pct_institutions +0.15 (strongest), esg_controversy +0.048, eps_surprise +0.033, pct_insiders +0.021, others ~0
+- **Ablation:** 4 strong features only = AUC 0.6966 (vs 0.6972 all 9) — weak features are neutral, keep all 9
+- **Key insight:** Institutional ownership is the strongest new signal (institutions do due diligence)
+- **Commit:** 0424ae7

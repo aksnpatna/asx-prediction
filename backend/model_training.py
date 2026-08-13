@@ -522,11 +522,14 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                     """SELECT DISTINCT symbol FROM eod_ohl_history o
                        WHERE o.market = :mkt
                          AND o.trade_date >= :lookback
-                         AND EXISTS (
-                           SELECT 1 FROM eod_ohl_history o2
-                           WHERE o2.symbol = o.symbol
-                             AND o2.trade_date >= :recent
-                           LIMIT 1
+                         AND (
+                           EXISTS (
+                             SELECT 1 FROM eod_ohl_history o2
+                             WHERE o2.symbol = o.symbol
+                               AND o2.trade_date >= :recent
+                             LIMIT 1
+                           )
+                           OR o.symbol IN (SELECT symbol FROM delisted_tickers)
                          )
                        ORDER BY symbol""",
                 ),

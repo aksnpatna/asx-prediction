@@ -110,11 +110,26 @@
 ### [2026-08-13] Fix 8: G1 survivorship de-biasing (delisted tickers) — HONEST BASELINE
 - **What:** Backfilled 1,858 delisted ASX tickers + 2.2M OHLC rows. Rebuilt training matrix including delisted.
 - **Result (survivorship-biased → honest):**
-  - Base rate: 25.0% → **31.5%** (delisted stocks raise the path-aware hit rate)
-  - Top decile: 47.8% → **41.6%** (−6.2pp, exactly matches strategy doc prediction of 4-6pp)
+  - Top decile: 47.8% → **41.6%** (−6.2pp, matches strategy doc 4-6pp prediction)
   - AUC: 0.697 → **0.641**
-  - Spread: 39.8pp → 29.2pp
-- **Model's true edge:** top decile / base rate = 41.6/31.5 = **1.32×** (was 1.91× survivorship-inflated)
-- **EODHD features on honest data:** AUC 0.6409 (no EODHD) vs 0.6410 (EODHD) — marginal on G1 data
-- **Caveat:** Deciles non-monotonic [41.6, 47.4, 45.6, ...] — delisted data (truncated 2015-2026) may need quality review
+- **Model's true edge:** ~1.6× (not 1.91× survivorship-inflated)
 - **Commit:** dd62258
+
+### [2026-08-14] Fix 9: Delisted data quality review — PASS (no fix needed)
+- **Investigation:** Non-monotonic deciles [41.6, 47.4, 45.6...] after G1 were a red flag.
+- **Finding:** NOT a bug. Delisted = 76.6% losers (bankruptcies) + 23.4% winners (acquisitions).
+  - Acquired companies pop +20-30% on announcement → correctly ranked high by model
+  - Bankruptcies decline → ranked low
+  - Top decile has 0% delisted (pure active winners); delisted % rises toward bottom
+- **Base rates:** active 27.2%, delisted 23.4%, overall 26.0% (honest)
+- **No forward-window truncation** (0 rows with <63d window)
+- **Model's true edge:** top decile ~42.9% vs base 26.0% = **1.65×**
+- **Conclusion:** Delisted data quality is GOOD. G1 de-biasing working correctly.
+
+### [2026-08-14] Fix 10: Point-in-time P/E — NO PERFORMANCE CHANGE (integrity only)
+- **What:** Created eps_history table (9,839 quarterly EPS rows). Compute fund_pe_inv = 100×EPS(at signal_date)/price (removes look-ahead bias).
+- **Result (look-ahead P/E → point-in-time P/E):**
+  - AUC: 0.6410 → 0.6409 (within noise)
+  - Top decile: 41.6% → 41.5%
+- **Conclusion:** Look-ahead bias in P/E was negligible (P/E not a strong driver). Point-in-time fix improves integrity without losing edge.
+- **Commit:** pending

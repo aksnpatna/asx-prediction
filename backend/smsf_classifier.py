@@ -138,6 +138,49 @@ def _fill_eodhd(feats: dict, symbol: str, eodhd_map: Dict[str, dict]) -> dict:
     return feats
 
 
+def _load_eps_history(db_conn) -> Dict[str, tuple]:
+    """Load point-in-time EPS history: symbol -> (dates_array, eps_array) sorted by date."""
+    from sqlalchemy import text
+    result = {}
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(text(
+                "SELECT symbol, report_date, eps_actual FROM eps_history "
+                "WHERE eps_actual IS NOT NULL AND eps_actual > 0 ORDER BY symbol, report_date"
+            )).fetchall()
+        for sym, rd, eps in rows:
+            if sym not in result:
+                result[sym] = ([], [])
+            result[sym][0].append(rd)
+            result[sym][1].append(float(eps))
+        for sym in result:
+            dates, eps_vals = result[sym]
+            result[sym] = (np.array(dates, dtype='datetime64[D]'), np.array(eps_vals))
+    except Exception as e:
+        print(f"[EPS] Load failed: {e}", flush=True)
+    return result
+
+
+def _fill_point_in_time_pe(feats: dict, symbol: str, signal_date, entry_price: float,
+                           eps_map: Dict[str, tuple]) -> dict:
+    """Override fund_pe_inv with point-in-time P/E (removes look-ahead bias).
+
+    fund_pe_inv = 100 * EPS(at or before signal_date) / entry_price
+    """
+    entry = eps_map.get(symbol)
+    if not entry or entry_price <= 0:
+        return feats
+    dates, eps_vals = entry
+    try:
+        sd = np.datetime64(signal_date, 'D') if hasattr(signal_date, 'year') else np.datetime64(str(signal_date)[:10], 'D')
+        idx = np.searchsorted(dates, sd, side='right') - 1
+        if idx >= 0 and eps_vals[idx] > 0:
+            feats["fund_pe_inv"] = round(100.0 * eps_vals[idx] / entry_price, 6)
+    except Exception:
+        pass
+    return feats
+
+
 def _fill_fundamentals(feats: dict, symbol: str, fund_map: Dict[str, dict],
                        entry_price: float) -> dict:
     """Fill zero fundamental features from the latest snapshot for the symbol."""
@@ -196,7 +239,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     fund_map = _load_latest_fundamentals(db_conn)
     hist_map = _load_historical_fundamentals(db_conn)
     eodhd_map = _load_eodhd_features()
-    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD symbol features", flush=True)
+    eps_map = _load_eps_history(db_conn)
+    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history symbols", flush=True)
 
     # Parse features + fill fundamentals
     X_list, y_list = [], []
@@ -207,6 +251,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             symbol, entry_price, signal_date, feats_raw, label = row
             feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
             feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
+            feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
             feats = _fill_historical(feats, symbol, hist_map)
             feats = _fill_eodhd(feats, symbol, eodhd_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]

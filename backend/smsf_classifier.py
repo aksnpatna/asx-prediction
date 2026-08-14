@@ -100,9 +100,32 @@ EODHD_FEATURE_KEYS = [
 ]
 
 
-def _load_eodhd_features() -> Dict[str, dict]:
-    """Load EODHD features from data/eodhd_features.json (or DB)."""
+def _load_eodhd_features(db_conn=None) -> Dict[str, dict]:
+    """Load EODHD features from DB (persistent) with file fallback."""
+    from sqlalchemy import text
     result = {}
+    try:
+        if db_conn is not None:
+            with db_conn() as conn:
+                rows = conn.execute(text(
+                    "SELECT DISTINCT ON (symbol) symbol, eps_surprise, eps_estimate_revision, "
+                    "analyst_count, pct_insiders, pct_institutions, insider_net_ratio, "
+                    "esg_governance, esg_controversy, payout_ratio "
+                    "FROM eodhd_feature_snapshots ORDER BY symbol, snapshot_date DESC"
+                )).fetchall()
+            for r in rows:
+                result[r[0]] = {
+                    "eps_surprise": float(r[1] or 0), "eps_estimate_revision": float(r[2] or 0),
+                    "analyst_count": float(r[3] or 0), "pct_insiders": float(r[4] or 0),
+                    "pct_institutions": float(r[5] or 0), "insider_net_ratio": float(r[6] or 0),
+                    "esg_governance": float(r[7] or 0), "esg_controversy": float(r[8] or 0),
+                    "payout_ratio": float(r[9] or 0),
+                }
+            if result:
+                return result
+    except Exception:
+        result = {}
+    # File fallback (legacy)
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "eodhd_features.json")
         if not os.path.exists(path):
@@ -110,8 +133,8 @@ def _load_eodhd_features() -> Dict[str, dict]:
         if os.path.exists(path):
             with open(path) as f:
                 result = json.load(f)
-    except Exception as e:
-        print(f"[EODHD] Load failed: {e}", flush=True)
+    except Exception:
+        pass
     return result
 
 
@@ -210,7 +233,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     # Load auxiliary maps first (small, in-memory)
     fund_map = _load_latest_fundamentals(db_conn)
     hist_map = _load_historical_fundamentals(db_conn)
-    eodhd_map = _load_eodhd_features()
+    eodhd_map = _load_eodhd_features(db_conn)
     eps_map = _load_eps_history(db_conn)
     print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history symbols", flush=True)
 

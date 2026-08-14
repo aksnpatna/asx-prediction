@@ -196,3 +196,21 @@ correct (exit on first touch). Concurrent label mislabels 'hit +8% early
 then crashed' as loss → first-touch base rate expected slightly HIGHER.
 
 **Commit:** 8f9b461
+
+### [2026-08-14] Fix 16: First-touch label rebuild complete — honest economics revealed
+- **Rebuild:** 4,318,965 rows (100%) with hit_8pct_first_touch labels
+- **Label comparison:**
+  - Concurrent base rate: 26.0% (touched +8% AND never breached -8%)
+  - First-touch base rate: **45.2%** (crossed +8% before -8%)
+  - Disagreement: 830,188 rows (19.2%) — stocks that hit +8% early then crashed later
+- **Retrain on first-touch (v2 spec):**
+  - Base 50.2%, top decile **55.3%**, spread 11.8pp, AUC **0.534**, edge **1.10×**
+  - vs concurrent: base 26.0%, top 46.0%, spread 33.3pp, AUC 0.645, edge 1.77×
+- **Finding:** First-touch base rate DOUBLED (reviewer predicted drop — inverted).
+  But discrimination collapses (AUC 0.534 ≈ coin flip): predicting which of
+  ±8% crossed first is inherently hard. The concurrent label's 1.77× edge
+  was partly a label artifact of "sustained trend" predictability.
+- **Honest economics (first-touch top decile):** 55.3%×8% − 44.7%×8% ≈ +0.85% EV/trade before costs
+- **G2 gate (60% top decile): NOT met** — 55.3% < 60%. Strategy correctly gates real capital.
+- **Decision:** score on concurrent label (better ranking for AI deep-dive),
+  report first-touch metrics for honest economics.

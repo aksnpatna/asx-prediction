@@ -827,6 +827,7 @@ def init_db():
             "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS hit_5pct_before_m5pct BOOLEAN",
             "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS hit_8pct_before_m8pct BOOLEAN",
             "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS close_5pct_63d BOOLEAN",
+            "ALTER TABLE model_training_set ADD COLUMN IF NOT EXISTS hit_8pct_first_touch BOOLEAN",
         ]:
             try:
                 conn.execute(text(mt_sql))

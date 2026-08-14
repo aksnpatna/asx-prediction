@@ -650,13 +650,23 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                 # ── Path-aware labels (SMSF v2): hit target BEFORE hitting stop ──
                 hit_5pct_before_m5pct = fwd_peak >= 5.0 and fwd_dd > -5.0
                 hit_8pct_before_m8pct = fwd_peak >= 8.0 and fwd_dd > -8.0
+
+                # ── Strict first-touch label (v2 Part 9): which threshold is crossed FIRST ──
+                # Economically correct: the exit engine exits on the first touch of
+                # either +8% (take-profit) or -8% (catastrophe stop). The concurrent
+                # label above mislabels "hit +8% early, then crashed later" as a loss.
+                future_pcts = (future / entry_price - 1).to_numpy(dtype=np.float64)
+                up_cross = np.argmax(future_pcts >= 0.08) if (future_pcts >= 0.08).any() else 9999
+                dn_cross = np.argmax(future_pcts <= -0.08) if (future_pcts <= -0.08).any() else 9999
+                hit_8pct_first_touch = bool(up_cross < dn_cross)
                 close_5pct_63d = fwd_ret >= 5.0
 
                 rows_to_insert.append((symbol, market, signal_date, entry_price,
                     json.dumps(feat_row), fwd_ret, fwd_peak, fwd_dd,
                     hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
                     hit_8pct_63d, hit_10pct_63d, direction_correct,
-                    hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d))
+                    hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d,
+                    hit_8pct_first_touch))
 
             if rows_to_insert:
                 try:
@@ -668,9 +678,10 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                                  forward_return_63d, forward_peak_return_63d, forward_max_drawdown_63d,
                                  hit_3pct, hit_3pct_14d, hit_3pct_30d, hit_5pct_63d,
                                  hit_8pct_63d, hit_10pct_63d, direction_correct,
-                                 hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d)
+                                 hit_5pct_before_m5pct, hit_8pct_before_m8pct, close_5pct_63d,
+                                 hit_8pct_first_touch)
                                 VALUES (:s,:m,:d,:p,:f,:fr,:fp,:fd,:h,:h14,:h30,:h5,:h8,:h10,:dc,
-                                        :h5m5,:h8m8,:c5)
+                                        :h5m5,:h8m8,:c5,:h8ft)
                                 ON CONFLICT (symbol, market, signal_date) DO UPDATE SET
                                 entry_price=EXCLUDED.entry_price, features=EXCLUDED.features,
                                 forward_return_63d=EXCLUDED.forward_return_63d,
@@ -685,12 +696,14 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                                 direction_correct=EXCLUDED.direction_correct,
                                 hit_5pct_before_m5pct=EXCLUDED.hit_5pct_before_m5pct,
                                 hit_8pct_before_m8pct=EXCLUDED.hit_8pct_before_m8pct,
-                                close_5pct_63d=EXCLUDED.close_5pct_63d
+                                close_5pct_63d=EXCLUDED.close_5pct_63d,
+                                hit_8pct_first_touch=EXCLUDED.hit_8pct_first_touch
                             """), {"s": row[0], "m": row[1], "d": row[2], "p": row[3], "f": row[4],
                                    "fr": row[5], "fp": row[6], "fd": row[7], "h": row[8],
                                    "h14": row[9], "h30": row[10], "h5": row[11],
                                    "h8": row[12], "h10": row[13], "dc": row[14],
-                                   "h5m5": row[15], "h8m8": row[16], "c5": row[17]})
+                                   "h5m5": row[15], "h8m8": row[16], "c5": row[17],
+                                   "h8ft": row[18]})
                         conn.commit()
                     inserted += len(rows_to_insert)
                 except Exception as e:

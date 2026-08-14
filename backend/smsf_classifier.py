@@ -447,6 +447,22 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
         conn.commit()
     print(f"[Classifier] Saved {len(coefs)} binary + {len(reg_coefs)} regression weights", flush=True)
 
+    # ── Regression guards — fail loudly if the model silently degrades ──────
+    # Locks in Fix 13 (+2.3pp) and Fix 14 (pruning): prevents silent backsliding
+    # where fundamental features freeze at 0.0 or too many features drop out.
+    guards = []
+    if len(active_features) < 40:
+        guards.append(f"active_features={len(active_features)} < 40 (expected ~45)")
+    pct_inst_coef = abs(coefs.get("pct_institutions", 0))
+    if pct_inst_coef < 0.001:
+        guards.append(f"|coef(pct_institutions)|={pct_inst_coef:.5f} < 0.001 (EODHD features likely frozen)")
+    if guards:
+        print(f"[Classifier] ⚠️ REGRESSION GUARDS FAILED: {'; '.join(guards)}", flush=True)
+    else:
+        print(f"[Classifier] Regression guards OK: {len(active_features)} features, "
+              f"|coef(pct_institutions)|={pct_inst_coef:.4f}", flush=True)
+    result_guards = guards
+
     return {
         "status": "ok", "model_type": "logistic_regression",
         "samples": len(X), "active_features": len(active_features),
@@ -458,4 +474,5 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
         "avg_precision": round(avg_precision, 4),
         "decile_hit_rates": decile_hit_rates,
         "top_features": top_features, "elapsed_s": round(elapsed, 1),
+        "regression_guards_failed": result_guards,
     }

@@ -10,19 +10,6 @@ from datetime import date
 from typing import Dict, List, Optional
 
 
-FUNDAMENTAL_FEATURES = [
-    "fund_pe_inv", "fund_forward_pe_inv", "fund_market_cap_log",
-    "fund_div_yield", "fund_analyst_upside", "fund_analyst_rec_score",
-    "fund_earnings_growth", "fund_revenue_growth", "fund_beta",
-    "fund_pct_from_52w_high",
-]
-
-HISTORICAL_FEATURES = [
-    "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
-    "fund_hist_op_margin", "fund_hist_fcf_yield",
-]
-
-
 def _load_historical_fundamentals(db_conn) -> Dict[str, dict]:
     """Load latest fiscal-year fundamental ratios per symbol (from income/balance/cashflow)."""
     from sqlalchemy import text

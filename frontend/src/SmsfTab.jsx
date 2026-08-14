@@ -140,12 +140,11 @@ export default function SmsfTab() {
 
         {/* Model Confidence Card */}
         <div className="smsf-card card-accent">
-          <div className="card-label">MODEL CONFIDENCE</div>
-          <div className="card-value">{model?.oob_accuracy ? `${(model.oob_accuracy * 100).toFixed(0)}%` : '—'}</div>
-          <div className="card-sub">Target: {model?.target || 'hit_8pct_before_m8pct'}</div>
+          <div className="card-label">MODEL (Multitask Blend)</div>
+          <div className="card-value">{model?.auc ? `${model.auc.toFixed(3)}` : '—'}</div>
+          <div className="card-sub">AUC (0.5 = random, 0.7 = strong)</div>
           <div className="card-meta">
-            Base: {model?.base_rate ? `${(model.base_rate * 100).toFixed(0)}%` : '—'} 
-            · Lift: {model?.top_decile_lift ? `${model.top_decile_lift.toFixed(1)}x` : '—'}
+            {model?.feature_count || 62} features · {model?.notes || 'hit_8pct_before_m8pct'}
           </div>
         </div>
       </div>
@@ -200,8 +199,10 @@ export default function SmsfTab() {
             <thead>
               <tr>
                 <th>Symbol</th>
+                <th>Qty</th>
                 <th>Entry</th>
                 <th>Current</th>
+                <th>Value</th>
                 <th>P&L</th>
                 <th>Days</th>
                 <th>Sentinel</th>
@@ -212,10 +213,13 @@ export default function SmsfTab() {
               {positions.map((p, i) => (
                 <tr key={i} className={p.sentinel_verdict === 'BROKEN' ? 'row-broken' : p.sentinel_verdict === 'WEAKENED' ? 'row-weakened' : ''}>
                   <td><strong>{p.symbol}</strong></td>
+                  <td>{p.quantity > 0 ? p.quantity.toLocaleString() : '—'}</td>
                   <td>${p.entry_price?.toFixed(2)}</td>
                   <td>${p.current_price?.toFixed(2)}</td>
+                  <td>${p.market_value > 0 ? p.market_value.toLocaleString() : '—'}</td>
                   <td className={p.pnl_pct >= 0 ? 'gain' : 'loss'}>
                     {p.pnl_pct >= 0 ? '+' : ''}{p.pnl_pct?.toFixed(1)}%
+                    <div className="text-small">{p.pnl_abs >= 0 ? '+' : ''}{p.pnl_abs?.toFixed(0)}</div>
                   </td>
                   <td>{p.days_held}d</td>
                   <td>
@@ -240,6 +244,45 @@ export default function SmsfTab() {
           <div className="muted" style={{ padding: '1rem' }}>No open positions. Paper trading will open positions as model signals arrive.</div>
         )}
       </div>
+
+      {/* ── Core Sleeve Panel ─────────────────────────────────────────── */}
+      {data?.core_sleeve && (
+        <div className="smsf-panel" style={{ marginTop: '1rem' }}>
+          <h3>🏛️ Core Sleeve {data.core_sleeve.status === 'above_target' ? '(above target)' : data.core_sleeve.status === 'below_target' ? '(below target)' : ''}</h3>
+          <div className="card-meta">
+            {data.core_sleeve.position_count || 0} positions · {data.core_sleeve.pct_of_nav || 0}% of NAV · Target {data.core_sleeve.target_pct || 60}%
+            {data.core_sleeve.review_due ? ' · ⏰ REVIEW DUE' : ''}
+          </div>
+          {data.core_sleeve.positions?.length > 0 && (
+            <table className="smsf-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Qty</th>
+                  <th>Value</th>
+                  <th>% NAV</th>
+                  <th>Yield</th>
+                  <th>Days</th>
+                  <th>Thesis</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.core_sleeve.positions.map((c, i) => (
+                  <tr key={i}>
+                    <td><strong>{c.symbol}</strong></td>
+                    <td>{c.qty?.toLocaleString()}</td>
+                    <td>${c.value?.toLocaleString()}</td>
+                    <td>{c.pct_of_nav}%</td>
+                    <td>{c.yield_est ? c.yield_est.toFixed(1) + '%' : '—'}</td>
+                    <td>{c.days_held}d</td>
+                    <td className="text-small">{c.thesis?.substring(0, 60)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       <div style={{ marginTop: '24px' }}>
         <NewsSentimentMonitor 

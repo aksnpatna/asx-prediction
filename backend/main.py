@@ -6206,12 +6206,30 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         # Model
         try:
             with db_conn() as c:
-                latest = c.execute(text("SELECT MAX(trained_at), LEFT(notes, 200) FROM model_weights_by_date WHERE model_type='pathaware_v2' OR model_type='ridge'")).fetchone()
+                latest = c.execute(text(
+                    "SELECT MAX(trained_at), MAX(in_sample_hit_rate), MAX(notes) "
+                    "FROM model_weights_by_date WHERE model_type='logistic'"
+                )).fetchone()
                 if latest and latest[0]:
-                    age_h = (datetime.utcnow() - latest[0].replace(tzinfo=None) if hasattr(latest[0], 'replace') else 24).total_seconds() / 3600
-                    result["model"]["weights_age_hours"] = round(max(0, age_h) if not isinstance(age_h, complex) else 24, 1)
-                    result["model"]["feature_count"] = 62
-        except: pass
+                    trained_at = latest[0]
+                    auc = float(latest[1]) if latest[1] is not None else None
+                    notes = latest[2] or ""
+                    age_h = 24
+                    try:
+                        age_h = max(0, (datetime.utcnow() - trained_at.replace(tzinfo=None)).total_seconds() / 3600)
+                    except Exception:
+                        pass
+                    result["model"]["weights_age_hours"] = round(age_h, 1)
+                    result["model"]["auc"] = round(auc, 3) if auc is not None else None
+                    result["model"]["notes"] = notes[:120]
+                    wc = c.execute(text(
+                        "SELECT COUNT(*) FROM model_weights_by_date WHERE model_type='logistic' AND "
+                        "trained_at=(SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='logistic') "
+                        "AND weight IS NOT NULL AND weight != 0"
+                    )).fetchone()
+                    result["model"]["feature_count"] = wc[0] if wc else 62
+        except Exception:
+            pass
 
         # Macro regime
         try:
@@ -6240,9 +6258,11 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         except: pass
 
         # Positions (no LLM call per position — uses cached sentinel from DB if available)
+        # Current price: prefer latest OHLC close (fresh daily) over monitor cache
         for p in open_positions:
             ep = float(p.get("entry_price", 0))
             cp = float(p.get("current_price", 0))
+            qty = float(p.get("quantity", 0) or 0)
             ed_str = p.get("entry_date_parsed") or p.get("created_at") or ""
             days_held = 0
             try:
@@ -6255,15 +6275,30 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
                     days_held = (date.today() - ed).days
             except: pass
 
+            # Fresh price from latest OHLC (updated daily by inc_update)
+            try:
+                with db_conn() as c:
+                    ohlc_row = c.execute(text(
+                        "SELECT close FROM eod_ohl_history WHERE symbol=:sym AND market='AU' "
+                        "ORDER BY trade_date DESC LIMIT 1"
+                    ), {"sym": p.get("symbol", "")}).fetchone()
+                if ohlc_row and ohlc_row[0] and float(ohlc_row[0]) > 0:
+                    cp = float(ohlc_row[0])
+            except Exception:
+                pass
+
             sentinel_verdict = p.get("position_stage", "entered")
             if sentinel_verdict not in ("INTACT", "WEAKENED", "BROKEN"):
                 sentinel_verdict = "INTACT"
 
             result["positions"].append({
                 "symbol": p.get("symbol",""),
+                "quantity": qty,
+                "market_value": round(cp * qty, 2) if qty > 0 else 0,
                 "entry_price": round(ep, 3),
                 "current_price": round(cp, 3),
                 "pnl_pct": round((cp / ep - 1) * 100, 2) if ep > 0 else 0,
+                "pnl_abs": round((cp - ep) * qty, 2) if qty > 0 else 0,
                 "days_held": days_held,
                 "sentinel_verdict": sentinel_verdict,
                 "exit_signal": "HOLD",

@@ -159,3 +159,11 @@
 - **Now live:** analyst_count −0.66, pct_institutions +0.46, op_margin +0.56, roe −0.49, fcf_yield −0.39
 - **Credit:** other agent's observation was correct (features not training); their SQLite fix approach was wrong (PostgreSQL).
 - **Commit:** 26cc418
+
+### [2026-08-14] Fix 14: Permutation-importance pruning (29 noise features dropped)
+- **What:** Measured permutation importance (5 reps, 8K subsample). Dropped 29 features with negative/zero importance via PRUNED_FEATURES constant.
+- **Result:** ALL metrics improved — top decile 44.7% → **46.0%**, spread 32.2 → 33.3pp, AUC 0.640 → **0.6454**
+- **Dropped:** parkinson_vol, bb_width, sma_cross_20_50, trend_strength, squeeze vars + weak fundamentals (fund_hist_roe, debt_equity, fcf_yield, pe_inv)
+- **Kept:** 45 features incl. all macro (vix, copper/gold, AUD, yield curve)
+- **Sweep finding:** aggressive pruning (11-14 feats) reaches top decile 48.4% but degrades loser avoidance — 45 is the no-trade-off optimum.
+- **Commit:** 042dc21

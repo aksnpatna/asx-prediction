@@ -167,3 +167,32 @@
 - **Kept:** 45 features incl. all macro (vix, copper/gold, AUD, yield curve)
 - **Sweep finding:** aggressive pruning (11-14 feats) reaches top decile 48.4% but degrades loser avoidance — 45 is the no-trade-off optimum.
 - **Commit:** 042dc21
+
+### [2026-08-14] Fix 15: Reviewer §8 — regression guards, WFO (G2), adjusted_close, first-touch
+
+**Item 1 — Regression guards (applied):** train_classifier fails loudly if
+active_features < 40 or |coef(pct_institutions)| < 0.001 — locks in Fix 13/14.
+
+**Item 2 — Walk-forward validation (FIRST REAL OOS NUMBERS):**
+Rolling 900K train windows, chronological folds (out-of-sample):
+| Fold | Base | Top decile | Bottom | Spread | AUC |
+|------|------|-----------|--------|--------|-----|
+| 2022 (bear) | 18.4% | 20.4% | 17.6% | 2.8pp | 0.478 |
+| 2023 | 21.5% | 35.7% | 8.9% | 26.8pp | 0.659 |
+| 2024 | 24.8% | 55.1% | 4.6% | 50.5pp | 0.754 |
+| **Avg** | **21.6%** | **37.1%** | **10.4%** | **26.7pp** | **0.630** |
+
+**Honest OOS edge: 1.72× base rate.** 2022 bear = no edge (AUC 0.478) —
+validates the need for circuit-breaker/bear overrides. Expanding-window
+variant gave 2022 top 27.4% (AUC 0.588) — older data helps bears.
+G2 gate (60% top decile) NOT met — honest deployable number is ~37% OOS.
+
+**Item 4 — adjusted_close: ALREADY STORED** (verified: DB has 158.0995 =
+EODHD adjusted, not raw 164.97). Reviewer claim based on outdated code.
+
+**Item 3 — First-touch label (built, rebuild running):** new
+hit_8pct_first_touch column = which threshold crossed first. Economically
+correct (exit on first touch). Concurrent label mislabels 'hit +8% early
+then crashed' as loss → first-touch base rate expected slightly HIGHER.
+
+**Commit:** 8f9b461

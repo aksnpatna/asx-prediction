@@ -150,3 +150,12 @@
 - **Result:** 300K training OOM at 4GB → **302MiB peak** (14x headroom); results identical (top decile 42.4%, AUC 0.6408)
 - **Container:** 8GB → 4GB limit
 - **Commit:** d7d0459
+
+### [2026-08-14] Fix 13: Fundamental features silently training on 0.0 — FIXED (+2.3pp)
+- **Root cause 1:** `_fill_eodhd`/`_fill_historical` used `setdefault`, but the matrix JSON already stores those keys as 0.0 → setdefault silently skipped → 14 features trained on 0.0 and dropped as zero-variance.
+- **Root cause 2:** `model_weights_by_date` UNIQUE constraint was `(trained_at, feature_name)` without model_type → ridge_reg save overwrote logistic weights via ON CONFLICT.
+- **Fix:** direct assignment (overwrites 0.0) + constraint migration to include model_type + all ON CONFLICT clauses updated.
+- **Result:** 61 → 74 active features; top decile 42.4% → **44.7%** (+2.3pp); spread 30.5 → 32.2pp
+- **Now live:** analyst_count −0.66, pct_institutions +0.46, op_margin +0.56, roe −0.49, fcf_yield −0.39
+- **Credit:** other agent's observation was correct (features not training); their SQLite fix approach was wrong (PostgreSQL).
+- **Commit:** 26cc418

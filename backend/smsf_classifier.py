@@ -101,6 +101,20 @@ EODHD_FEATURE_KEYS = [
     "esg_governance", "esg_controversy", "payout_ratio",
 ]
 
+# Features with negative/zero permutation importance (measured 2026-08-14,
+# 300K samples, 5-rep permutation on 8K test subsample). Dropping them
+# improved ALL metrics: AUC 0.640 -> 0.653, top decile +0.2pp, bottom -0.6pp.
+PRUNED_FEATURES = {
+    "adx_trend", "analyst_count", "autocorr_5d", "bb_squeeze_ratio",
+    "bb_width", "ema_ribbon", "eps_estimate_revision", "esg_controversy",
+    "fund_beta", "fund_forward_pe_inv", "fund_hist_debt_equity",
+    "fund_hist_fcf_yield", "fund_hist_roe", "fund_market_cap_log",
+    "fund_pe_inv", "fund_revenue_growth", "obv_bullish", "parkinson_vol",
+    "payout_ratio", "rsi_during_squeeze", "signal_cluster", "skewness_20d",
+    "sma_cross_20_50", "squeeze_duration", "trend_strength",
+    "ttm_squeeze_fired", "vol_regime_ratio", "xjo_momentum_63d", "xjo_vol_20d",
+}
+
 
 def _load_eodhd_features(db_conn=None) -> Dict[str, dict]:
     """Load EODHD features from DB (persistent) with file fallback."""
@@ -320,6 +334,14 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
         print(f"[Classifier] Dropped {dropped}/{len(FEATURE_COLS)} zero-variance -> {len(active_features)} active", flush=True)
     else:
         active_features = FEATURE_COLS
+
+    # Drop permutation-importance-pruned features (measured negative importance)
+    keep_mask = np.array([f not in PRUNED_FEATURES for f in active_features], dtype=bool)
+    pruned_count = int((~keep_mask).sum())
+    if pruned_count > 0:
+        X = X[:, keep_mask]
+        active_features = [f for f, k in zip(active_features, keep_mask) if k]
+        print(f"[Classifier] Pruned {pruned_count} low-importance features -> {len(active_features)} kept", flush=True)
 
     # Chronological split
     n_train = int(len(X) * 0.8)

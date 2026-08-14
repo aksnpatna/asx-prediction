@@ -8837,9 +8837,23 @@ def init_phase6_tables():
                 sample_size INTEGER,
                 in_sample_hit_rate NUMERIC(6, 2),
                 notes TEXT,
-                UNIQUE(trained_at, feature_name)
+                UNIQUE(trained_at, feature_name, model_type)
             )
         """))
+        # Migration: fix legacy constraint (was (trained_at, feature_name) without
+        # model_type — caused regression weights to overwrite binary classifier weights)
+        try:
+            conn.execute(text(
+                "ALTER TABLE model_weights_by_date DROP CONSTRAINT IF EXISTS "
+                "model_weights_by_date_trained_at_feature_name_key"
+            ))
+            conn.execute(text(
+                "ALTER TABLE model_weights_by_date ADD CONSTRAINT "
+                "model_weights_by_date_trained_at_feature_name_model_type_key "
+                "UNIQUE (trained_at, feature_name, model_type)"
+            ))
+        except Exception:
+            pass
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS channel_hit_rates (
                 id SERIAL PRIMARY KEY,

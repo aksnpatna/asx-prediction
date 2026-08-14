@@ -45,17 +45,19 @@ def _load_historical_fundamentals(db_conn) -> Dict[str, dict]:
 
 
 def _fill_historical(feats: dict, symbol: str, hist_map: Dict[str, dict]) -> dict:
+    """Fill historical ratios — overwrites the 0.0 defaults stored in the
+    matrix JSON (setdefault silently skipped them since keys exist as 0.0)."""
     h = hist_map.get(symbol)
     if not h:
         return feats
-    feats.setdefault("fund_hist_roe", h["roe"])
-    feats.setdefault("fund_hist_debt_equity", h["debt_equity"])
-    feats.setdefault("fund_hist_gross_margin", h["gross_margin"])
-    feats.setdefault("fund_hist_op_margin", h["op_margin"])
+    feats["fund_hist_roe"] = h["roe"]
+    feats["fund_hist_debt_equity"] = h["debt_equity"]
+    feats["fund_hist_gross_margin"] = h["gross_margin"]
+    feats["fund_hist_op_margin"] = h["op_margin"]
     if h["market_cap"] > 0 and h["fcf"] > 0:
-        feats.setdefault("fund_hist_fcf_yield", h["fcf"] / h["market_cap"] * 100)
+        feats["fund_hist_fcf_yield"] = h["fcf"] / h["market_cap"] * 100
     else:
-        feats.setdefault("fund_hist_fcf_yield", 0.0)
+        feats["fund_hist_fcf_yield"] = 0.0
     return feats
 
 
@@ -139,12 +141,13 @@ def _load_eodhd_features(db_conn=None) -> Dict[str, dict]:
 
 
 def _fill_eodhd(feats: dict, symbol: str, eodhd_map: Dict[str, dict]) -> dict:
-    """Fill EODHD features (EPS, ownership, ESG, insider) from the feature map."""
+    """Fill EODHD features (EPS, ownership, ESG, insider) — overwrites the
+    0.0 defaults stored in the matrix JSON (setdefault silently skipped them)."""
     f = eodhd_map.get(symbol)
     if not f:
         return feats
     for key in EODHD_FEATURE_KEYS:
-        feats.setdefault(key, float(f.get(key, 0) or 0))
+        feats[key] = float(f.get(key, 0) or 0)
     return feats
 
 
@@ -402,8 +405,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 "INSERT INTO model_weights_by_date (trained_at,feature_name,weight,coefficient,"
                 "model_type,sample_size,in_sample_hit_rate,notes) VALUES "
                 "(:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
-                "ON CONFLICT (trained_at,feature_name) DO UPDATE SET "
-                "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type='logistic'"),
+                "ON CONFLICT (trained_at,feature_name,model_type) DO UPDATE SET "
+                "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient"),
                 {"ta": today, "fn": fname, "w": round(float(w), 6), "c": round(float(w), 6),
                  "mt": "logistic", "ss": len(X), "ish": round(auc, 4),
                  "nt": f"LogReg+RegBlend topDecile={top_decile_hit:.0f}% AUC={auc:.3f} spread={spread:.1f}pp"})
@@ -414,8 +417,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 "INSERT INTO model_weights_by_date (trained_at,feature_name,weight,coefficient,"
                 "model_type,sample_size,in_sample_hit_rate,notes) VALUES "
                 "(:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
-                "ON CONFLICT (trained_at,feature_name) DO UPDATE SET "
-                "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type='ridge_reg'"),
+                "ON CONFLICT (trained_at,feature_name,model_type) DO UPDATE SET "
+                "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient"),
                 {"ta": today, "fn": fname, "w": round(float(w), 6), "c": round(float(w), 6),
                  "mt": "ridge_reg", "ss": len(X), "ish": round(auc, 4),
                  "nt": f"RidgeReg 63d-return blend=0.4"})

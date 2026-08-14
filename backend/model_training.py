@@ -916,8 +916,8 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
                 conn.execute(text("INSERT INTO model_weights_by_date "
                     "(trained_at,feature_name,weight,coefficient,model_type,sample_size,in_sample_hit_rate,notes) "
                     "VALUES (:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
-                    "ON CONFLICT (trained_at,feature_name) DO UPDATE SET "
-                    "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,model_type=EXCLUDED.model_type,"
+                    "ON CONFLICT (trained_at,feature_name,model_type) DO UPDATE SET "
+                    "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,"
                     "sample_size=EXCLUDED.sample_size,in_sample_hit_rate=EXCLUDED.in_sample_hit_rate"),
                     {"ta": today, "fn": fname, "w": round(coef, 6), "c": round(coef, 6),
                      "mt": "ridge"[:20], "ss": len(X), "ish": round(blend_test_r2, 4),
@@ -932,7 +932,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
             conn.execute(text(
                 "INSERT INTO model_weights_by_date (trained_at, feature_name, weight, coefficient, model_type, notes) "
                 "VALUES (:ta, '__scaler_stats__', 0, 0, 'scaler', :nt) "
-                "ON CONFLICT (trained_at, feature_name) DO UPDATE SET notes=EXCLUDED.notes, model_type='scaler'"
+                "ON CONFLICT (trained_at, feature_name, model_type) DO UPDATE SET notes=EXCLUDED.notes"
             ), {"ta": today, "nt": scaler_stats})
             conn.commit()
 
@@ -959,12 +959,12 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         with db_conn() as conn:
             for fn, w in corr_w.items():
                 conn.execute(text("INSERT INTO model_weights_by_date "
-                    "(trained_at,feature_name,weight,coefficient,sample_size,in_sample_hit_rate,notes) "
-                    "VALUES (:ta,:fn,:w,:c,:ss,:ish,:nt) "
-                    "ON CONFLICT (trained_at,feature_name) DO UPDATE SET "
+                    "(trained_at,feature_name,weight,coefficient,model_type,sample_size,in_sample_hit_rate,notes) "
+                    "VALUES (:ta,:fn,:w,:c,:mt,:ss,:ish,:nt) "
+                    "ON CONFLICT (trained_at,feature_name,model_type) DO UPDATE SET "
                     "weight=EXCLUDED.weight,coefficient=EXCLUDED.coefficient,"
                     "sample_size=EXCLUDED.sample_size,in_sample_hit_rate=EXCLUDED.in_sample_hit_rate"),
-                    {"ta": today, "fn": fn, "w": w, "c": w, "ss": len(X), "ish": 0,
+                    {"ta": today, "fn": fn, "w": w, "c": w, "mt": "logistic", "ss": len(X), "ish": 0,
                      "nt": "Correlation fallback (no sklearn)"})
             conn.commit()
         return {"status": "correlation_fallback", "samples": len(X), "mean_return_pct": round(y_mean, 2)}

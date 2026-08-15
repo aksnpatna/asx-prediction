@@ -4,6 +4,29 @@
 
 ---
 
+## Current Performance Snapshot (updated 2026-08-15, after Fix 26)
+
+> **Critical context:** Fix 20 found that all Fix 1–19 metrics were measured on
+> the 2015–2016 training window (ASC LIMIT bug). The table below is the honest
+> modern-window state. Nothing degraded: the old "base" numbers were validations
+> on 2015–2016 rows, not live 2026 performance.
+
+| Metric | Old "base" (2015–2016 window) | Current (modern window) |
+|---|---|---|
+| Production model | LogisticRegression + ridge blend | LightGBM + proba-only blend (ridge excluded by measurement) |
+| Production split (daily 80/20) | AUC 0.645, top decile 46.0% | **AUC 0.7398, top decile 58.1%**, bottom 2.9%, spread 55.2pp (base 21.3%) |
+| Training window | 2015-03 → 2016-08 | 2025-10 → 2026-05 (200K most-recent rows) |
+| WFO folds (cross-period OOS) | 2022: AUC 0.478 (logistic) | 2022: 0.572 / 2023: 0.564 / 2024: 0.728 / recent: 0.684 |
+| First-touch EV per trade (top decile) | +0.35% (stale window) | +1.10% (recent fold, before costs) |
+| Backtest P&L (2022→2026, WFO scores) | RSI-proxy + random exits (invalid) | +70.8% total / +15.5% p.a. / Sharpe 1.36 / maxDD 4.7% (with caveats, see Fix 25) |
+| Calibration | none | OOB isotonic with Brier self-guard |
+| Deployment protection | none | Bear breaker: VIX ≥ 25 AND XJO < SMA200 blocks new entries |
+
+**Live model today:** LGBM artifact (sha256-verified, mtime-refreshed) trained
+2026-08-15; logistic fallback also retrained on the modern window.
+
+---
+
 ## Baseline (2026-08-13 07:00 AEST)
 
 | Metric | Value |

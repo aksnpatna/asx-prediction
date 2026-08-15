@@ -743,11 +743,18 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
     try:
         with db_conn() as conn:
             rows = conn.execute(
-                text(f"SELECT features, CAST({target_col} AS INTEGER) FROM model_training_set "
+                # Fix 20: most recent 100K rows (was ASC LIMIT → earliest 2015
+                # rows). Subquery keeps chronological ASC order for the split.
+                text(f"SELECT features, CAST({target_col} AS INTEGER), signal_date, "
+                     "symbol, entry_price FROM ("
+                     f"SELECT features, {target_col}, signal_date, symbol, entry_price, "
+                     "forward_peak_return_63d, "
+                     "forward_return_63d FROM model_training_set "
                      "WHERE features IS NOT NULL AND forward_peak_return_63d IS NOT NULL "
                      "AND ABS(forward_peak_return_63d) <= 500 "
                      "AND ABS(forward_return_63d) <= 500 "
-                     "ORDER BY signal_date ASC LIMIT 100000")
+                     "ORDER BY signal_date DESC LIMIT 100000) t "
+                     "ORDER BY signal_date ASC")
             ).fetchall()
     except Exception as e:
         print(f"[Fit] DB read: {e}")
@@ -757,15 +764,35 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         print(f"[Fit] {len(rows)} < {min_samples} — insufficient")
         return None
 
-    X_list, y_list = [], []
+    # ── Fix 23: fill fundamentals from the same DB maps the classifier uses ──
+    # Previously the ensemble trained on raw matrix JSON where EODHD +
+    # historical fundamental features were 0.0 → all 14 dropped as
+    # zero-variance → scaler stats inconsistent with the classifier's weights.
+    from smsf_classifier import (
+        _load_latest_fundamentals, _load_historical_fundamentals,
+        _load_eodhd_features, _load_eps_history, _fill_fundamentals,
+        _fill_point_in_time_pe, _fill_historical, _fill_eodhd,
+    )
+    fund_map = _load_latest_fundamentals(db_conn)
+    hist_map = _load_historical_fundamentals(db_conn)
+    eodhd_map = _load_eodhd_features(db_conn)
+    eps_map = _load_eps_history(db_conn)
+
+    X_list, y_list, dates_list = [], [], []
     for row in rows:
         try:
             feats = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+            symbol, entry_price, signal_date = row[3], float(row[4] or 0), row[2]
+            feats = _fill_fundamentals(feats, symbol, fund_map, entry_price)
+            feats = _fill_point_in_time_pe(feats, symbol, signal_date, entry_price, eps_map)
+            feats = _fill_historical(feats, symbol, hist_map)
+            feats = _fill_eodhd(feats, symbol, eodhd_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 continue
             X_list.append(x_row)
             y_list.append(float(row[1]) if row[1] is not None else 0.0)
+            dates_list.append(np.datetime64(signal_date, "D") if signal_date is not None else np.datetime64("NaT"))
         except Exception:
             continue
 
@@ -794,14 +821,11 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
     y_train, y_test = y[:n_train], y[n_train:]
 
     # ── Sample weighting by recency (exponential decay, half-life = 1 year) ──
-    # Rows are sorted by signal_date ASC. Compute weight based on position
-    # relative to the full training span (not raw array index).
-    n_all = len(X)
-    total_days = 9 * 365  # approximate 9yr span
+    # Fix 20: weights computed from actual signal dates (the old position-based
+    # mapping assumed a 9-year span; the modern window is ~10 months).
+    dates_arr = np.array(dates_list, dtype="datetime64[D]")
+    days_old = (dates_arr.max() - dates_arr).astype(float)
     half_life = 365  # 1 calendar year
-    positions = np.arange(n_all)[::-1]  # newest sample = 0 position, oldest = n_all
-    # Map position to approximate days old
-    days_old = positions / n_all * total_days
     sample_weights = np.power(0.5, days_old / half_life)
     sample_weights = sample_weights / sample_weights.mean()
     w_train = sample_weights[:n_train]

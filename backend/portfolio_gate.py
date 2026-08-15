@@ -5,7 +5,16 @@ Consolidated single source of truth for SMSF position limits.
 All other docs reference this module.
 """
 
+import os
 from typing import Dict, List, Optional
+
+# ── Bear-market deployment breaker (Fix 24) ─────────────────────────────────
+# Blocks NEW entries when VIX >= threshold AND XJO is below its SMA200.
+# Measured basis: 2022 bear fold top-decile hit rate 20.4% (Fix 15) and the
+# regime experiment (Fix 21) showed no ranking edge survives deep bear windows.
+# Env-tunable; default matches the strategy review's proposal.
+BEAR_BREAKER_ENABLED = os.getenv("BEAR_BREAKER_ENABLED", "1") == "1"
+BEAR_BREAKER_VIX = float(os.getenv("BEAR_BREAKER_VIX", "25"))
 
 # ── Hard caps (v2: risk-parity aligned) ─────────────────────────────────────
 MAX_SATELLITE_POSITIONS = 12
@@ -33,7 +42,24 @@ SECTOR_CAPS: Dict[str, float] = {
 
 class PortfolioGate:
     def __init__(self):
-        pass
+        self._market_context = None
+
+    def set_market_context(self, vix_level: Optional[float] = None,
+                           xjo_above_sma200: Optional[bool] = None) -> None:
+        """Point-in-time macro state; call before can_open_position each batch.
+        Callers that never set context are unaffected (breaker stays inactive)."""
+        self._market_context = {
+            "vix": vix_level,
+            "xjo_above_sma200": xjo_above_sma200,
+        }
+
+    def bear_breaker_active(self) -> bool:
+        """VIX >= BEAR_BREAKER_VIX AND XJO below SMA200 -> block new entries."""
+        if not BEAR_BREAKER_ENABLED or not self._market_context:
+            return False
+        vix = self._market_context.get("vix")
+        xjo = self._market_context.get("xjo_above_sma200")
+        return (vix is not None and vix >= BEAR_BREAKER_VIX) and (xjo is not None and not xjo)
 
     def can_open_position(
         self,
@@ -48,6 +74,14 @@ class PortfolioGate:
     ) -> Dict:
         max_single = MAX_SINGLE_POSITION_PCT_CORE if is_core else MAX_SINGLE_POSITION_PCT
         max_positions = MAX_TOTAL_POSITIONS if is_core else MAX_SATELLITE_POSITIONS
+
+        if self.bear_breaker_active():
+            vix = self._market_context.get("vix")
+            return {
+                "approved": False,
+                "reason": f"BEAR_BREAKER: VIX {vix:.1f} >= {BEAR_BREAKER_VIX:.0f} and XJO below SMA200 — no new entries",
+                "checks_passed": 0,
+            }
 
         checks = [
             (len(open_positions) >= max_positions,

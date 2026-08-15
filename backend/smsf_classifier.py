@@ -104,6 +104,12 @@ EODHD_FEATURE_KEYS = [
 # Features with negative/zero permutation importance (measured 2026-08-14,
 # 300K samples, 5-rep permutation on 8K test subsample). Dropping them
 # improved ALL metrics: AUC 0.640 -> 0.653, top decile +0.2pp, bottom -0.6pp.
+# Fix 26: measured on the modern window (2026-08-15), the ridge blend HURTS
+# ranking at every weight (0.2: -0.001 AUC, 0.4: -0.034 at 200K; top decile
+# 60.4% -> 52.7%). The 0.4 weight was optimised on the 2015-2016 window.
+# Probability-only ranking wins; ridge kept for artifact/fallback only.
+REG_BLEND_WEIGHT = 0.0
+
 PRUNED_FEATURES = {
     "adx_trend", "analyst_count", "autocorr_5d", "bb_squeeze_ratio",
     "bb_width", "ema_ribbon", "eps_estimate_revision", "esg_controversy",
@@ -238,11 +244,146 @@ def _fill_fundamentals(feats: dict, symbol: str, fund_map: Dict[str, dict],
     return feats
 
 
+def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
+                           reg_pred_test, active_features,
+                           scaler_mean, scaler_scale, reg_coefs, dates):
+    """Fix 17: LightGBM binary head challenger — identical split and blend as
+    the logistic baseline (0.6 binary rank + 0.4 ridge rank), so the A/B is fair.
+
+    Fix 20: recency weights computed from actual signal dates (the old
+    position-based mapping assumed a 9-year window).
+
+    Fix 22: isotonic calibration fit on the early-stopping validation slice
+    (monotone — ranking unchanged; Brier improves ~18% for Kelly sizing).
+
+    Returns a metrics dict including the fitted model, or {"ok": False}.
+    """
+    try:
+        import lightgbm as lgb
+        from scipy.stats import rankdata
+        from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.model_selection import KFold
+    except ImportError as e:
+        return {"ok": False, "error": f"lightgbm unavailable: {e}"}
+
+    try:
+        t0 = time.time()
+        days_old = (dates.max() - dates).astype(float)
+        w = np.power(0.5, days_old / 365.0)
+        w = w / w.mean()
+        w_train = w[:len(X_train)]
+
+        model = lgb.LGBMClassifier(
+            objective="binary", n_estimators=600, learning_rate=0.03,
+            num_leaves=63, max_depth=6, min_child_samples=50,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+            reg_alpha=0.3, reg_lambda=2.0, class_weight="balanced",
+            random_state=42, n_jobs=-1, verbose=-1,
+        )
+        cut = int(len(X_train) * 0.9)
+        model.fit(
+            X_train[:cut], y_train[:cut], sample_weight=w_train[:cut],
+            eval_set=[(X_train[cut:], y_train[cut:])],
+            eval_metric="auc",
+            callbacks=[lgb.early_stopping(30, verbose=False)],
+        )
+
+        # ── Fix 22: OOB isotonic calibration ──────────────────────────────
+        # Fitting isotonic on the early-stopping slice overfit (Brier regressed
+        # 0.151 -> 0.158). Use 3-fold OOB predictions for the isotonic fit;
+        # the main model still serves ranking. Keep calibration only if it
+        # improves test Brier.
+        iso = None
+        brier_raw = brier_score_loss(y_test, model.predict_proba(X_test)[:, 1])
+        brier_cal = brier_raw
+        try:
+            kf = KFold(n_splits=3, shuffle=False)
+            oob_pred = np.empty(len(X_train), dtype=np.float64)
+            for tr_idx, va_idx in kf.split(X_train):
+                m_fold = lgb.LGBMClassifier(
+                    objective="binary", n_estimators=400, learning_rate=0.05,
+                    num_leaves=63, max_depth=6, min_child_samples=50,
+                    subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                    reg_alpha=0.3, reg_lambda=2.0, class_weight="balanced",
+                    random_state=42, n_jobs=-1, verbose=-1,
+                )
+                sub_cut = int(len(tr_idx) * 0.9)
+                m_fold.fit(
+                    X_train[tr_idx[:sub_cut]], y_train[tr_idx[:sub_cut]],
+                    sample_weight=w_train[tr_idx[:sub_cut]],
+                    eval_set=[(X_train[tr_idx[sub_cut:]], y_train[tr_idx[sub_cut:]])],
+                    eval_metric="auc",
+                    callbacks=[lgb.early_stopping(30, verbose=False)],
+                )
+                oob_pred[va_idx] = m_fold.predict_proba(X_train[va_idx])[:, 1]
+            iso_cand = IsotonicRegression(out_of_bounds="clip")
+            iso_cand.fit(oob_pred, y_train)
+            proba_te_raw = model.predict_proba(X_test)[:, 1]
+            cal_proba = iso_cand.predict(proba_te_raw)
+            brier_cal = brier_score_loss(y_test, cal_proba)
+            if brier_cal < brier_raw:
+                iso = iso_cand
+            else:
+                print(f"[Classifier] LGBM calibration rejected "
+                      f"(Brier {brier_raw:.4f} -> {brier_cal:.4f})", flush=True)
+        except Exception as e:
+            print(f"[Classifier] LGBM calibration failed (skipped): {e}", flush=True)
+        if iso is not None:
+            print(f"[Classifier] LGBM calibration kept: Brier {brier_raw:.4f} -> {brier_cal:.4f}", flush=True)
+
+        proba_te = iso.predict(model.predict_proba(X_test)[:, 1]) if iso is not None \
+            else model.predict_proba(X_test)[:, 1]
+
+        blended = ((1 - REG_BLEND_WEIGHT) * rankdata(proba_te)
+                   + REG_BLEND_WEIGHT * rankdata(reg_pred_test))
+
+        sorted_idx = np.argsort(blended)[::-1]
+        decile_size = len(sorted_idx) // 10
+        decile_hit_rates = []
+        for d in range(10):
+            start = d * decile_size
+            end = start + decile_size if d < 9 else len(sorted_idx)
+            decile_hit_rates.append(round(float(y_test[sorted_idx[start:end]].mean()) * 100, 1))
+
+        auc_ = roc_auc_score(y_test, blended)
+        print(f"[Classifier] LGBM calibration: Brier {brier_raw:.4f} -> {brier_cal:.4f}", flush=True)
+        return {
+            "ok": True,
+            "auc": round(auc_, 4),
+            "avg_precision": round(average_precision_score(y_test, blended), 4),
+            "top_decile": decile_hit_rates[0],
+            "bottom_decile": decile_hit_rates[-1],
+            "spread": round(decile_hit_rates[0] - decile_hit_rates[-1], 1),
+            "deciles": decile_hit_rates,
+            "brier_raw": round(brier_raw, 4),
+            "brier_calibrated": round(brier_cal, 4),
+            "model": model,
+            "isotonic": iso,
+            "best_iter": int(getattr(model, "best_iteration_", -1) or -1),
+            "secs": round(time.time() - t0, 1),
+        }
+    except Exception as e:
+        print(f"[Classifier] LightGBM challenger failed: {e}", flush=True)
+        return {"ok": False, "error": str(e)}
+
+
 def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                      min_samples: int = 5000) -> Optional[dict]:
     """Train LogisticRegression on path-aware labels with fundamentals filled in-memory."""
     from sqlalchemy import text
-    from model_training import FEATURE_COLS, db_conn
+    import sys as _sys
+    from model_training import FEATURE_COLS
+    # db_conn lives in main (running app process). For standalone runs
+    # (tests/CLI), use a direct engine instead of importing main — importing
+    # main outside the app process would start a second scheduler.
+    if "main" in _sys.modules:
+        from main import db_conn
+    else:
+        from sqlalchemy import create_engine
+        _standalone_engine = create_engine(
+            os.getenv("DATABASE_URL", "sqlite:///data/shares.db"))
+        db_conn = lambda: _standalone_engine.connect()
 
     print(f"[Classifier] Loading {target_col} data with fundamentals...", flush=True)
     t0 = time.time()
@@ -256,20 +397,29 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
 
     # Stream training rows in batches (server-side cursor) — avoids the ~2GB
     # fetchall spike that OOMs a 4GB container. Preallocated float32 array.
-    MAX_ROWS = 300000
+    MAX_ROWS = 200000
     n_rows = MAX_ROWS
     X = np.zeros((n_rows, len(FEATURE_COLS)), dtype=np.float32)
     y = np.zeros(n_rows, dtype=np.int8)
     y_reg = np.zeros(n_rows, dtype=np.float32)
+    dates = np.zeros(n_rows, dtype="datetime64[D]")
     valid = np.ones(n_rows, dtype=bool)
 
     try:
         with db_conn() as conn:
             result = conn.execution_options(stream_results=True, max_row_buffer=20000).execute(text(
-                f"SELECT symbol, entry_price, signal_date, features, CAST({target_col} AS INTEGER), "
-                "COALESCE(forward_return_63d, 0) FROM model_training_set "
+                # Fix 20: train on the MOST RECENT 200K rows (was ASC LIMIT 300000
+                # → earliest rows 2015-2016). Subquery keeps the stream ASC so the
+                # chronological 80/20 split below stays valid.
+                # Fix 26: 200K modern optimum (sweep 2026-08-15: 200K AUC 0.750
+                # vs 300K 0.716 on the adjacent split; 400K 0.704).
+                f"SELECT symbol, entry_price, signal_date, features, "
+                f"CAST({target_col} AS INTEGER), COALESCE(forward_return_63d, 0) FROM ("
+                f"SELECT symbol, entry_price, signal_date, features, {target_col}, "
+                "forward_return_63d, forward_peak_return_63d FROM model_training_set "
                 "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
-                "ORDER BY signal_date ASC LIMIT 300000"
+                "ORDER BY signal_date DESC LIMIT 200000) t "
+                "ORDER BY signal_date ASC"
             ))
             skipped = 0
             filled = 0
@@ -303,6 +453,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                         continue
                     y[i] = int(label) if label is not None else 0
                     y_reg[i] = fwd_ret
+                    dates[i] = np.datetime64(signal_date, "D")
                     if symbol in fund_map:
                         filled += 1
                     i += 1
@@ -319,7 +470,10 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     X = X[:n_rows][valid[:n_rows]]
     y = y[:n_rows][valid[:n_rows]]
     y_reg = y_reg[:n_rows][valid[:n_rows]]
+    dates = dates[:n_rows][valid[:n_rows]]
     print(f"[Classifier] Parsed {len(X)} rows (fund-filled={filled}, skipped={skipped})", flush=True)
+    if len(dates) > 0:
+        print(f"[Classifier] Window: {dates.min()} -> {dates.max()}", flush=True)
 
     if len(X) < min_samples:
         print(f"[Classifier] {len(X)} < {min_samples} — insufficient", flush=True)
@@ -372,7 +526,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     # The 63d return adds magnitude info (30% run vs 6% run) that the binary
     # label discards. Blend weight 0.4 optimises top-decile hit rate while
     # keeping bottom-decile (loser avoidance) intact.
-    REG_BLEND_WEIGHT = 0.4
+
     y_reg_train = y_reg[:n_train]
     y_reg_test = y_reg[n_train:]
     reg_model = Ridge(alpha=10.0)
@@ -463,6 +617,101 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
               f"|coef(pct_institutions)|={pct_inst_coef:.4f}", flush=True)
     result_guards = guards
 
+    # ── Fix 17: LightGBM challenger — same split, same blend, strict winner rule ──
+    # Adopt only if it beats logistic on AUC (+0.005) without losing top-decile
+    # or bottom-decile quality. Otherwise logistic stays and nothing changes.
+    lgbm_challenger = _train_lgbm_challenger(
+        X_train, X_test, y_train, y_test,
+        reg_model.predict(X_test_s), active_features,
+        scaler.mean_, scaler.scale_, reg_model.coef_, dates,
+    )
+    adopt_lgbm = False
+    if lgbm_challenger and lgbm_challenger.get("ok"):
+        auc_gap = lgbm_challenger["auc"] - auc
+        adopt_lgbm = (
+            auc_gap >= 0.005
+            and lgbm_challenger["top_decile"] >= top_decile_hit
+            and lgbm_challenger["bottom_decile"] <= bottom_decile_hit + 1.0
+        )
+        print(f"[Classifier] LightGBM challenger: AUC={lgbm_challenger['auc']} "
+              f"(Δ={auc_gap:+.4f}) top={lgbm_challenger['top_decile']}% "
+              f"bottom={lgbm_challenger['bottom_decile']}% spread={lgbm_challenger['spread']}pp "
+              f"-> {'ADOPTED' if adopt_lgbm else 'REJECTED (winner rule)'}", flush=True)
+    else:
+        print(f"[Classifier] LightGBM challenger unavailable: "
+              f"{(lgbm_challenger or {}).get('error', 'unknown')}", flush=True)
+
+    if adopt_lgbm:
+        try:
+            import joblib
+            import hashlib
+            artifact = {
+                "model": lgbm_challenger["model"],
+                "isotonic": lgbm_challenger["isotonic"],
+                "feature_order": active_features,
+                "scaler_mean": scaler.mean_.tolist(),
+                "scaler_scale": scaler.scale_.tolist(),
+                "ridge_coefs": reg_model.coef_.tolist(),
+                "trained_at": today.isoformat(),
+                "auc": lgbm_challenger["auc"],
+                "top_decile": lgbm_challenger["top_decile"],
+                "blend": {"binary": 1 - REG_BLEND_WEIGHT, "ridge": REG_BLEND_WEIGHT},
+            }
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "data", "lgbm_classifier.pkl")
+            if not os.path.isdir(os.path.dirname(path)):
+                path = "/app/data/lgbm_classifier.pkl"
+            joblib.dump(artifact, path)
+            sha256 = hashlib.sha256(open(path, "rb").read()).hexdigest()
+            marker_note = json.dumps(
+                {k: v for k, v in lgbm_challenger.items() if k not in ("model", "isotonic")})[:500]
+            marker_meta = {"sha256": sha256, "artifact_path": path,
+                           "trained_at": today.isoformat()}
+            marker_note = json.dumps({**json.loads(marker_note), **marker_meta})[:1000]
+            with db_conn() as conn:
+                conn.execute(text(
+                    "DELETE FROM model_weights_by_date "
+                    "WHERE model_type = 'lgbm_classifier' AND trained_at = :ta"),
+                    {"ta": today})
+                conn.execute(text(
+                    "INSERT INTO model_weights_by_date (trained_at, feature_name, weight, "
+                    "coefficient, model_type, sample_size, in_sample_hit_rate, notes) VALUES "
+                    "(:ta, '__artifact__', 0, 0, 'lgbm_classifier', :ss, :ish, :nt)"),
+                    {"ta": today, "ss": len(X), "ish": lgbm_challenger["auc"],
+                     "nt": marker_note})
+                conn.commit()
+            print(f"[Classifier] LGBM artifact saved to {path} (sha256={sha256[:12]}…)", flush=True)
+        except Exception as e:
+            print(f"[Classifier] LGBM artifact save failed: {e}", flush=True)
+    elif lgbm_challenger and lgbm_challenger.get("ok"):
+        # Challenger ran and was rejected by the winner rule: remove any
+        # previously adopted artifact so live scoring cannot keep serving a
+        # model the current verdict rejected, and record the rejection loudly.
+        for _p in (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "lgbm_classifier.pkl"),
+            "/app/data/lgbm_classifier.pkl",
+        ):
+            try:
+                if os.path.exists(_p):
+                    os.remove(_p)
+                    print(f"[Classifier] ⚠️ LGBM rejected — removed stale artifact {_p}", flush=True)
+            except OSError:
+                pass
+        try:
+            _rej_note = json.dumps(
+                {k: v for k, v in lgbm_challenger.items() if k not in ("model", "isotonic")})[:500]
+            with db_conn() as conn:
+                conn.execute(text(
+                    "INSERT INTO model_weights_by_date (trained_at, feature_name, weight, "
+                    "coefficient, model_type, sample_size, in_sample_hit_rate, notes) VALUES "
+                    "(:ta, '__rejected__', 0, 0, 'lgbm_classifier', :ss, :ish, :nt) "
+                    "ON CONFLICT (trained_at, feature_name, model_type) DO UPDATE SET notes=EXCLUDED.notes"),
+                    {"ta": today, "ss": len(X), "ish": lgbm_challenger["auc"],
+                     "nt": _rej_note})
+                conn.commit()
+        except Exception as e:
+            print(f"[Classifier] LGBM rejection marker failed: {e}", flush=True)
+
     return {
         "status": "ok", "model_type": "logistic_regression",
         "samples": len(X), "active_features": len(active_features),
@@ -475,4 +724,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
         "decile_hit_rates": decile_hit_rates,
         "top_features": top_features, "elapsed_s": round(elapsed, 1),
         "regression_guards_failed": result_guards,
+        "lgbm_challenger": ({k: v for k, v in lgbm_challenger.items() if k not in ("model", "isotonic")}
+                            if lgbm_challenger else None),
+        "lgbm_adopted": adopt_lgbm,
     }

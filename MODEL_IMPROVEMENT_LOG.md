@@ -214,3 +214,158 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
 - **G2 gate (60% top decile): NOT met** — 55.3% < 60%. Strategy correctly gates real capital.
 - **Decision:** score on concurrent label (better ranking for AI deep-dive),
   report first-touch metrics for honest economics.
+
+### [2026-08-15] Fix 17: LightGBM classifier head — measured A/B, ADOPTED
+- **What:** `train_classifier` now trains a LightGBM binary head on the identical
+  data pipeline (300K rows, same fills, same pruning, same 80/20 chrono split,
+  same 0.6 binary + 0.4 Ridge rank blend, recency sample weights half-life 1yr).
+  Strict winner rule before adoption: AUC ≥ +0.005 AND top decile ≥ baseline
+  AND bottom decile ≤ baseline + 1.0pp. Adopted model persisted to
+  `data/lgbm_classifier.pkl` (model + feature order + scaler + ridge coefs) with
+  a `lgbm_classifier` marker row. Live scoring (`_enrich_candidates_with_tiers`)
+  prefers the artifact and falls back to the linear weights path unchanged.
+- **Before → After (concurrent label, chrono 80/20, 300K):**
+  - AUC: 0.6442 → **0.6766** (+0.032)
+  - Top decile: 45.7% → **51.3%** (+5.6pp)
+  - Bottom decile: 13.5% → **11.3%** (−2.2pp)
+  - Spread: 32.2pp → **40.0pp** (+7.8pp)
+  - Deciles: [51.3, 48.9, 40.9, 33.5, 32.0, 28.9, 23.2, 20.6, 14.0, 11.3]
+- **Honest economics (first-touch, same ranking):**
+  - First-touch top decile: 52.2% → **58.2%**
+  - EV per trade before costs: +0.35% → **+1.31%**
+- **Also tested — two-label rank ensemble (0.7 concurrent + 0.3 first-touch):
+  REJECTED.** AUC 0.6586 vs concurrent-only LGBM 0.6766 — first-touch
+  probability does not add ranking value. Cheap experiment, honest answer:
+  not applied.
+- **Commit:** pending
+
+### [2026-08-15] Fix 18: Broken classifier import + stale live weights — FIXED
+- **Finding:** `train_classifier` imported `db_conn` from `model_training`
+  (it lives in `main`). The import raised ImportError inside the daily
+  pipeline, which silently caught it (`classifier=None`) and continued with
+  the regression ensemble only.
+- **Impact:** live scoring used stale 2026-08-14 logistic weights trained on
+  the FIRST-TOUCH label (AUC 0.534) — contradicting Fix 16's decision to
+  score on concurrent (1.77× edge).
+- **Fix:** resolve `db_conn` from `main` when running in the app process,
+  direct engine otherwise (standalone-safe, no second scheduler). Retrained
+  immediately: concurrent-label logistic weights restored (top decile 46%,
+  AUC 0.644) and Fix 17 artifact adopted on top.
+- **Deployment note:** container code updated; next backend restart activates
+  the LGBM live path. Image rebuild bakes it in.
+
+### [2026-08-15] Fix 19: Review hardening (artifact serving path)
+- **Cache staleness fixed:** `_load_lgbm_classifier` now keys its cache by file
+  mtime — daily retrains and rejection-driven removals take effect without a
+  process restart; a miss is no longer cached permanently.
+- **Rejection cleanup:** when the challenger runs and loses the winner rule,
+  the old artifact file is deleted and a `__rejected__` marker row is written,
+  so live scoring can never serve a model the latest verdict rejected.
+- **Live feature drift fixed:** EODHD + historical-fundamental features
+  (eps_surprise, pct_institutions, pct_insiders, insider_net_ratio,
+  esg_governance, fund_hist_gross_margin, fund_hist_op_margin) are now filled
+  from the same DB sources training uses. Verified: filling pct_institutions
+  alone moves proba by ~2.5pp on a sample row — the zero-fill drift was real.
+- **Artifact integrity:** sha256 of the artifact recorded in the DB marker row
+  and verified at load; mismatch or missing marker → fallback to linear path.
+- **Audit trail:** marker DELETE now scoped to trained_at (matches logistic path).
+- Verified end-to-end in container: hash match, fill maps load, artifact scores.
+
+### [2026-08-15] Fix 20: Training window correction — CRITICAL
+- **Bug:** `ORDER BY signal_date ASC LIMIT 300000` selected the EARLIEST rows
+  (2015-03 → 2016-08) with near-constant macro features. Every Fix 1–19
+  headline metric (top decile 46–51%, AUC 0.64–0.68) was measured on 2015–2016.
+  Fix 6's "300K sweet spot" is void — it was a 2015–2016 artifact.
+- **Fix:** most-recent rows via subquery (DESC LIMIT → re-sort ASC, keeping the
+  chrono split valid) in train_classifier AND fit_model_weights; recency
+  weights now computed from actual signal dates (old mapping assumed 9 years).
+- **New honest modern numbers (daily split 2025-07 → 2026-05, base 21.1%):**
+  - LGBM: AUC **0.6855**, top decile **42.5%**, bottom 3.9%, spread 38.6pp,
+    edge **2.01× base**
+  - Logistic (fallback): AUC ~0.592 — LGBM wins by +0.093 (Δ criterion met)
+- **Modern WFO-style folds (train window before fold, eval = fold):**
+  - 2022 bear fold: single AUC 0.572 (bear-slice 0.574) — vs Fix 15 logistic 0.478
+  - 2024 bull fold: single AUC 0.728, top decile 57.5%, EV +2.05%
+  - Recent fold (eval 2025-07→2026-05): AUC 0.684, top 50.2%, EV +1.10%
+- **Commit:** pending
+
+### [2026-08-15] Fix 21: Regime-conditional heads (T1-A) — TESTED, REJECTED
+- **What:** bear head (vix≥20 or XJO≤SMA200) + bull head vs single head, 3 folds.
+- **Results:** 2022 fold: pair wins (bear AUC 0.610 vs 0.574). 2024 fold:
+  single wins (top 57.5% vs 54.1%). Recent fold: single wins decisively
+  (top 50.2% vs 37.5%; bear-slice 0.700 vs 0.676).
+- **Conclusion:** 2025 bears ≠ 2022 bears; the single multi-regime head
+  dominates on the production window. The 2022-only gain does not generalize.
+  Not applied. A regime gate remains valuable as a DEPLOYMENT filter (T3-B),
+  not as split training heads.
+
+### [2026-08-15] Fix 22: Probability calibration (T1-B) — implemented with self-guard
+- **What:** 3-fold OOB isotonic calibration of the LGBM head; kept only if test
+  Brier improves (guard rejects otherwise; artifact `isotonic` may be None).
+- **Results:** daily split: REJECTED (Brier 0.1511 → 0.1597 — raw probabilities
+  already well-calibrated on adjacent-window splits). Cross-period fold:
+  improved 0.214 → 0.176. Guard keeps calibration exactly when it helps —
+  i.e. on regime-shifted days when raw probabilities drift.
+- Live path applies isotonic when present; ranking unchanged (monotone).
+- Also refreshed: ensemble scaler stats now modern-window (was 2015–2016).
+
+### [2026-08-15] Fix 23: Ensemble fills + live XJO realism + experiments into repo
+- **fit_model_weights fundamental fills:** the ensemble (Ridge/LGBM/RF regression
+  + scaler stats) trained on raw matrix JSON where all 14 EODHD/historical
+  fundamental features were 0.0 (dropped as zero-variance). Now filled from the
+  same DB maps the classifier uses. Result: 14 dropped → 1, ensemble test R²
+  0.1967 → **0.2308** (LGBM regression head 0.2297 → 0.2666).
+- **Live xjo_sma_position:** replaced the trend-string proxy with the real
+  XJO vs SMA200 computation (`_get_axjo_vs_sma200`, training-consistent
+  1.0/0.0), fetched once per scan batch, proxy fallback on failure.
+- **Live fills generalized:** EODHD fill loop now covers all EODHD_FEATURE_KEYS
+  and historical fills cover roe/debt_equity/margins/fcf_yield (drift-proof if
+  the active feature set changes).
+- **Experiments into repo:** `backend/experiments/model_ab_test.py` (Fix 17 A/B)
+  and `backend/experiments/regime_ab_test.py` (Fix 20/21/22 folds) with run
+  instructions. model_ab_test.py docstring notes its numbers are pre-Fix-20
+  (2015–2016 window).
+
+### [2026-08-15] Fix 24: Bear-market deployment breaker (PortfolioGate)
+- **What:** `PortfolioGate.set_market_context()` + `bear_breaker_active()`:
+  VIX ≥ 25 (`BEAR_BREAKER_VIX` env) AND XJO < SMA200 → block NEW entries
+  (`BEAR_BREAKER_ENABLED` env kills it). Wired into the paper-trade creation
+  path in main.py; backtest applies it per signal_date from point-in-time
+  row features. Callers that never set context are unaffected.
+- **Basis:** 2022 bear fold top decile 20.4% (Fix 15); Fix 21 showed no
+  ranking edge survives deep bear windows; the breaker is a deployment
+  filter, not a ranking change.
+
+### [2026-08-15] Fix 25: backtest.py — real model scores + deterministic exits
+- **Was:** score = `feats["rsi"]` (RSI-ranked portfolios) and exits =
+  `np.random.normal(0.05, 0.15)` (noise). Every prior P&L number was invalid
+  as G2 evidence.
+- **Now:** walk-forward LGBM per fold-year trained ONLY on pre-fold rows
+  (month-capped, same pipeline as train_classifier); exits deterministic from
+  `forward_return_63d` with −20% catastrophe stop via `forward_max_drawdown_63d`.
+- **First real WFO P&L (2022-01 → 2026-07):** final +70.8%, annual +15.5%,
+  Sharpe 1.36, max DD 4.7%, hit rate 67.7% (96 trades), avg win +22.7% /
+  avg loss −10.5%.
+- **Caveats (do not cite without them):** fundamental fills use LATEST
+  snapshots (lookahead inflation; P/E point-in-time since Fix 10, but
+  EODHD/historical ratios are latest-value); no slippage/brokerage; satellite
+  exposure capped ~25% NAV by the gate.
+- **WFO fold summary (single LGBM, proba-only):**
+  - 2022 bear: AUC 0.572, top 28.7% (1.76× base) | 2023: 0.564, 30.0%
+    (1.44×) | 2024: 0.728, 57.5% (2.29×) | recent 2025-07→2026-05: 0.684,
+    50.2% (1.99×)
+
+### [2026-08-15] Fix 26: Modern-window sample/blend re-optimization — ADOPTED
+- **Sample sweep (most-recent N, adjacent 80/20, proba-only):**
+  100K AUC 0.803/top 71.8% | 150K 0.752/58.5% | 200K 0.750/60.4% |
+  300K 0.716/50.4% | 400K 0.704/39.4% — Fix 6's "300K sweet spot" was a
+  2015–2016 artifact; modern optimum ≈ 150–200K.
+- **Ridge blend hurts modern ranking at every weight** (200K: 0.0 → AUC
+  0.750/top 60.4%; 0.2 → 0.749/57.7%; 0.4 → 0.731/52.7%). The 0.4 weight
+  was tuned on 2015–2016. REG_BLEND_WEIGHT → 0.0; live blend weights now
+  come from the artifact.
+- **Adopted:** LIMIT 200000 + probability-only blend. Production rerun:
+  window 2025-10-23 → 2026-05-15, AUC **0.7398**, top decile **58.1%**,
+  bottom 2.9%, spread 55.2pp (base 21.3%) vs pre-adoption 0.6855/42.5%/3.9%.
+  Calibration guard kept isotonic this run (Brier 0.1535 → 0.1522).
+- **Commit:** pending

@@ -2166,6 +2166,75 @@ def _calculate_position_size(price: float, stop_loss_pct: float, account_balance
     }
 
 
+_LGBM_ARTIFACT_CACHE = {"mtime": None, "data": None}
+
+
+def _load_lgbm_classifier():
+    """Load the persisted LightGBM classifier artifact (Fix 17).
+
+    Present only when the daily training's challenger beat the logistic
+    baseline under the winner rule. Returns the artifact dict or None.
+    Cache is keyed by file mtime so the daily retrain (and rejection-driven
+    removal) is picked up without a process restart; a miss is not cached
+    permanently. Any failure returns None so the caller falls back to the
+    linear weights path unchanged.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "lgbm_classifier.pkl")
+    if not os.path.exists(path):
+        path = "/app/data/lgbm_classifier.pkl"
+    if not os.path.exists(path):
+        if _LGBM_ARTIFACT_CACHE["data"] is not None:
+            print("[EnrichTiers] LGBM artifact removed — falling back to linear path")
+            _LGBM_ARTIFACT_CACHE["data"] = None
+            _LGBM_ARTIFACT_CACHE["mtime"] = None
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if _LGBM_ARTIFACT_CACHE["data"] is not None and _LGBM_ARTIFACT_CACHE["mtime"] == mtime:
+        return _LGBM_ARTIFACT_CACHE["data"]
+    try:
+        import joblib
+        import hashlib
+        art = joblib.load(path)
+        required = {"model", "isotonic", "feature_order", "scaler_mean",
+                    "scaler_scale", "ridge_coefs"}
+        if not required.issubset(set(art.keys())):
+            print("[EnrichTiers] LGBM artifact missing keys — ignoring")
+            return None
+        n_feat = len(art["feature_order"])
+        if n_feat != len(art["scaler_mean"]) or n_feat != len(art["ridge_coefs"]):
+            print("[EnrichTiers] LGBM artifact shape mismatch — ignoring")
+            return None
+        # Integrity: the file hash must match the hash recorded by the
+        # training run in the DB marker row. Mismatch or missing marker →
+        # treat as untrusted and fall back.
+        file_sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        marker_sha = None
+        try:
+            from sqlalchemy import text as _text
+            with db_conn() as conn:
+                row = conn.execute(_text(
+                    "SELECT notes FROM model_weights_by_date "
+                    "WHERE model_type = 'lgbm_classifier' AND feature_name = '__artifact__' "
+                    "ORDER BY trained_at DESC LIMIT 1")).fetchone()
+                if row and row[0]:
+                    marker_sha = (json.loads(row[0]) or {}).get("sha256")
+        except Exception:
+            marker_sha = None
+        if not marker_sha or marker_sha != file_sha:
+            print("[EnrichTiers] LGBM artifact hash mismatch or no marker — ignoring")
+            return None
+        _LGBM_ARTIFACT_CACHE["mtime"] = mtime
+        _LGBM_ARTIFACT_CACHE["data"] = art
+        return art
+    except Exception as e:
+        print(f"[EnrichTiers] LGBM artifact load failed: {e}")
+        return None
+
+
 def _enrich_candidates_with_tiers(candidates: list):
     """Compute 51-feature ensemble model score and assign target tier to each candidate.
 
@@ -2193,6 +2262,39 @@ def _enrich_candidates_with_tiers(candidates: list):
     except Exception:
         _weights = {}
         _scaler_stats = None
+
+    # ── Fix 17: prefer persisted LightGBM classifier when the challenger won ──
+    _lgbm_art = None
+    try:
+        _lgbm_art = _load_lgbm_classifier()
+    except Exception:
+        _lgbm_art = None
+    if _lgbm_art is not None:
+        print(f"[EnrichTiers] LGBM classifier active "
+              f"(trained_at={_lgbm_art.get('trained_at')}, "
+              f"AUC={_lgbm_art.get('auc')}, top_decile={_lgbm_art.get('top_decile')}%)")
+
+    # ── Fix 19: fill EODHD + historical fundamental features from the same DB
+    # sources training uses, so the artifact model is not scored on zero-filled
+    # drift for these features (the logistic path benefits too).
+    _eodhd_map = {}
+    _fund_hist_map = {}
+    try:
+        from smsf_classifier import (_load_eodhd_features, _load_historical_fundamentals,
+                                     EODHD_FEATURE_KEYS as _EODHD_KEYS)
+        _eodhd_map = _load_eodhd_features(db_conn)
+        _fund_hist_map = _load_historical_fundamentals(db_conn)
+    except Exception:
+        _EODHD_KEYS = ()
+        pass
+
+    # ── Fix 23: real XJO vs SMA200 (training computes 1.0 above SMA200 else 0.0;
+    # the old trend-string proxy was nearly noise). Fetched once per batch.
+    _xjo_sma_position = None
+    try:
+        _xjo_sma_position = 1.0 if _get_axjo_vs_sma200() >= 0 else 0.0
+    except Exception:
+        _xjo_sma_position = None
 
     for c in candidates:
         confluence = c.get("confluence") or {}
@@ -2258,7 +2360,8 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["max_drawdown_20d"] = feat["dist_from_sma50"] * 0.5
         # Macro features (approximate from market context)
         feat["xjo_momentum_63d"] = float(c.get("sector_perf_1mo", 0) or 0)
-        feat["xjo_sma_position"] = 1.0 if str(c.get("trend", "")) in ("BULLISH", "UP") else 0.0
+        feat["xjo_sma_position"] = _xjo_sma_position if _xjo_sma_position is not None \
+            else (1.0 if str(c.get("trend", "")) in ("BULLISH", "UP") else 0.0)
         feat["xjo_vol_20d"] = feat["hv_20d"]
         feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0)
         # Pure macro features (live values from cached macro data)
@@ -2286,6 +2389,43 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["fund_revenue_growth"] = float(c.get("revenue_growth", 0) or 0)
         feat["fund_beta"] = float(c.get("beta", 1.0) or 1.0)
         feat["fund_pct_from_52w_high"] = float(c.get("pct_from_52w_high", 0) or 0)
+
+        # ── Fix 19: fill features the heuristic dict cannot derive ──
+        _sym = str(c.get("symbol", "") or "")
+        if _eodhd_map:
+            _eh = _eodhd_map.get(_sym)
+            if _eh:
+                for _k in _EODHD_KEYS:
+                    feat[_k] = float(_eh.get(_k, 0) or 0)
+        if _fund_hist_map:
+            _fh = _fund_hist_map.get(_sym)
+            if _fh:
+                feat["fund_hist_roe"] = float(_fh.get("roe", 0) or 0)
+                feat["fund_hist_debt_equity"] = float(_fh.get("debt_equity", 0) or 0)
+                feat["fund_hist_gross_margin"] = float(_fh.get("gross_margin", 0) or 0)
+                feat["fund_hist_op_margin"] = float(_fh.get("op_margin", 0) or 0)
+                if float(_fh.get("market_cap", 0) or 0) > 0 and float(_fh.get("fcf", 0) or 0) > 0:
+                    feat["fund_hist_fcf_yield"] = float(_fh["fcf"]) / float(_fh["market_cap"]) * 100
+        feat["mean_reversion_score"] = 0.0  # no intraday range/volume history live
+
+        # ── Fix 17: LGBM path — proba + ridge head over artifact feature order ──
+        if _lgbm_art is not None:
+            try:
+                _order = _lgbm_art["feature_order"]
+                _vals = np.array([float(feat.get(col, 0.0) or 0.0)
+                                  for col in _order], dtype=np.float64)
+                _raw = float(
+                    _lgbm_art["model"].predict_proba(_vals.reshape(1, -1))[0, 1])
+                # Fix 22: isotonic calibration (monotone — ranking unchanged)
+                if _lgbm_art.get("isotonic") is not None:
+                    _raw = float(_lgbm_art["isotonic"].predict([_raw])[0])
+                c["_lgbm_proba"] = _raw
+                _mean = np.array(_lgbm_art["scaler_mean"], dtype=np.float64)
+                _scale = np.array(_lgbm_art["scaler_scale"], dtype=np.float64)
+                _vals = np.where(_scale > 1e-9, (_vals - _mean) / _scale, 0.0)
+                c["_ridge_raw"] = float(np.dot(_lgbm_art["ridge_coefs"], _vals))
+            except Exception:
+                c["_lgbm_proba"] = None
 
         model_score_raw = 0.0
         _scaler_ok = False
@@ -2323,6 +2463,29 @@ def _enrich_candidates_with_tiers(candidates: list):
 
         c["_model_score"] = round(model_score_raw, 4)
         c["_model_confidence"] = min(99, max(1, round(max(0, model_score_raw) * 100)))
+
+    # ── Fix 17: LGBM path — rank-blend proba (0.6) + ridge head (0.4) ──────
+    # Mirrors training-time blending exactly (batch-relative ranks, as the
+    # tier cutoffs below are percentile-based on this same batch).
+    if _lgbm_art is not None:
+        _scored = [c for c in candidates if c.get("_lgbm_proba") is not None]
+        if len(_scored) >= 3:
+            try:
+                from scipy.stats import rankdata
+                _probas = np.array([c["_lgbm_proba"] for c in _scored])
+                _ridges = np.array([c["_ridge_raw"] for c in _scored])
+                # Fix 26: blend weights come from the artifact (measured optimum
+                # on the modern window is binary=1.0, ridge=0.0).
+                _blend_cfg = _lgbm_art.get("blend", {"binary": 0.6, "ridge": 0.4})
+                _bw = float(_blend_cfg.get("binary", 0.6))
+                _rw = float(_blend_cfg.get("ridge", 0.4))
+                _blended = _bw * rankdata(_probas) + _rw * rankdata(_ridges)
+                for c, s in zip(_scored, _blended):
+                    c["_model_score"] = round(float(s), 4)
+                    c["_model_confidence"] = min(99, max(1, int(round(c["_lgbm_proba"] * 100))))
+                print(f"[EnrichTiers] LGBM rank-blend applied to {len(_scored)} candidates")
+            except Exception:
+                pass
 
     # ── After all candidates scored: use percentile-based tier thresholds ──
     # Hardcoded thresholds (0.22 / 0.155) are meaningless because model_score
@@ -14188,6 +14351,17 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 except Exception:
                     sector = "Unknown"
                 
+                # ── Fix 24: point-in-time macro context for the bear breaker ──
+                try:
+                    _macro_ctx = _get_macro_data_cached()
+                    _vix_ctx = float(_macro_ctx.get("vix", {}).get("current", 20) or 20)
+                    _PORTFOLIO_GATE.set_market_context(
+                        vix_level=_vix_ctx,
+                        xjo_above_sma200=(_get_axjo_vs_sma200() >= 0),
+                    )
+                except Exception:
+                    pass
+
                 gate_result = _PORTFOLIO_GATE.can_open_position(
                     proposed_symbol=symbol,
                     proposed_sector=sector,

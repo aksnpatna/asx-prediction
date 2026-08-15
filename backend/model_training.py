@@ -60,6 +60,9 @@ FEATURE_COLS = [
     "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
     # New timing features (SMSF v2)
     "mean_reversion_score", "squeeze_duration", "rsi_during_squeeze",
+    # ASX announcement NLP features (T4-A — self-guarding: zero-variance until
+    # the announcement_features table accumulates coverage)
+    "ann_sentiment_7d", "guidance_revision_score", "mgmt_confidence_delta",
 ]
 
 

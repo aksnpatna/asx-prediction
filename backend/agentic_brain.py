@@ -163,7 +163,18 @@ def _format_data_blob(state: AgentState) -> str:
     peer_section = ""
     if model_ctx.get("sector_peer_comparison"):
         peer = model_ctx["sector_peer_comparison"]
-        peer_section = f"Sector Peer Comparison:\n  RSI rank: {peer.get('rsi_rank','?')}, Momentum rank: {peer.get('momentum_rank','?')}"
+        peer_section = (f"Market Percentile (last 60d):\n"
+                        f"  RSI rank: {peer.get('rsi_rank','?')}%, "
+                        f"Momentum rank: {peer.get('momentum_rank','?')}%")
+
+    knn_section = ""
+    if model_ctx.get("knn_setups"):
+        knn_section = "Similar Historical Setups (same symbol, nearest features):\n"
+        for s in model_ctx["knn_setups"][:3]:
+            outcome = ("+8% before -8%" if s.get("hit_8pct_before_m8pct")
+                       else ("+8% first-touch" if s.get("hit_8pct_first_touch") else "neither hit"))
+            knn_section += (f"  {s.get('signal_date','?')}: 63d={s.get('forward_return_63d_pct','?')}% "
+                            f"[{outcome}] (dist {s.get('distance','?')})\n")
 
     macro_section = ""
     if state.get("macro_data"):
@@ -183,6 +194,7 @@ Confluence: {confluence.get('confidence', 'unknown').upper()} — {confluence.ge
 {tier_info}
 {feature_breakdown}
 {peer_section}
+{knn_section}
 {macro_section}
 {wfo_section}
 

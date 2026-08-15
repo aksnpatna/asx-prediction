@@ -422,3 +422,42 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   evidence (G3/G4) is the only path to deployment. Production scoring is
   NOT degraded — today's candidates are scored with today's data (no
   lookahead at serve time).
+
+### [2026-08-15] Fix 29: Model-aware AI debate (T3-C) — LIVE
+- **What:** new `model_context.py` builds a model-aware context block for the
+  6-persona debate: (1) top LGBM feature drivers WITH the candidate's actual
+  values and importances, (2) 3 nearest same-symbol historical setups from
+  the training matrix with real outcomes, (3) RSI/momentum percentile vs the
+  last 180 days of market rows. Enrichment now retains `_feat_row` per
+  candidate; both call sites (V2 daily scan + deep-dive API) pass
+  `model_context` into `run_agentic_analysis`; `_format_data_blob` renders
+  the new sections. All local DB/artifact — no extra LLM calls.
+- Verified in container: top_features, kNN setups (with outcomes), market
+  percentiles all populate.
+
+### [2026-08-15] Fix 30: ASX announcement NLP features (T4-A) — pipeline LIVE
+- **What:** new `announcement_features.py`: daily 9:45am job scores ASX
+  announcements (free ASX JSON feed) for open positions + top-tier
+  candidates via the existing LLM stack (one batch call per symbol, capped
+  at 25 symbols/day — free-tier volume). Persists to `announcement_features`
+  (sentiment, guidance_revision, mgmt_confidence_delta per announcement).
+- **Model integration is self-guarding:** 3 keys added to FEATURE_COLS
+  (`ann_sentiment_7d`, `guidance_revision_score`, `mgmt_confidence_delta`);
+  filled in training + live scoring. Verified: with an empty table they are
+  auto-dropped as zero-variance (79 → 75 → 46 active) — AUC 0.7398 / top
+  decile 58.1% UNCHANGED. They activate automatically once coverage accrues.
+- Table created in DB; job registered (scheduler id `announcement_features_0945`).
+
+### [2026-08-15] Fix 31: Hyperparameter stability across WFO folds (T2-C) — STABLE
+- **Test:** 4 configs (num_leaves × max_depth: 63×6 prod, 31×4, 127×8, 63×4)
+  × 3 folds, single LGBM, proba-only:
+
+| Fold | prod 63/6 | shallow 31/4 | deep 127/8 | flat 63/4 |
+|------|-----------|--------------|------------|-----------|
+| 2022 (bear) | 0.5645 / 28.5% | 0.5554 / 26.6% | 0.5735 / 29.2% | 0.5554 / 26.6% |
+| 2024 (bull) | 0.7201 / 56.8% | 0.7190 / 58.3% | 0.7155 / 55.2% | 0.7190 / 58.3% |
+| recent | 0.6755 / 51.6% | — | 0.6808 / 50.2% | — |
+
+- **Conclusion:** max cross-config spread 0.019 AUC — production params are
+  within noise of the fold-best in every regime. No regime-conditional
+  hyperparameters adopted. Re-run after major data changes.

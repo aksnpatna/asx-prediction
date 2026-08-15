@@ -10,6 +10,34 @@ from datetime import date
 from typing import Dict, List, Optional
 
 
+ANNOUNCEMENT_FEATURE_KEYS = [
+    "ann_sentiment_7d", "guidance_revision_score", "mgmt_confidence_delta",
+]
+
+
+def _load_announcement_features(db_conn=None) -> Dict[str, dict]:
+    """T4-A: per-symbol announcement aggregates from announcement_features."""
+    try:
+        from announcement_features import load_announcement_features
+        if db_conn is not None:
+            return load_announcement_features(db_conn)
+        from sqlalchemy import create_engine
+        _engine = create_engine(os.getenv("DATABASE_URL", "sqlite:///data/shares.db"))
+        return load_announcement_features(lambda: _engine.connect())
+    except Exception as e:
+        print(f"[AnnNLP] feature load failed: {e}", flush=True)
+        return {}
+
+
+def _fill_announcement(feats: dict, symbol: str, ann_map: Dict[str, dict]) -> dict:
+    a = ann_map.get(symbol)
+    if not a:
+        return feats
+    for key in ANNOUNCEMENT_FEATURE_KEYS:
+        feats[key] = float(a.get(key, 0) or 0)
+    return feats
+
+
 def _load_historical_fundamentals(db_conn) -> Dict[str, dict]:
     """Load latest fiscal-year fundamental ratios per symbol (from income/balance/cashflow)."""
     from sqlalchemy import text
@@ -393,7 +421,8 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     hist_map = _load_historical_fundamentals(db_conn)
     eodhd_map = _load_eodhd_features(db_conn)
     eps_map = _load_eps_history(db_conn)
-    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history symbols", flush=True)
+    ann_map = _load_announcement_features(db_conn)
+    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history + {len(ann_map)} announcement symbols", flush=True)
 
     # Stream training rows in batches (server-side cursor) — avoids the ~2GB
     # fetchall spike that OOMs a 4GB container. Preallocated float32 array.
@@ -434,6 +463,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                     feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
                     feats = _fill_historical(feats, symbol, hist_map)
                     feats = _fill_eodhd(feats, symbol, eodhd_map)
+                    feats = _fill_announcement(feats, symbol, ann_map)
                     bad = False
                     for j, c in enumerate(FEATURE_COLS):
                         v = feats.get(c, 0)

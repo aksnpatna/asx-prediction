@@ -2279,11 +2279,14 @@ def _enrich_candidates_with_tiers(candidates: list):
     # drift for these features (the logistic path benefits too).
     _eodhd_map = {}
     _fund_hist_map = {}
+    _ann_map = {}
     try:
         from smsf_classifier import (_load_eodhd_features, _load_historical_fundamentals,
                                      EODHD_FEATURE_KEYS as _EODHD_KEYS)
         _eodhd_map = _load_eodhd_features(db_conn)
         _fund_hist_map = _load_historical_fundamentals(db_conn)
+        from announcement_features import load_announcement_features
+        _ann_map = load_announcement_features(db_conn)
     except Exception:
         _EODHD_KEYS = ()
         pass
@@ -2406,6 +2409,12 @@ def _enrich_candidates_with_tiers(candidates: list):
                 feat["fund_hist_op_margin"] = float(_fh.get("op_margin", 0) or 0)
                 if float(_fh.get("market_cap", 0) or 0) > 0 and float(_fh.get("fcf", 0) or 0) > 0:
                     feat["fund_hist_fcf_yield"] = float(_fh["fcf"]) / float(_fh["market_cap"]) * 100
+        if _ann_map:
+            _ann = _ann_map.get(_sym)
+            if _ann:
+                for _k in ("ann_sentiment_7d", "guidance_revision_score",
+                           "mgmt_confidence_delta"):
+                    feat[_k] = float(_ann.get(_k, 0) or 0)
         feat["mean_reversion_score"] = 0.0  # no intraday range/volume history live
 
         # ── Fix 17: LGBM path — proba + ridge head over artifact feature order ──
@@ -2414,6 +2423,8 @@ def _enrich_candidates_with_tiers(candidates: list):
                 _order = _lgbm_art["feature_order"]
                 _vals = np.array([float(feat.get(col, 0.0) or 0.0)
                                   for col in _order], dtype=np.float64)
+                # T3-C: retain the raw feature row for the AI debate context
+                c["_feat_row"] = [float(v) for v in _vals]
                 _raw = float(
                     _lgbm_art["model"].predict_proba(_vals.reshape(1, -1))[0, 1])
                 # Fix 22: isotonic calibration (monotone — ranking unchanged)
@@ -7973,8 +7984,18 @@ async def deep_dive_analysis(query: SymbolQuery, current_user: dict = Depends(ge
             regime_snap = {}
         confluence = bullish_confluence_score(sym, market, tech, prediction, sd, hist, val, regime_snap)
 
+        # T3-C: model-aware debate context (API path — no enriched candidate)
+        try:
+            from model_context import build_model_context
+            model_ctx = build_model_context(
+                sym, market, tech, val, candidate=None,
+                db_conn=db_conn, artifact=_load_lgbm_classifier())
+        except Exception:
+            model_ctx = {}
+
         # Run the 6-Persona Multi-Agent Debate
-        result = await asyncio.to_thread(run_agentic_analysis, sym, market, tech, val, confluence)
+        result = await asyncio.to_thread(run_agentic_analysis, sym, market, tech, val, confluence,
+                                         model_context=model_ctx)
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Deep Dive failed: {str(e)}")
@@ -12817,6 +12838,38 @@ def _format_ai_report_for_telegram(analysis: dict, candidate: dict) -> str:
 
 
 # V2 Daily Scan — single unified AI pipeline
+def _scheduled_announcement_features():
+    """T4-A daily job: LLM-score ASX announcements for open positions +
+    top-tier candidates. Runs 9:45am weekdays."""
+    try:
+        from announcement_features import process_symbols
+        symbols = set()
+        with db_conn() as conn:
+            rows = conn.execute(text(
+                "SELECT DISTINCT symbol FROM paper_trades WHERE status='open'")).fetchall()
+            symbols.update(r[0] for r in rows)
+            try:
+                row = conn.execute(text(
+                    "SELECT picks FROM wealth_scan_cache "
+                    "ORDER BY generated_at DESC LIMIT 1")).fetchone()
+                if row and row[0]:
+                    picks = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    for p in picks:
+                        if p.get("_target_tier") in ("10pct", "8pct"):
+                            sym = p.get("symbol")
+                            if sym:
+                                symbols.add(sym)
+            except Exception:
+                pass
+        if not symbols:
+            print("[AnnNLP] No symbols to score — skipping.", flush=True)
+            return
+        res = process_symbols(sorted(symbols), db_conn)
+        print(f"[AnnNLP] Daily run complete: {res}", flush=True)
+    except Exception as e:
+        print(f"[AnnNLP] Daily job failed: {e}", flush=True)
+
+
 def _scheduled_v2_daily_scan():
     """V2 Daily Scan (replaces broad_scan and daily_ai_pipeline).
     
@@ -12892,7 +12945,17 @@ def _scheduled_v2_daily_scan():
             val["model_score"] = cand.get("_model_score", 0)
             val["model_tier_label"] = cand.get("_tier_label", "")
 
-            result = run_agentic_analysis(sym, market, tech_compact, val, confluence)
+            # T3-C: model-aware debate context (feature drivers + kNN setups)
+            try:
+                from model_context import build_model_context
+                model_ctx = build_model_context(
+                    sym, market, tech_compact, val, candidate=cand,
+                    db_conn=db_conn, artifact=_load_lgbm_classifier())
+            except Exception:
+                model_ctx = {}
+
+            result = run_agentic_analysis(sym, market, tech_compact, val, confluence,
+                                          model_context=model_ctx)
             result["candidate"] = cand
             ai_results.append(result)
 
@@ -15391,6 +15454,13 @@ if SCHEDULER_AVAILABLE:
             _scheduled_v2_daily_scan, "cron",
             minute=0, hour=8, day_of_week="mon-fri",
             id="v2_daily_scan_8am", max_instances=1,
+        )
+
+        # ── T4-A: ASX announcement NLP features (9:45am, after scan) ─────
+        scheduler.add_job(
+            _scheduled_announcement_features, "cron",
+            minute=45, hour=9, day_of_week="mon-fri",
+            id="announcement_features_0945", max_instances=1,
         )
 
         scheduler.add_job(

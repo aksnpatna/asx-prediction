@@ -461,3 +461,17 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
 - **Conclusion:** max cross-config spread 0.019 AUC — production params are
   within noise of the fold-best in every regime. No regime-conditional
   hyperparameters adopted. Re-run after major data changes.
+
+### [2026-08-15] Fix 32: Self-learning schema drift + G3 paper-trade status
+- **Bug:** `_scheduled_self_learning_loop` queried `paper_trades.initial_price`
+  — column does not exist (actual: `entry_price`). The job failed silently on
+  every run since the schema gained `entry_price`. Fixed.
+- **First real evaluation (2026-08-15):** 23 closed/exit-stage trades —
+  win rate 26.1%, avg win +1.46%, avg loss −2.77%. Action:
+  "PID tightened penalties (win_rate=26% vs target 55%)".
+- **G3 paper-trade tracker:** 35 total (9 closed, 26 open). 60+ evaluated
+  trades required before G3 — accumulation is time-bound by the 63-day
+  horizon + trading days (realistic: late Sep/Oct). Pipeline config
+  verified: PAPER_MONITOR_MAX_TRADES=250, bootstrap auto-execute on,
+  monitor every 15 min, consensus tiers feeding candidates.
+- Deployed to container; startup catchup ran the loop (previously 999h stale).

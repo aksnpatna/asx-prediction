@@ -12719,7 +12719,7 @@ def _scheduled_self_learning_loop():
         with engine.connect() as conn:
             # Get all closed/exited trades
             trades = conn.execute(text("""
-                SELECT initial_price, current_price, position_stage
+                SELECT entry_price, current_price, position_stage
                 FROM paper_trades
                 WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
             """)).fetchall()

@@ -4,6 +4,7 @@ import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
 import SmsfTab from './SmsfTab'
+import SmsfUplift from './smsfUplift'
 import DiscoverTab from './DiscoverTab'
 import NewsSentimentMonitor from './NewsSentimentMonitor'
 import GlobalMarketsTab from './GlobalMarketsTab'
@@ -906,7 +907,7 @@ function App() {
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [activeTab, setActiveTab] = useState('smsf')
+  const [activeTab, setActiveTab] = useState('smsf-brief')
 
   const [topUniverse, setTopUniverse] = useState([])
   const [aiQuery, setAiQuery] = useState('Find ASX shares with strong momentum and low volatility')
@@ -1900,7 +1901,11 @@ function App() {
           </div>
           <div className="nav-scroll-wrap">
           <nav className="nav">
-            <button className={`nav-btn ${activeTab === 'smsf' ? 'active' : ''}`} onClick={() => setActiveTab('smsf')} title="SMSF Dashboard"><span className="nav-icon">🏠</span><span className="nav-label-text">SMSF</span></button>
+            <button className={`nav-btn ${activeTab === 'smsf-brief' ? 'active' : ''}`} onClick={() => setActiveTab('smsf-brief')} title="Dashboard"><span className="nav-icon">📊</span><span className="nav-label-text">Dashboard</span></button>
+            <button className={`nav-btn ${activeTab === 'smsf-screener' ? 'active' : ''}`} onClick={() => setActiveTab('smsf-screener')} title="Screener"><span className="nav-icon">🔍</span><span className="nav-label-text">Screener</span></button>
+            <button className={`nav-btn ${activeTab === 'smsf-portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('smsf-portfolio')} title="Portfolio"><span className="nav-icon">💼</span><span className="nav-label-text">Portfolio</span></button>
+            <button className={`nav-btn ${activeTab === 'smsf-wealth' ? 'active' : ''}`} onClick={() => setActiveTab('smsf-wealth')} title="Wealth"><span className="nav-icon">📈</span><span className="nav-label-text">Wealth</span></button>
+            <button className={`nav-btn ${activeTab === 'smsf' ? 'active' : ''}`} onClick={() => setActiveTab('smsf')} title="SMSF Dashboard (legacy)"><span className="nav-icon">🏠</span><span className="nav-label-text">Legacy SMSF</span></button>
             <button className={`nav-btn ${activeTab === 'markets' ? 'active' : ''}`} onClick={() => setActiveTab('markets')} title="Global Markets"><span className="nav-icon">🌍</span><span className="nav-label-text">Markets</span></button>
             <button className={`nav-btn ${activeTab === 'analyze' ? 'active' : ''}`} onClick={() => setActiveTab('analyze')} title="Analyze"><span className="nav-icon">🔍</span><span className="nav-label-text">Analyze</span></button>
             <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} className="market-selector-nav">
@@ -1921,6 +1926,11 @@ function App() {
       </header>
 
       <main className="main">
+        {/* ── SMSF UI Uplift (Fix 33): new screens, legacy intact ── */}
+        {['smsf-brief', 'smsf-screener', 'smsf-portfolio', 'smsf-wealth'].includes(activeTab) && (
+          <SmsfUplift screen={activeTab} token={token}
+            onRunScan={() => setActiveTab('smsf-screener')} />
+        )}
         {/* AI Weekly Banner */}
         {aiBanner?.summary && activeTab === 'markets' && (
           <div style={{ background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)', border: '1px solid #0f3460', borderRadius: 8, padding: '16px 20px', marginBottom: 16, color: '#e0e0e0' }}>

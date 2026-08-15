@@ -475,3 +475,29 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   verified: PAPER_MONITOR_MAX_TRADES=250, bootstrap auto-execute on,
   monitor every 15 min, consensus tiers feeding candidates.
 - Deployed to container; startup catchup ran the loop (previously 999h stale).
+
+### [2026-08-15] Fix 33: SMSF UI Uplift (Emergent-grade screens)
+- **Base commit before this work: `35d4182`** (rollback point if needed).
+- **Design system:** light theme tokens + sx-* component classes appended to
+  index.css — legacy dark classes untouched, old screens still fully styled.
+- **New screens (frontend/src/smsfUplift.jsx):**
+  - Dashboard — morning briefing: circuit breaker banner, regime strip,
+    today's actions (exit windows / targets hit), satellite 63-day summary,
+    announcement feed, model health blurb, RUN SCAN button.
+  - Screener — Emergent-style: hero stats (screened / top decile / high
+    conviction / model edge), filter chips, StockCard (score, target +8%,
+    EV/trade, SMSF vol-adjusted size, institutional ownership, PE, div,
+    franking badge), inline AI analyst note.
+  - Portfolio — NAV card with core/satellite split bar, core sleeve rows,
+    SatelliteClock (63-day bar with grey/amber/red states, target ring),
+    CGT alerts, sector cap alerts.
+  - Wealth — $200K→$1M projector (Conservative 14.4% / Base 18.3% /
+    Bull 22.3%), milestone cards, tax panel, G-gate progress, seasonality bar.
+- **New read-only endpoints:** /api/screener/scan, /api/portfolio/nav-breakdown,
+  /api/model/health-summary, /api/wealth/projection,
+  /api/positions/{id}/detail, /api/dashboard/morning-brief — all auth-guarded,
+  degrade to safe defaults.
+- **Non-breaking:** legacy tabs (SMSF/Markets/Analyze/etc.) remain in nav;
+  default tab is now the new Dashboard.
+- Deployed: backend restarted (200), frontend build served on :8081 (200),
+  all 6 endpoints registered in OpenAPI.

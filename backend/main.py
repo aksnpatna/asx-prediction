@@ -14615,6 +14615,404 @@ _TELEGRAM_BOT_COMMANDS_HELP = """\
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMSF UI Uplift endpoints (read-only; all failures degrade to safe defaults)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _smsf_position_size(entry_price: float, atr_pct: float, nav: float = 200000.0) -> float:
+    """Vol-adjusted sizing per strategy: 1.5% NAV at risk, stop = max(-20%, -2.5*ATR), cap 7% NAV."""
+    if not entry_price or entry_price <= 0:
+        return 0.0
+    stop_pct = max(0.20, 2.5 * (atr_pct / 100.0) if atr_pct else 0.20)
+    value = nav * 0.015 / stop_pct
+    return round(min(value, nav * 0.07), 0)
+
+
+@app.get("/api/screener/scan")
+async def screener_scan(current_user: dict = Depends(get_current_user)):
+    """UI uplift: latest broad-scan picks enriched with SMSF sizing, ownership,
+    first-touch EV estimate, and model hero stats."""
+    del current_user
+    out = {
+        "stocks_screened": 0, "high_conviction": 0,
+        "top_decile_hit": None, "model_edge": None, "auc": None,
+        "last_scan": None, "candidates": [],
+    }
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text(
+                "SELECT scanned_count, candidates_found, picks, generated_at "
+                "FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1")).fetchone()
+        if not row:
+            return out
+        out["stocks_screened"] = int(row[0] or 0)
+        out["last_scan"] = str(row[3])[:19] if row[3] else None
+        picks = json.loads(row[2]) if isinstance(row[2], str) else (row[2] or [])
+
+        try:
+            with db_conn() as conn:
+                mrow = conn.execute(text(
+                    "SELECT notes FROM model_weights_by_date "
+                    "WHERE model_type='lgbm_classifier' AND feature_name='__artifact__' "
+                    "ORDER BY trained_at DESC LIMIT 1")).fetchone()
+                if mrow and mrow[0]:
+                    notes = json.loads(mrow[0]) if isinstance(mrow[0], str) else (mrow[0] or {})
+                    out["top_decile_hit"] = notes.get("top_decile")
+                    out["auc"] = notes.get("auc")
+        except Exception:
+            pass
+        base_rate = 21.3  # modern-window concurrent base (Fix 26)
+        if out["top_decile_hit"]:
+            out["model_edge"] = round(float(out["top_decile_hit"]) / base_rate, 2)
+
+        art = None
+        try:
+            art = _load_lgbm_classifier()
+        except Exception:
+            art = None
+        order = (art or {}).get("feature_order", [])
+        inst_idx = order.index("pct_institutions") if "pct_institutions" in order else None
+        pe_idx = order.index("fund_pe_inv") if "fund_pe_inv" in order else None
+        mom_idx = order.index("momentum_20d") if "momentum_20d" in order else None
+
+        candidates = []
+        for p in picks[:200]:
+            try:
+                sym = p.get("symbol", "")
+                if not sym:
+                    continue
+                proba = p.get("_lgbm_proba")
+                if proba is None:
+                    proba = p.get("_model_confidence", 0) / 100.0
+                row_f = p.get("_feat_row") or []
+                price = float(p.get("current_price", 0) or p.get("entry_price", 0) or 0)
+                atr = float(row_f[order.index("atr_pct")]) if row_f and "atr_pct" in order else 0.02
+                ev = 0.08 * float(proba or 0) - 0.08 * (1 - float(proba or 0))
+                cand = {
+                    "symbol": sym,
+                    "name": p.get("company_name", "") or p.get("name", ""),
+                    "price": round(price, 2) if price else None,
+                    "score": round(float(proba or 0) * 100, 1),
+                    "tier": p.get("_target_tier", "watch"),
+                    "tier_label": p.get("_tier_label", ""),
+                    "target_price": round(price * 1.08, 2) if price else None,
+                    "ev_est_pct": round(ev, 2),
+                    "reachable_63d": bool(proba and float(proba) >= 0.5),
+                    "smsf_size": _smsf_position_size(price, atr),
+                    "institutional_pct": round(float(row_f[inst_idx]), 1) if inst_idx is not None and row_f and len(row_f) > inst_idx and row_f[inst_idx] else None,
+                    "pe": round(100.0 / float(row_f[pe_idx]), 1) if pe_idx is not None and row_f and len(row_f) > pe_idx and row_f[pe_idx] and float(row_f[pe_idx]) > 0 else None,
+                    "momentum_20d": round(float(row_f[mom_idx]), 1) if mom_idx is not None and row_f and len(row_f) > mom_idx and row_f[mom_idx] is not None else None,
+                    "rsi": float(p.get("rsi", 0) or 0) or None,
+                    "trend": p.get("trend", "") or p.get("signal_trend", ""),
+                    "div_yield": p.get("dividend_yield") or None,
+                    "franked": p.get("franking_pct") or None,
+                    "sector": (p.get("valuation_metrics") or {}).get("sector", "") or p.get("sector", ""),
+                }
+                candidates.append(cand)
+            except Exception:
+                continue
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        out["candidates"] = candidates
+        out["high_conviction"] = sum(1 for c in candidates if c["tier"] == "10pct")
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
+@app.get("/api/portfolio/nav-breakdown")
+async def portfolio_nav_breakdown(current_user: dict = Depends(get_current_user)):
+    """UI uplift: core/satellite split, CGT alerts, sector caps for the portfolio screen."""
+    uid = current_user["id"]
+    out = {"nav": 0, "cash": 0, "pnl_pct": 0, "core_pct": 0, "satellite_pct": 0,
+           "core_positions": [], "satellite_positions": [], "cgt_alerts": [],
+           "sector_exposure": [], "gate_alerts": []}
+    try:
+        paper = list_paper_trades(uid)
+        state = _compute_portfolio_state(uid)
+        out["nav"] = round(state["total_equity"], 0)
+        out["cash"] = round(state["available_cash"], 0)
+        start = state.get("starting_capital", 0) or 200000
+        out["pnl_pct"] = round((state["total_equity"] / start - 1) * 100, 1) if start else 0
+
+        from portfolio_gate import SECTOR_CAPS
+        core_value, sat_value = 0.0, 0.0
+        sector_value = {}
+        today = date.today()
+        for p in paper:
+            if p.get("status") != "open":
+                continue
+            qty = float(p.get("quantity", 0) or 0)
+            entry = float(p.get("entry_price", 0) or 0)
+            cur = float(p.get("current_price", 0) or 0) or entry
+            value = qty * cur
+            is_core = str(p.get("sleeve", "")).lower() == "core"
+            row = {
+                "id": p.get("id"), "symbol": p.get("symbol", ""),
+                "value": round(value, 0),
+                "pnl_pct": round((cur / entry - 1) * 100, 1) if entry else 0,
+                "current_price": round(cur, 2), "entry_price": round(entry, 2),
+                "sector": p.get("sector", "DEFAULT"),
+                "target_price": p.get("target_price"),
+                "take_profit_price": p.get("take_profit_price"),
+                "catastrophe_stop_price": p.get("catastrophe_stop_price"),
+                "time_stop_date": str(p.get("time_stop_date", ""))[:10] if p.get("time_stop_date") else None,
+                "entry_date": str(p.get("entry_date_parsed") or p.get("created_at"))[:10],
+                "position_stage": p.get("position_stage", ""),
+            }
+            if is_core:
+                core_value += value
+                out["core_positions"].append(row)
+            else:
+                sat_value += value
+                out["satellite_positions"].append(row)
+                sec = p.get("sector", "DEFAULT") or "DEFAULT"
+                sector_value[sec] = sector_value.get(sec, 0) + value
+
+            # CGT alerts: gains approaching the 12-month discount window
+            ed = p.get("entry_date_parsed")
+            if ed and cur > entry:
+                days_held = (today - ed).days if hasattr(ed, "days") else 0
+                if 300 <= days_held < 365:
+                    out["cgt_alerts"].append({
+                        "symbol": p.get("symbol", ""),
+                        "days_held": days_held,
+                        "days_to_discount": 365 - days_held,
+                        "gain": round((cur - entry) * qty, 0),
+                    })
+        total = core_value + sat_value
+        if total > 0:
+            out["core_pct"] = round(core_value / total * 100, 0)
+            out["satellite_pct"] = round(sat_value / total * 100, 0)
+        for sec, val in sector_value.items():
+            cap = SECTOR_CAPS.get(sec, SECTOR_CAPS.get("DEFAULT", 0.20))
+            pct = val / total * 100 if total else 0
+            out["sector_exposure"].append({"sector": sec, "pct": round(pct, 1),
+                                           "cap": round(cap * 100, 0),
+                                           "near_cap": pct >= cap * 100 - 2})
+            if pct >= cap * 100:
+                out["gate_alerts"].append(
+                    f"SECTOR CAP: {sec} at {pct:.0f}% of NAV (cap {cap*100:.0f}%) — new {sec} entries blocked")
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
+@app.get("/api/model/health-summary")
+async def model_health_summary(current_user: dict = Depends(get_current_user)):
+    """UI uplift: honest model health — AUC, top decile, window, calibration, G-gate state."""
+    del current_user
+    out = {"auc": None, "top_decile": None, "spread": None, "brier_raw": None,
+           "brier_calibrated": None, "window": None, "sample_size": None,
+           "calibrated": False, "wfo_state": "INSUFFICIENT_DATA", "gates": {}}
+    try:
+        with db_conn() as conn:
+            mrow = conn.execute(text(
+                "SELECT notes, sample_size, trained_at FROM model_weights_by_date "
+                "WHERE model_type='lgbm_classifier' AND feature_name='__artifact__' "
+                "ORDER BY trained_at DESC LIMIT 1")).fetchone()
+            if mrow and mrow[0]:
+                notes = json.loads(mrow[0]) if isinstance(mrow[0], str) else (mrow[0] or {})
+                out.update({
+                    "auc": notes.get("auc"), "top_decile": notes.get("top_decile"),
+                    "spread": notes.get("spread"),
+                    "brier_raw": notes.get("brier_raw"),
+                    "brier_calibrated": notes.get("brier_calibrated"),
+                    "sample_size": mrow[1],
+                })
+                out["calibrated"] = notes.get("brier_calibrated") is not None and \
+                    notes.get("brier_raw") is not None and \
+                    float(notes["brier_calibrated"]) < float(notes["brier_raw"])
+            wrow = conn.execute(text(
+                "SELECT MIN(signal_date), MAX(signal_date) FROM ("
+                "SELECT signal_date FROM model_training_set "
+                "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
+                "ORDER BY signal_date DESC LIMIT 200000) t")).fetchone()
+            if wrow:
+                out["window"] = f"{wrow[0]} → {wrow[1]}"
+    except Exception as e:
+        out["error"] = str(e)
+    try:
+        wfo = get_current_wfo_state()
+        out["wfo_state"] = wfo.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
+        out["gates"] = {
+            "G1": {"status": "done", "label": "Survivorship de-biased (1,858 delisted)"},
+            "G2": {"status": "amber", "label": f"WFO top-decile ≥60% — {out.get('top_decile') or '?'}% current"},
+            "G3": {"status": "open", "label": "60 paper trades evaluated"},
+            "G4": {"status": "open", "label": "Micro-live $500–$1K positions"},
+            "G5": {"status": "open", "label": "Risk limits consistent + CI ≥ 0.5"},
+        }
+        with db_conn() as conn:
+            closed = conn.execute(text(
+                "SELECT COUNT(*) FROM paper_trades WHERE status='closed'")).fetchone()
+            out["gates"]["G3"]["progress"] = f"{closed[0]}/60 closed"
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/wealth/projection")
+async def wealth_projection(capital: float = 200000, current_user: dict = Depends(get_current_user)):
+    """UI uplift: scenario projections 2026→2035, milestone cards, tax panel, G-gate progress."""
+    del current_user
+    try:
+        capital = float(max(10000, min(5000000, capital or 200000)))
+    except Exception:
+        capital = 200000.0
+    scenarios = {
+        "Conservative": 14.4, "Base": 18.3, "Bull": 22.3,
+    }
+    years = list(range(2026, 2036))
+    series = {}
+    milestones = []
+    for name, rate in scenarios.items():
+        vals = [round(capital * (1 + rate / 100.0) ** (y - 2026), 0) for y in years]
+        series[name] = {"years": years, "nav": vals}
+        for y, v in zip(years, vals):
+            if y in (2028, 2030, 2033, 2035):
+                milestones.append({"year": y, "scenario": name, "nav": v})
+    try:
+        with db_conn() as conn:
+            closed = conn.execute(text(
+                "SELECT COUNT(*) FROM paper_trades WHERE status='closed'")).fetchone()[0]
+            row = conn.execute(text(
+                "SELECT total_trades, win_rate_pct, recommended_action "
+                "FROM ai_self_learning_metrics ORDER BY evaluated_at DESC LIMIT 1")).fetchone()
+    except Exception:
+        closed, row = 0, None
+    return {
+        "capital": capital, "scenarios": series, "milestones": milestones,
+        "tax": {
+            "smsf_rate": 15,
+            "franked_effective_yield": 5.8,
+            "cgt_effective_rate": 10,
+            "cgt_note": "Hold >12 months → 10% effective rate (33% discount × 15%)",
+        },
+        "ggate": {
+            "paper_trades_closed": int(closed or 0),
+            "self_learning": {"win_rate_pct": float(row[1]) if row else None,
+                              "action": row[2] if row else None},
+        },
+    }
+
+
+@app.get("/api/positions/{position_id}/detail")
+async def position_detail(position_id: int, current_user: dict = Depends(get_current_user)):
+    """UI uplift: full position drill-down with exit plan, CGT countdown, sentinel state."""
+    uid = current_user["id"]
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text(
+                "SELECT id, symbol, quantity, entry_price, current_price, target_price, "
+                "take_profit_price, catastrophe_stop_price, time_stop_date, "
+                "entry_date_parsed, created_at, position_stage, buy_thesis, notes, "
+                "sector, sleeve, exit_reason, peak_price "
+                "FROM paper_trades WHERE id=:id AND user_id=:uid"),
+                {"id": position_id, "uid": uid}).fetchone()
+        if not row:
+            return {"error": "not found"}
+        entry = float(row[3] or 0)
+        cur = float(row[4] or 0) or entry
+        ed = row[9] or (row[10].date() if row[10] else None)
+        days_held = (date.today() - ed).days if ed else 0
+        gain = (cur - entry) * float(row[2] or 0)
+        return {
+            "id": row[0], "symbol": row[1], "quantity": float(row[2] or 0),
+            "entry_price": round(entry, 2), "current_price": round(cur, 2),
+            "pnl": round(gain, 0), "pnl_pct": round((cur / entry - 1) * 100, 1) if entry else 0,
+            "target_price": float(row[5] or 0) or None,
+            "take_profit_price": float(row[6] or 0) or None,
+            "catastrophe_stop_price": float(row[7] or 0) or None,
+            "time_stop_date": str(row[8])[:10] if row[8] else None,
+            "entry_date": str(ed), "days_held": days_held,
+            "day_of_63": min(days_held, 63),
+            "position_stage": row[11], "buy_thesis": row[12], "notes": row[13],
+            "sector": row[14], "sleeve": row[15], "exit_reason": row[16],
+            "peak_price": float(row[17] or 0) or None,
+            "target_reached": bool(row[6] and cur >= float(row[6])) or bool(row[5] and cur >= float(row[5])),
+            "cgt_days_to_discount": max(0, 365 - days_held) if gain > 0 else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/dashboard/morning-brief")
+async def dashboard_morning_brief(current_user: dict = Depends(get_current_user)):
+    """UI uplift: today's actions, regime, positions summary, model health blurb."""
+    uid = current_user["id"]
+    out = {"regime": {}, "actions": [], "satellite_summary": [], "model": {},
+           "announcements": []}
+    try:
+        vix, xjo = None, None
+        try:
+            vix = _get_vix_level()
+        except Exception:
+            vix = None
+        try:
+            xjo = _get_axjo_vs_sma200()
+        except Exception:
+            xjo = None
+        bullish = xjo is not None and xjo >= 0
+        out["regime"] = {
+            "label": "BULLISH" if bullish else ("BEARISH" if xjo is not None else "UNKNOWN"),
+            "vix": round(vix, 1) if vix else None,
+            "xjo_vs_sma200_pct": round(xjo, 1) if xjo is not None else None,
+            "allow_new": (vix is None or vix < 25) or not (bullish is False),
+        }
+        paper = list_paper_trades(uid)
+        today = date.today()
+        for p in paper:
+            if p.get("status") != "open":
+                continue
+            ed = p.get("entry_date_parsed")
+            days = (today - ed).days if ed else 0
+            cur = float(p.get("current_price", 0) or 0)
+            entry = float(p.get("entry_price", 0) or 0)
+            pnl = round((cur / entry - 1) * 100, 1) if entry else 0
+            sat = {"symbol": p.get("symbol", ""), "days": days, "pnl_pct": pnl}
+            if days >= 56:
+                sat["flag"] = "exit_window"
+                out["actions"].append({
+                    "kind": "exit", "symbol": p.get("symbol", ""),
+                    "text": f"Day {days}/63 — exit window open ({pnl:+.1f}%)",
+                })
+            target = float(p.get("take_profit_price", 0) or p.get("target_price", 0) or 0)
+            if target and cur >= target:
+                sat["flag"] = "target_reached"
+                out["actions"].append({
+                    "kind": "target", "symbol": p.get("symbol", ""),
+                    "text": f"Target reached (+8%) — {pnl:+.1f}%, consider exit",
+                })
+            out["satellite_summary"].append(sat)
+        try:
+            with db_conn() as conn:
+                rows = conn.execute(text(
+                    "SELECT symbol, title, sentiment FROM announcement_features "
+                    "WHERE ann_date >= CURRENT_DATE - 2 "
+                    "ORDER BY sentiment DESC LIMIT 5")).fetchall()
+                out["announcements"] = [
+                    {"symbol": r[0], "title": (r[1] or "")[:90],
+                     "sentiment": float(r[2] or 0)} for r in rows]
+        except Exception:
+            pass
+        try:
+            with db_conn() as conn:
+                mrow = conn.execute(text(
+                    "SELECT notes FROM model_weights_by_date "
+                    "WHERE model_type='lgbm_classifier' AND feature_name='__artifact__' "
+                    "ORDER BY trained_at DESC LIMIT 1")).fetchone()
+                if mrow and mrow[0]:
+                    notes = json.loads(mrow[0]) if isinstance(mrow[0], str) else (mrow[0] or {})
+                    out["model"] = {"auc": notes.get("auc"), "top_decile": notes.get("top_decile")}
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
 @app.post("/api/telegram/bot-webhook")
 async def telegram_bot_webhook(request: Request):
     """Receive Telegram bot updates (messages from users).

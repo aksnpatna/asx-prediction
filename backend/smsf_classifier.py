@@ -617,6 +617,18 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
               f"|coef(pct_institutions)|={pct_inst_coef:.4f}", flush=True)
     result_guards = guards
 
+    # ── Fix 27: RandomForest head for the consensus filter ──────────────────
+    # Measured (2026-08-15, modern window): LGBM top-decile AND ridge-q75 AND
+    # RF-q75 -> concurrent 68.0% / first-touch 76.8% / EV +4.30% vs LGBM-only
+    # top decile 59.3% / 67.2% / +2.75%. RF is ~5s to fit; stored in artifact.
+    from sklearn.ensemble import RandomForestClassifier
+    rf_model = RandomForestClassifier(
+        n_estimators=100, max_depth=12, min_samples_leaf=50,
+        class_weight="balanced", random_state=42, n_jobs=-1,
+    )
+    rf_model.fit(X_train, y_train)
+    print(f"[Classifier] RF consensus head fit ({rf_model.n_estimators} trees)", flush=True)
+
     # ── Fix 17: LightGBM challenger — same split, same blend, strict winner rule ──
     # Adopt only if it beats logistic on AUC (+0.005) without losing top-decile
     # or bottom-decile quality. Otherwise logistic stays and nothing changes.
@@ -648,6 +660,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             artifact = {
                 "model": lgbm_challenger["model"],
                 "isotonic": lgbm_challenger["isotonic"],
+                "random_forest": rf_model,
                 "feature_order": active_features,
                 "scaler_mean": scaler.mean_.tolist(),
                 "scaler_scale": scaler.scale_.tolist(),

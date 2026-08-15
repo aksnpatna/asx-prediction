@@ -18,9 +18,10 @@
 | Training window | 2015-03 → 2016-08 | 2025-10 → 2026-05 (200K most-recent rows) |
 | WFO folds (cross-period OOS) | 2022: AUC 0.478 (logistic) | 2022: 0.572 / 2023: 0.564 / 2024: 0.728 / recent: 0.684 |
 | First-touch EV per trade (top decile) | +0.35% (stale window) | +1.10% (recent fold, before costs) |
-| Backtest P&L (2022→2026, WFO scores) | RSI-proxy + random exits (invalid) | +70.8% total / +15.5% p.a. / Sharpe 1.36 / maxDD 4.7% (with caveats, see Fix 25) |
+| Backtest P&L (2022→2026, WFO scores) | RSI-proxy + random exits (invalid) | **HONEST: +3.8% total / +0.8% p.a. / Sharpe 0.22** (PIT-safe features + consensus gate, see Fix 28; earlier +15.5% p.a. was lookahead-inflated) |
 | Calibration | none | OOB isotonic with Brier self-guard |
 | Deployment protection | none | Bear breaker: VIX ≥ 25 AND XJO < SMA200 blocks new entries |
+| Candidate tiers | percentile-only | Consensus tiers: R2 (LGBM dec + ridge-q75 + RF-q75 → 10pct), R1 (→ 8pct) |
 
 **Live model today:** LGBM artifact (sha256-verified, mtime-refreshed) trained
 2026-08-15; logistic fallback also retrained on the modern window.
@@ -392,3 +393,32 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   bottom 2.9%, spread 55.2pp (base 21.3%) vs pre-adoption 0.6855/42.5%/3.9%.
   Calibration guard kept isotonic this run (Brier 0.1535 → 0.1522).
 - **Commit:** pending
+
+### [2026-08-15] Fix 27: Consensus filter (T1-C) — measured, ADOPTED
+- **Measurement (200K modern pipeline, test set):**
+  - R0 LGBM top-decile: conc 59.3% / ft 67.2% / EV +2.75%
+  - R1 LGBM-dec AND (ridge-q75 OR rf-q75): 60.5% / 68.3% / +2.93%
+  - **R2 LGBM-dec AND ridge-q75 AND rf-q75: 68.0% / 76.8% / +4.30%** (n=1421 vs 3927)
+  - R3 all-three-q75: 56.3% — worse than R0, rejected
+- **Adopted:** RF head (100 trees, ~5s fit) added to daily training + artifact.
+  Live tier assignment uses R2 for the 10pct tier and R1 for the 8pct tier
+  when the batch has ≥40 scored candidates (small batches keep percentile logic).
+  Backtest applies R2 day-level.
+
+### [2026-08-15] Fix 28: Honest backtest — lookahead features removed
+- **Finding:** EODHD snapshots exist only from 2026-08-14 (464 rows) and
+  fundamental snapshots from 2026-07-18. Filling 2022–2025 rows from them
+  was pure lookahead — `pct_institutions` (top feature) "predicted" history
+  with data that didn't exist yet. The +15.5% p.a. backtest was inflated.
+- **Fix:** backtest now zeroes 23 lookahead features (EODHD, snapshot
+  fundamentals, historical ratios); fold models train on 35 PIT-safe
+  features (technical + macro + XJO + PIT P/E from eps_history); day-level
+  R2 consensus gate applied.
+- **Honest WFO P&L (2022-01 → 2026-07):** final +3.8%, annual +0.8%,
+  Sharpe 0.22, max DD 5.8%, hit rate 50.0% (80 trades, avg win +14.3% /
+  avg loss −12.2%). Gross, before costs.
+- **Interpretation:** no deployable edge demonstrated by history alone.
+  The G2 gate (60% top decile, not met) remains correct; paper-trade
+  evidence (G3/G4) is the only path to deployment. Production scoring is
+  NOT degraded — today's candidates are scored with today's data (no
+  lookahead at serve time).

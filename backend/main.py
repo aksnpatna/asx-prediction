@@ -2199,8 +2199,8 @@ def _load_lgbm_classifier():
         import joblib
         import hashlib
         art = joblib.load(path)
-        required = {"model", "isotonic", "feature_order", "scaler_mean",
-                    "scaler_scale", "ridge_coefs"}
+        required = {"model", "isotonic", "random_forest", "feature_order",
+                    "scaler_mean", "scaler_scale", "ridge_coefs"}
         if not required.issubset(set(art.keys())):
             print("[EnrichTiers] LGBM artifact missing keys — ignoring")
             return None
@@ -2420,6 +2420,11 @@ def _enrich_candidates_with_tiers(candidates: list):
                 if _lgbm_art.get("isotonic") is not None:
                     _raw = float(_lgbm_art["isotonic"].predict([_raw])[0])
                 c["_lgbm_proba"] = _raw
+                # Fix 27: RF consensus head (raw features, pre-scaling)
+                if _lgbm_art.get("random_forest") is not None:
+                    c["_rf_proba"] = float(
+                        _lgbm_art["random_forest"].predict_proba(
+                            _vals.reshape(1, -1))[0, 1])
                 _mean = np.array(_lgbm_art["scaler_mean"], dtype=np.float64)
                 _scale = np.array(_lgbm_art["scaler_scale"], dtype=np.float64)
                 _vals = np.where(_scale > 1e-9, (_vals - _mean) / _scale, 0.0)
@@ -2525,6 +2530,36 @@ def _enrich_candidates_with_tiers(candidates: list):
         else:
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
+
+    # ── Fix 27: consensus override (measured precision lift) ──────────────
+    # R2: LGBM top-decile AND ridge-q75 AND RF-q75 -> 10pct tier.
+    # R1: LGBM top-decile AND (ridge-q75 OR RF-q75) -> 8pct tier.
+    # Applied only when the artifact carries the RF head AND the batch is big
+    # enough for stable quartiles (>=40 scored candidates).
+    if _lgbm_art is not None and _lgbm_art.get("random_forest") is not None:
+        _cand = [c for c in candidates
+                 if c.get("_lgbm_proba") is not None and c.get("_rf_proba") is not None
+                 and c.get("_ridge_raw") is not None]
+        if len(_cand) >= 40:
+            try:
+                from scipy.stats import rankdata
+                _n = len(_cand)
+                _dec = rankdata([c["_lgbm_proba"] for c in _cand]) >= 0.9 * _n
+                _rfq = rankdata([c["_rf_proba"] for c in _cand]) >= 0.75 * _n
+                _rgq = rankdata([c["_ridge_raw"] for c in _cand]) >= 0.75 * _n
+                for c, d, rfq, rgq in zip(_cand, _dec, _rfq, _rgq):
+                    if d and rfq and rgq:
+                        c["_target_tier"] = "10pct"
+                        c["_tier_label"] = "10% TARGET TIER"
+                    elif d and (rfq or rgq):
+                        c["_target_tier"] = "8pct"
+                        c["_tier_label"] = "8% COMPOUND TIER"
+                    else:
+                        c["_target_tier"] = "watch"
+                        c["_tier_label"] = "WATCH"
+                print(f"[EnrichTiers] Consensus tiers applied (R2 10pct / R1 8pct, n={_n})")
+            except Exception:
+                pass
 
     print(f"[EnrichTiers] {n} candidates scored | 10% cutoff={cutoff_10pct:.4f} ({cutoff_10pct_idx} stocks) | 8% cutoff={cutoff_8pct:.4f} ({cutoff_8pct_idx} stocks)")
 

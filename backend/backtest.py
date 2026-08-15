@@ -83,6 +83,25 @@ def compute_path_aware_labels(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df.reset_index(drop=True), pd.DataFrame(labels)], axis=1)
 
 
+# ── Fix 28: historically-safe feature subset for the backtest ───────────────
+# EODHD snapshots only exist from 2026-08-14 (464 rows) and fundamental
+# snapshots from 2026-07-18 — filling 2022-2025 rows from them is lookahead
+# inflation. These features are zeroed in the backtest (auto-dropped as
+# zero-variance), so fold models train only on features that are genuinely
+# point-in-time: price-derived technicals, XJO-relative, macro series, and
+# PIT P/E from eps_history.
+BACKTEST_DROP_FEATURES = {
+    "eps_surprise", "eps_estimate_revision", "analyst_count",
+    "pct_insiders", "pct_institutions", "insider_net_ratio",
+    "esg_governance", "esg_controversy", "payout_ratio",
+    "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
+    "fund_hist_op_margin", "fund_hist_fcf_yield",
+    "fund_div_yield", "fund_analyst_upside", "fund_analyst_rec_score",
+    "fund_earnings_growth", "fund_revenue_growth", "fund_beta",
+    "fund_pct_from_52w_high", "fund_market_cap_log", "fund_forward_pe_inv",
+}
+
+
 # ── Shared preprocessing (mirrors train_classifier) ────────────────────────
 
 def _load_aux():
@@ -94,13 +113,16 @@ def _load_aux():
 
 
 def _fill_row(feats_raw, symbol, entry_price, signal_date, aux):
-    fund_map, hist_map, eodhd_map, eps_map = aux
+    _, _, _, eps_map = aux
     feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
-    feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
+    # Fix 28: PIT P/E only — zero the stored (build-time, anachronistic) value
+    # first, then let _fill_point_in_time_pe set it from eps_history when
+    # point-in-time EPS exists. No latest-snapshot fills for historical rows.
+    feats["fund_pe_inv"] = 0.0
     feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
-    feats = _fill_historical(feats, symbol, hist_map)
-    feats = _fill_eodhd(feats, symbol, eodhd_map)
     x = np.array([feats.get(c, 0) for c in FEATURE_COLS], dtype=np.float32)
+    for f in BACKTEST_DROP_FEATURES:
+        x[FEATURE_COLS.index(f)] = 0.0
     if not np.isfinite(x).all():
         return None
     return x
@@ -139,23 +161,25 @@ def _train_fold_model(X_train, y_train):
 
 
 def _train_wfo_scorers(start_date: str, end_date: str, aux, cap_per_month: int = 8000):
-    """Train one LGBM per fold-year on month-capped rows BEFORE the fold."""
+    """Train one LGBM per fold-year on month-capped rows BEFORE the fold.
+    Also trains the consensus heads (ridge + RF) per fold (Fix 27)."""
     start_dt = pd.Timestamp(start_date)
     train_lo = (start_dt - pd.DateOffset(years=3)).strftime("%Y-%m-%d")
     first_year = start_dt.year
     last_year = pd.Timestamp(end_date).year
-    scorers = {}  # year -> {"model", "cols"}
+    scorers = {}  # year -> {"model", "cols", "ridge", "scaler", "rf"}
 
     for year in range(first_year, last_year + 1):
         fold_hi = f"{year}-01-01"
         print(f"[Backtest] Training fold model for {year} on rows < {fold_hi}...", flush=True)
-        X_list, y_list = [], []
+        X_list, y_list, yr_list = [], [], []
         month_count = {}
         with db_conn() as conn:
             result = conn.execution_options(
                 stream_results=True, max_row_buffer=20000).execute(text(
                 "SELECT symbol, entry_price, signal_date, features, "
-                "CAST(hit_8pct_before_m8pct AS INTEGER) "
+                "CAST(hit_8pct_before_m8pct AS INTEGER), "
+                "COALESCE(forward_return_63d, 0) "
                 "FROM model_training_set "
                 "WHERE features IS NOT NULL AND ABS(forward_peak_return_63d) <= 500 "
                 "AND signal_date >= :lo AND signal_date < :hi "
@@ -163,7 +187,7 @@ def _train_wfo_scorers(start_date: str, end_date: str, aux, cap_per_month: int =
             ), {"lo": max(train_lo, "2019-01-01"), "hi": fold_hi})
             for row in result.yield_per(20000):
                 try:
-                    symbol, entry_price, signal_date, feats_raw, lab = row
+                    symbol, entry_price, signal_date, feats_raw, lab, fwd = row
                     mkey = signal_date.strftime("%Y-%m")
                     if month_count.get(mkey, 0) >= cap_per_month:
                         continue
@@ -172,6 +196,7 @@ def _train_wfo_scorers(start_date: str, end_date: str, aux, cap_per_month: int =
                         continue
                     X_list.append(x)
                     y_list.append(int(lab) if lab is not None else 0)
+                    yr_list.append(float(fwd))
                     month_count[mkey] = month_count.get(mkey, 0) + 1
                 except Exception:
                     continue
@@ -182,10 +207,22 @@ def _train_wfo_scorers(start_date: str, end_date: str, aux, cap_per_month: int =
             continue
         X = np.asarray(X_list, dtype=np.float32)
         y = np.asarray(y_list, dtype=np.int8)
+        yr = np.asarray(yr_list, dtype=np.float32)
         X, cols = _prune(X)
         model = _train_fold_model(X, y)
-        scorers[year] = {"model": model, "cols": cols}
-        print(f"[Backtest] Fold {year}: {len(X)} rows, {len(cols)} features trained", flush=True)
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.ensemble import RandomForestClassifier
+        scaler = StandardScaler().fit(X)
+        ridge = Ridge(alpha=10.0).fit(scaler.transform(X), yr)
+        rf = RandomForestClassifier(
+            n_estimators=100, max_depth=12, min_samples_leaf=50,
+            class_weight="balanced", random_state=42, n_jobs=-1,
+        ).fit(X, y)
+        scorers[year] = {"model": model, "cols": cols,
+                         "ridge": ridge, "scaler": scaler, "rf": rf}
+        print(f"[Backtest] Fold {year}: {len(X)} rows, {len(cols)} features "
+              f"(+ridge+rf consensus heads) trained", flush=True)
     return scorers
 
 
@@ -232,6 +269,20 @@ def walk_forward_backtest(
             X_sel[:, j] = X[:, idx]
         proba = scorer["model"].predict_proba(X_sel)[:, 1]
 
+        # Fix 27: day-level consensus gate (R2: LGBM top-decile AND ridge-q75
+        # AND RF-q75). Applied only when the day batch is large enough.
+        from scipy.stats import rankdata
+        r_scores = scorer["ridge"].predict(scorer["scaler"].transform(X_sel))
+        rf_scores = scorer["rf"].predict_proba(X_sel)[:, 1]
+        n_day = len(X_sel)
+        if n_day >= 40:
+            dec = rankdata(proba) >= 0.9 * n_day
+            rfq = rankdata(rf_scores) >= 0.75 * n_day
+            rgq = rankdata(r_scores) >= 0.75 * n_day
+            eligible = dec & rfq & rgq
+        else:
+            eligible = np.ones(n_day, dtype=bool)
+
         # Bear breaker context from point-in-time row features
         vix_vals = [m["vix"] for m in day_meta]
         xjo_vals = [m["xjo_pos"] for m in day_meta]
@@ -260,13 +311,15 @@ def walk_forward_backtest(
                 })
                 open_positions.remove(pos)
 
-        # Open: top-5 by proba above threshold
+        # Open: top-5 by proba above threshold, consensus-eligible only
         order = np.argsort(proba)[::-1]
         opened = 0
         for i in order:
             if opened >= 5:
                 break
             if proba[i] < score_threshold:
+                continue
+            if not eligible[i]:
                 continue
             meta = day_meta[i]
             pos_value = portfolio_value * 0.05

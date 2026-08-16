@@ -501,3 +501,25 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   default tab is now the new Dashboard.
 - Deployed: backend restarted (200), frontend build served on :8081 (200),
   all 6 endpoints registered in OpenAPI.
+
+### [2026-08-17] Fix 34: Job health audit — 3 silent failures found and fixed
+- **Audit result:** 13 scheduler jobs registered and firing (model_training,
+  v2_daily_scan, paper_trade_monitor, walk_forward_oos, announcement_features,
+  pipeline_health, broad_scan, inc_update, smsf_*, sunday_rotation,
+  monthly_fundamentals). Today's 7AM training healthy — artifact
+  AUC **0.7448**, top decile **59.1%** (improved overnight).
+- **Fixed 1 — pipeline_health failing daily:** stage 9 queried
+  `job_execution_log` (table doesn't exist; real table is `job_runs`) — the
+  exception killed the whole daily health report before the Telegram summary.
+- **Fixed 2 — yfinance index-ticker bug (1,365 wasted requests/14h):**
+  `YFinanceService.get_info/get_history` blindly appended `.AX` (producing
+  `$^AXJO.AX`) and never marked it dead → 3 retries with backoff on every
+  call. Now normalized via `_asx_ticker` (strips $, never suffixes `^`
+  indices). `detect_market` also early-returns for index tickers. AXJO noise
+  after deploy: 0.
+- **Fixed 3 — stale `running` job_runs rows** (interrupted by container
+  restarts) cleaned up.
+- **Remaining non-critical noise:** intermittent FRED/EODHD timeouts
+  (retried by design), one pandas FutureWarning (cosmetic).
+- **UI:** legacy SMSF tab removed from nav per request (new 4 screens +
+  Markets/Analyze remain).

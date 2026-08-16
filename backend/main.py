@@ -1543,6 +1543,10 @@ def detect_market(symbol: str) -> str:
     Priority: explicit US list → explicit AU list → IN company list → try ASX live → default AU.
     """
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
+    if s.startswith("^"):
+        # Index tickers are already fully qualified — never probe ".AX".
+        return {"^AXJO": "AU", "^GSPC": "US", "^IXIC": "US", "^NDX": "US",
+                "^NSEI": "IN"}.get(s, "AU")
     if s in US_COMPANIES:
         return "US"
     if s in ASX_COMPANIES:
@@ -15557,7 +15561,7 @@ def _scheduled_pipeline_health_report():
 
             # 9. Pipeline activity check (failure alerting)
             r = c.execute(text(
-                "SELECT COUNT(*) FROM job_execution_log WHERE started_at >= CURRENT_DATE"
+                "SELECT COUNT(*) FROM job_runs WHERE started_at >= CURRENT_DATE"
             )).fetchone()
             jobs_today = r[0] if r else 0
             if jobs_today == 0:

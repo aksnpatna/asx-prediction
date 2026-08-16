@@ -146,6 +146,16 @@ class YFinanceService:
             }
 
     @staticmethod
+    def _asx_ticker(symbol: str) -> str:
+        """Normalize to a valid yfinance ticker: strip $, never suffix indices."""
+        s = (symbol or "").strip().lstrip("$").upper()
+        if not s:
+            return s
+        if s.startswith("^"):
+            return s  # index tickers are already fully qualified
+        return s if s.endswith(".AX") else f"{s}.AX"
+
+    @staticmethod
     def get_info(symbol: str) -> Optional[dict]:
         import yfinance as yf
 
@@ -155,7 +165,7 @@ class YFinanceService:
         for attempt in range(3):
             try:
                 _rate_limit()
-                ticker = yf.Ticker(f"{symbol}.AX")
+                ticker = yf.Ticker(YFinanceService._asx_ticker(symbol))
                 info = ticker.info
                 if not info or (info.get("trailingPE") is None and info.get("marketCap") is None):
                     YFinanceService.mark_dead(symbol, "NO_DATA")
@@ -186,7 +196,7 @@ class YFinanceService:
         for attempt in range(3):
             try:
                 _rate_limit()
-                ticker = yf.Ticker(f"{symbol}.AX")
+                ticker = yf.Ticker(YFinanceService._asx_ticker(symbol))
                 df = ticker.history(period=period, timeout=_TIMEOUT_SEC)
                 if df.empty:
                     YFinanceService.mark_dead(symbol, "NO_DATA")

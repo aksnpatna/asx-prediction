@@ -560,3 +560,14 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
 - **User isolation verified:** paper trades are stored per user_id (4 users
   own separate trade sets); all portfolio endpoints scope by uid; the only
   cross-user leak was the global peak tracker — now per-user.
+
+### [2026-08-17] Fix 38: Retire pre-lock-in model trades from view + G3 evidence
+- **Clarification:** paper trades NEVER feed model training (training uses
+  model_training_set only). Legacy trades only polluted the G3 paper-trade
+  evidence and the portfolio view.
+- **Action:** closed 26 open trades created before the model lock-in
+  (2026-08-15, Fix 26 config) with exit_reason='legacy_model_retired' —
+  kept in closed history for audit. Portfolio/Screener now only surface
+  current-model trades (8 open: STO Aug-15, SGP Aug-17).
+- **G3 protection:** self-learning loop and both closed-trade counts now
+  exclude legacy_model_retired rows (9 G3-eligible closed remain).

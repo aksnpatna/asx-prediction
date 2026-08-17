@@ -12862,7 +12862,8 @@ def _scheduled_self_learning_loop():
             trades = conn.execute(text("""
                 SELECT entry_price, current_price, position_stage
                 FROM paper_trades
-                WHERE status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal')
+                WHERE (status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal'))
+                  AND COALESCE(exit_reason, '') <> 'legacy_model_retired'
             """)).fetchall()
 
             min_trades = 3 if PAPER_BOOTSTRAP_MODE else 8
@@ -15035,7 +15036,7 @@ async def model_health_summary(current_user: dict = Depends(get_current_user)):
         }
         with db_conn() as conn:
             closed = conn.execute(text(
-                "SELECT COUNT(*) FROM paper_trades WHERE status='closed'")).fetchone()
+                "SELECT COUNT(*) FROM paper_trades WHERE status='closed' AND COALESCE(exit_reason, '') <> 'legacy_model_retired'")).fetchone()
             out["gates"]["G3"]["progress"] = f"{closed[0]}/60 closed"
     except Exception:
         pass
@@ -15065,7 +15066,7 @@ async def wealth_projection(capital: float = 200000, current_user: dict = Depend
     try:
         with db_conn() as conn:
             closed = conn.execute(text(
-                "SELECT COUNT(*) FROM paper_trades WHERE status='closed'")).fetchone()[0]
+                "SELECT COUNT(*) FROM paper_trades WHERE status='closed' AND COALESCE(exit_reason, '') <> 'legacy_model_retired'")).fetchone()[0]
             row = conn.execute(text(
                 "SELECT total_trades, win_rate_pct, recommended_action "
                 "FROM ai_self_learning_metrics ORDER BY evaluated_at DESC LIMIT 1")).fetchone()

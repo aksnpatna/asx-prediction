@@ -14851,6 +14851,21 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
+        # AI news sentiment per symbol (announcement NLP, T4-A)
+        ann_sent = {}
+        ann_titles = {}
+        try:
+            from announcement_features import load_announcement_features
+            ann_sent = load_announcement_features(db_conn)
+            with db_conn() as conn:
+                rows = conn.execute(text(
+                    "SELECT DISTINCT ON (symbol) symbol, title, sentiment "
+                    "FROM announcement_features ORDER BY symbol, ann_date DESC")).fetchall()
+                ann_titles = {r[0]: {"title": (r[1] or "")[:110], "sentiment": float(r[2] or 0)}
+                              for r in rows}
+        except Exception:
+            pass
+
         candidates = []
         for p in picks[:200]:
             try:
@@ -14887,6 +14902,11 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                 v = ai_verdicts.get(sym)
                 cand["ai_decision"] = v["decision"] if v else None
                 cand["ai_confidence"] = v["confidence"] if v else None
+                ns = ann_sent.get(sym)
+                cand["news_sentiment_7d"] = ns.get("ann_sentiment_7d") if ns else None
+                nt = ann_titles.get(sym)
+                cand["latest_announcement"] = nt["title"] if nt else None
+                cand["latest_ann_sentiment"] = nt["sentiment"] if nt else None
                 candidates.append(cand)
             except Exception:
                 continue

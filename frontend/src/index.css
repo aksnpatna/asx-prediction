@@ -797,3 +797,8 @@ body {
 /* AI verdict badges */
 .sx-ai-ok { color: #1A6B3C; font-weight: 800; font-size: 12px; margin-top: 4px; }
 .sx-ai-no { color: #DC2626; font-weight: 800; font-size: 12px; margin-top: 4px; }
+
+/* AI news sentiment strip */
+.sx-news { background: #F9FAFB; border: 1px solid var(--border); border-left: 4px solid #D1D5DB; border-radius: 10px; padding: 8px 10px; font-size: 13px; margin-bottom: 10px; }
+.sx-news-pos { border-left-color: #1A6B3C; background: #F0F9F4; }
+.sx-news-neg { border-left-color: #DC2626; background: #FEF2F2; }

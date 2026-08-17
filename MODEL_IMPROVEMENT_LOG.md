@@ -587,3 +587,23 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   rejected), sample-size sweep (Fix 26).
 - **P6 applied:** announcement NLP quota 25 → 50 symbols/day (env
   ANNOUNCEMENT_NLP_MAX_SYMBOLS).
+
+### [2026-08-17] Fix 40: Quality-lever A/B + benchmark comparison + news sentiment in UI
+- **Quality levers tested (backend/experiments/quality_ab.py, 200K adjacent
+  split):** focal reweighting with OOF predictions (AUC 0.5313 — destructive),
+  label smoothing via lgb.train (0.5000 — destructive), 3-seed ensemble
+  (0.7449/top 59.3% — within noise, 3× cost), focal+ensemble (0.5319).
+  NONE adopted. Model at a genuine plateau: best remaining measured lever is
+  the interaction features (+1.3pp top decile, Fix 39, pending re-test).
+- **External benchmark scan (2026-08-17):** honest published ASX references —
+  Trading Agent live record: 51.5% directional accuracy on 1,991 verified
+  calls (their own words: anyone claiming 80-90% is lying); public GitHub
+  ASX LSTM+FinBERT: test AUC 0.6449; academic PBFJ 2025 ASX study: tree
+  models best, no higher headline; I Know First: cherry-picked 3-day
+  windows (marketing); pro funds (Ten Cap): 340bps p.a. net, different game.
+  Our model (AUC 0.74-0.75 modern, top decile 58-60%) is above every honest
+  published ASX-specific number found.
+- **AI news sentiment now in the Screener:** /api/screener/scan joins
+  announcement_features (7-day aggregate + latest announcement per symbol);
+  StockCard shows the 📣 AI NEWS strip (sentiment + latest headline) where
+  coverage exists.

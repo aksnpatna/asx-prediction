@@ -108,6 +108,12 @@ export function StockCard({ c, onAI, aiOpen }) {
         {c.div_yield != null && <span className="sx-badge">💰 Div: {c.div_yield}%</span>}
         {c.franked && <span className="sx-badge sx-badge-frank">⊕ FRANKED</span>}
       </div>
+      {c.news_sentiment_7d != null && (
+        <div className={`sx-news ${c.news_sentiment_7d > 0 ? 'sx-news-pos' : c.news_sentiment_7d < 0 ? 'sx-news-neg' : ''}`}>
+          📣 AI NEWS: sentiment {c.news_sentiment_7d > 0 ? '+' : ''}{c.news_sentiment_7d} (7d)
+          {c.latest_announcement && <div className="sx-meta">Latest: {c.latest_announcement}</div>}
+        </div>
+      )}
       <button className="sx-ai-btn" onClick={() => onAI && onAI(c.symbol)}>
         ✦ AI ANALYST NOTE
       </button>

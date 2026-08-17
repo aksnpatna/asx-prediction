@@ -99,30 +99,51 @@ class DrawdownCircuitBreaker:
         return f"{emoji} <b>{level}</b>: {dd:.1f}% drawdown from ${state['peak_value']:,.0f} peak"
 
 
-def persist_peak_value(portfolio_value: float):
+def persist_peak_value(portfolio_value: float, uid: str = None):
     try:
         from sqlalchemy import text
         from main import db_conn
         with db_conn() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE portfolio_peak_tracker ADD COLUMN IF NOT EXISTS user_id TEXT"))
+                conn.commit()
+            except Exception:
+                pass
             conn.execute(text("""
-                INSERT INTO portfolio_peak_tracker (recorded_at, peak_value)
-                VALUES (CURRENT_TIMESTAMP, :val)
-            """), {"val": portfolio_value})
+                INSERT INTO portfolio_peak_tracker (recorded_at, peak_value, user_id)
+                VALUES (CURRENT_TIMESTAMP, :val, :uid)
+            """), {"val": portfolio_value, "uid": uid})
             conn.commit()
     except Exception:
         pass
 
 
-def get_peak_value() -> float:
+def get_peak_value(uid: str = None, default: float = 0.0) -> float:
+    """Latest recorded peak. Per-user when uid given (fresh users fall back to
+    `default` — the global tracker holds legacy summed values that poison
+    per-user breakers)."""
     try:
         from sqlalchemy import text
         from main import db_conn
         with db_conn() as conn:
+            if uid:
+                try:
+                    row = conn.execute(text(
+                        "SELECT peak_value FROM portfolio_peak_tracker "
+                        "WHERE user_id = :uid ORDER BY recorded_at DESC LIMIT 1"),
+                        {"uid": uid}).fetchone()
+                    if row and row[0]:
+                        return float(row[0])
+                except Exception:
+                    pass
+                return float(default or 0.0)
             row = conn.execute(text(
-                "SELECT peak_value FROM portfolio_peak_tracker ORDER BY recorded_at DESC LIMIT 1"
+                "SELECT peak_value FROM portfolio_peak_tracker "
+                "ORDER BY recorded_at DESC LIMIT 1"
             )).fetchone()
             if row:
                 return float(row[0])
     except Exception:
         pass
-    return 0.0
+    return float(default or 0.0)

@@ -142,7 +142,7 @@ export function SatelliteClock({ pos }) {
         Entered {fmtMoney(pos.entry_price)} · Now {fmtMoney(pos.current_price)} ·{' '}
         <b className={pos.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{pos.pnl_pct > 0 ? '+' : ''}{pos.pnl_pct}%</b>
       </div>
-      {pos.target_price && <div className="sx-meta">Target: {fmtMoney(pos.target_price)} (+8%) · Stop: {pos.catastrophe_stop_price != null ? fmtMoney(pos.catastrophe_stop_price) : '—'} (−20%)</div>}
+      {pos.target_price && <div className="sx-meta">Target: {fmtMoney(pos.target_price)} (+{pos.target_pct ?? 8}%) · Stop: {pos.catastrophe_stop_price != null ? fmtMoney(pos.catastrophe_stop_price) : '—'} (−20%)</div>}
       {pos.time_stop_date && <div className="sx-meta">Exit window closes: {pos.time_stop_date}</div>}
       <div className={status.cls}>{status.text}</div>
     </div>
@@ -443,8 +443,14 @@ export function PortfolioScreen({ token }) {
     <Screen title="My SMSF Portfolio" subtitle="What you own, how it's doing, what needs attention">
       <CircuitBreakerBanner level={cb.level} drawdown_pct={cb.drawdown_pct} />
       <div className="sx-nav-card">
-        <div className="sx-hero-num">{fmtMoney(d.nav)}</div>
-        <div className={d.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{d.pnl_pct > 0 ? '+' : ''}{d.pnl_pct}% since inception</div>
+        <div className="sx-hero-num">{fmtMoney(d.cash)}</div>
+        <div className="sx-meta">
+          Cash available — {fmtMoney(d.starting_capital)} minus {fmtMoney(d.invested)} invested in
+          {' '}{d.satellite_positions?.length || 0} open {d.satellite_positions?.length === 1 ? 'trade' : 'trades'}
+        </div>
+        <div className={d.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>
+          Portfolio value {fmtMoney(d.nav)} ({d.pnl_pct > 0 ? '+' : ''}{d.pnl_pct}% since inception)
+        </div>
         <div className="sx-bar">
           <div className="sx-bar-fill sx-split-core" style={{ width: `${d.core_pct || 0}%` }} />
           <div className="sx-bar-fill sx-split-sat" style={{ width: `${d.satellite_pct || 0}%` }} />

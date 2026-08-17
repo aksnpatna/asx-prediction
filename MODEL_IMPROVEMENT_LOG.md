@@ -540,3 +540,23 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   REJECTED / 🤖 AI REVIEW PENDING and a new "✅ AI APPROVED" filter chip.
 - Note: today's verdicts (8AM run, pre-fix) are unrecoverable — population
   starts at the next scan. Until then candidates honestly show REVIEW PENDING.
+
+### [2026-08-17] Fix 37: Portfolio correctness — live prices, cash headline, per-user breaker
+- **Entered==Now bug:** `list_paper_trades` used `row[5]` (entry_price) as
+  current_price — the monitor-updated DB `current_price` was never read.
+  Now selected and used with entry fallback (verified: STO 7.99→8.04 live).
+- **Cash headline:** Portfolio now shows available cash = starting capital −
+  invested (per user request: $100,000 − sum of shares bought), with
+  invested/portfolio-value sub-lines. nav-breakdown returns invested +
+  starting_capital; target % computed from the real take-profit (was
+  hardcoded +8%, auto-created trades use +12% when the model is bearish);
+  catastrophe stop falls back to entry×0.80 when unset.
+- **Per-user circuit breaker:** `portfolio_peak_tracker` was GLOBAL and held
+  legacy summed values ($137–147K vs $100K budgets) — every user saw
+  "RISK STATUS: STOP, SATELLITE FROZEN". Table gains user_id; get_peak_value
+  is per-user with starting-capital default (fresh users start NORMAL);
+  smsf_dashboard persists the user's peak on view; morning-brief now carries
+  the per-user breaker for the Dashboard banner.
+- **User isolation verified:** paper trades are stored per user_id (4 users
+  own separate trade sets); all portfolio endpoints scope by uid; the only
+  cross-user leak was the global peak tracker — now per-user.

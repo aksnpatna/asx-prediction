@@ -4992,7 +4992,7 @@ def list_paper_trades(user_id: str) -> list[dict]:
                       signal_score, signal_trend, signal_warning, notes, created_at, closed_at,
                       peak_price, stop_loss_price, take_profit_price, trailing_stop_pct,
                       review_date, last_alert_at, position_stage, recommendation_action, source_reason,
-                      entry_date_parsed
+                      entry_date_parsed, current_price
                 FROM paper_trades
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
@@ -5004,7 +5004,11 @@ def list_paper_trades(user_id: str) -> list[dict]:
     for row in rows:
         symbol = row[1]
         market = row[2] or "AU"
-        current_price = float(row[5])  # default to entry price (avoids hanging on yfinance)
+        # Live price: the paper monitor refreshes current_price every 15 min
+        # during market hours; fall back to entry price only when unset.
+        current_price = float(row[24]) if len(row) > 24 and row[24] is not None else float(row[5])
+        if current_price <= 0:
+            current_price = float(row[5])
         results.append(_paper_trade_snapshot(row, current_price))
     return results
 
@@ -6424,10 +6428,13 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
             "open_count": len(open_positions), "closed_count": len(closed_positions),
         }
 
-        # Circuit breaker
-        from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
-        breaker = DrawdownCircuitBreaker(peak_value=max(get_peak_value(), starting_capital))
+        # Circuit breaker — per-user peak (the global tracker holds legacy
+        # summed values that would falsely trip every user's breaker)
+        from circuit_breaker import DrawdownCircuitBreaker, get_peak_value, persist_peak_value
+        breaker = DrawdownCircuitBreaker(
+            peak_value=max(get_peak_value(uid, default=starting_capital), starting_capital))
         breaker_state = breaker.check(total_value)
+        persist_peak_value(total_value, uid)
         result["circuit_breaker"] = {
             "level": breaker_state["level"], "drawdown_pct": breaker_state.get("drawdown_pct", 0),
             "peak_value": breaker_state.get("peak_value", total_value),
@@ -14895,7 +14902,8 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
 async def portfolio_nav_breakdown(current_user: dict = Depends(get_current_user)):
     """UI uplift: core/satellite split, CGT alerts, sector caps for the portfolio screen."""
     uid = current_user["id"]
-    out = {"nav": 0, "cash": 0, "pnl_pct": 0, "core_pct": 0, "satellite_pct": 0,
+    out = {"nav": 0, "cash": 0, "invested": 0, "starting_capital": 0,
+           "pnl_pct": 0, "core_pct": 0, "satellite_pct": 0,
            "core_positions": [], "satellite_positions": [], "cgt_alerts": [],
            "sector_exposure": [], "gate_alerts": []}
     try:
@@ -14903,7 +14911,9 @@ async def portfolio_nav_breakdown(current_user: dict = Depends(get_current_user)
         state = _compute_portfolio_state(uid)
         out["nav"] = round(state["total_equity"], 0)
         out["cash"] = round(state["available_cash"], 0)
+        out["invested"] = round(state.get("invested", 0), 0)
         start = state.get("starting_capital", 0) or 200000
+        out["starting_capital"] = round(start, 0)
         out["pnl_pct"] = round((state["total_equity"] / start - 1) * 100, 1) if start else 0
 
         from portfolio_gate import SECTOR_CAPS
@@ -14924,9 +14934,9 @@ async def portfolio_nav_breakdown(current_user: dict = Depends(get_current_user)
                 "pnl_pct": round((cur / entry - 1) * 100, 1) if entry else 0,
                 "current_price": round(cur, 2), "entry_price": round(entry, 2),
                 "sector": p.get("sector", "DEFAULT"),
-                "target_price": p.get("target_price"),
-                "take_profit_price": p.get("take_profit_price"),
-                "catastrophe_stop_price": p.get("catastrophe_stop_price"),
+                "target_price": p.get("take_profit_price") or p.get("target_price"),
+                "target_pct": round((float(p.get("take_profit_price") or p.get("target_price") or 0) / entry - 1) * 100, 1) if entry else 8.0,
+                "catastrophe_stop_price": p.get("catastrophe_stop_price") or round(entry * 0.80, 2) if entry else None,
                 "time_stop_date": str(p.get("time_stop_date", ""))[:10] if p.get("time_stop_date") else None,
                 "entry_date": str(p.get("entry_date_parsed") or p.get("created_at"))[:10],
                 "position_stage": p.get("position_stage", ""),
@@ -15122,8 +15132,23 @@ async def dashboard_morning_brief(current_user: dict = Depends(get_current_user)
     """UI uplift: today's actions, regime, positions summary, model health blurb."""
     uid = current_user["id"]
     out = {"regime": {}, "actions": [], "satellite_summary": [], "model": {},
-           "announcements": []}
+           "announcements": [], "circuit_breaker": {}}
     try:
+        # Per-user circuit breaker (same basis as /api/smsf/dashboard)
+        try:
+            pf_state = _compute_portfolio_state(uid)
+            start_cap = pf_state.get("starting_capital", 0) or 200000
+            from circuit_breaker import DrawdownCircuitBreaker, get_peak_value
+            _cb = DrawdownCircuitBreaker(
+                peak_value=max(get_peak_value(uid, default=start_cap), start_cap))
+            _cb_state = _cb.check(pf_state["total_equity"])
+            out["circuit_breaker"] = {
+                "level": _cb_state["level"],
+                "drawdown_pct": _cb_state.get("drawdown_pct", 0),
+                "description": _cb_state.get("description", ""),
+            }
+        except Exception:
+            pass
         vix, xjo = None, None
         try:
             vix = _get_vix_level()

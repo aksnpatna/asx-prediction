@@ -571,3 +571,19 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   current-model trades (8 open: STO Aug-15, SGP Aug-17).
 - **G3 protection:** self-learning loop and both closed-trade counts now
   exclude legacy_model_retired rows (9 G3-eligible closed remain).
+
+### [2026-08-17] Fix 39: Next-lever A/B — measured, nothing adopted
+- **Tested (200K modern pipeline, adjacent split, experiment
+  backend/experiments/next_lever_ab.py):**
+  - Recency half-life 180/270/365d: within noise (AUC 0.7436–0.7460) — 365d kept
+  - 4 macro-interaction features (vix×mom20, copper/gold×macd, vix×atr,
+    yield×mom63): AUC 0.7483 (+0.0023), top decile 60.0% (+1.3pp) — below
+    the +0.005 AUC adoption rule; flagged for re-test after a week of data
+  - PIT EPS-growth features (qoq/yoy from eps_history): AUC 0.7374 (down)
+    but top 60.7% — ranking reshuffle, not a clean win; not adopted
+  - Combo: 0.7424 — worse than interactions alone
+- **Also from the review list (already done earlier, no action needed):**
+  blend weight 0 (Fix 26), param sweep (Fix 31), regime heads (Fix 21
+  rejected), sample-size sweep (Fix 26).
+- **P6 applied:** announcement NLP quota 25 → 50 symbols/day (env
+  ANNOUNCEMENT_NLP_MAX_SYMBOLS).

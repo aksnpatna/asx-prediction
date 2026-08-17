@@ -2,13 +2,44 @@ import React, { useState, useEffect, useMemo } from 'react'
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api'
-const STARTING_CAPITAL = 30000
+// NOTE: STARTING_CAPITAL is now loaded from the API — see budgetInfo below.
+
+// ── Projection math ─────────────────────────────────────────────────────────
+function projectCapital(startingCap, annualRate, years) {
+  return Array.from({ length: years + 1 }, (_, i) => Math.round(startingCap * Math.pow(1 + annualRate, i)))
+}
+
+const SCENARIOS = [
+  { key: 'conservative', label: 'Conservative', rate: 0.144, color: '#9CA3AF' },
+  { key: 'base',         label: 'Base',          rate: 0.183, color: '#0F0F0F' },
+  { key: 'bull',         label: 'Bull',          rate: 0.223, color: '#1A6B3C' },
+]
+
+const CALENDAR_DATA = [
+  { month: 'Jan', stars: 2, avg: 3.8, winRate: 54, note: '' },
+  { month: 'Feb', stars: 0, avg: -0.4, winRate: 38, note: 'Avoid' },
+  { month: 'Mar', stars: 0, avg: 0.1, winRate: 40, note: 'Avoid' },
+  { month: 'Apr', stars: 3, avg: 4.9, winRate: 62, note: 'Strong entry' },
+  { month: 'May', stars: 1, avg: 1.8, winRate: 46, note: '' },
+  { month: 'Jun', stars: 0, avg: -0.8, winRate: 35, note: 'Avoid' },
+  { month: 'Jul', stars: 3, avg: 5.2, winRate: 64, note: 'Strong entry' },
+  { month: 'Aug', stars: 2, avg: 3.2, winRate: 54, note: '' },
+  { month: 'Sep', stars: 0, avg: 0.4, winRate: 42, note: 'Caution' },
+  { month: 'Oct', stars: 0, avg: 0.9, winRate: 43, note: 'Caution' },
+  { month: 'Nov', stars: 3, avg: 5.97, winRate: 59, note: 'Best entry month' },
+  { month: 'Dec', stars: 1, avg: 1.2, winRate: 47, note: '' },
+]
 
 export default function WealthTab({ token, preferredMarket }) {
   const [suggestions, setSuggestions] = useState([])
   const [paperTrades, setPaperTrades] = useState([])
   const [wfo, setWfo] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [smsfData, setSmsfData] = useState(null)
+  const [startingCap, setStartingCap] = useState(200000)
+  const [scenario, setScenario] = useState('base')
+  const [capInput, setCapInput] = useState('')
+  const [editingCap, setEditingCap] = useState(false)
 
   const authH = () => ({ headers: { Authorization: `Bearer ${token}` } })
 
@@ -16,10 +47,12 @@ export default function WealthTab({ token, preferredMarket }) {
     async function load() {
       setLoading(true)
       try {
-        const [sugRes, tradesRes, wfoRes] = await Promise.allSettled([
+        const [sugRes, tradesRes, wfoRes, dashRes, budgetRes] = await Promise.allSettled([
           axios.get(`${API_BASE}/suggestions/tracking`, { ...authH(), params: { days: 90 } }),
           axios.get(`${API_BASE}/paper-trades`, authH()),
           axios.get(`${API_BASE}/walk-forward/oos`, authH()),
+          axios.get(`${API_BASE}/smsf/dashboard`, authH()),
+          axios.get(`${API_BASE}/user/investment-budget`, authH()),
         ])
 
         if (sugRes.status === 'fulfilled') {
@@ -30,6 +63,19 @@ export default function WealthTab({ token, preferredMarket }) {
         }
         if (wfoRes.status === 'fulfilled') {
           setWfo(wfoRes.value.data || null)
+        }
+        if (dashRes.status === 'fulfilled') {
+          setSmsfData(dashRes.value.data)
+        }
+        // Real starting capital from budget API
+        if (budgetRes.status === 'fulfilled') {
+          const b = budgetRes.value.data
+          const cap = b?.total_budget || b?.starting_capital || 200000
+          setStartingCap(cap)
+        } else if (dashRes.status === 'fulfilled') {
+          // Fallback: portfolio starting capital from dashboard
+          const sc = dashRes.value.data?.portfolio?.starting_capital
+          if (sc && sc > 0) setStartingCap(sc)
         }
       } catch (e) {
         console.error('Wealth load:', e)
@@ -42,9 +88,9 @@ export default function WealthTab({ token, preferredMarket }) {
   const portfolio = useMemo(() => {
     const closed = paperTrades.filter(t => t.status === 'closed')
     const open = paperTrades.filter(t => t.status === 'open')
-    const realizedPnl = closed.reduce((s, t) => s + (t.current_pnl || 0), 0)
-    const invested = open.reduce((s, t) => s + ((t.entry_price || 0) * (t.qty || 0)), 0)
-    const totalEquity = STARTING_CAPITAL + realizedPnl
+    const realizedPnl = closed.reduce((s, t) => s + (t.unrealized_pnl_value || 0), 0)
+    const invested = open.reduce((s, t) => s + ((t.entry_price || 0) * (t.quantity || 0)), 0)
+    const totalEquity = startingCap + realizedPnl
     return {
       totalEquity: totalEquity.toFixed(0),
       availableCash: (totalEquity - invested).toFixed(0),
@@ -53,7 +99,7 @@ export default function WealthTab({ token, preferredMarket }) {
       openCount: open.length,
       closedCount: closed.length,
     }
-  }, [paperTrades])
+  }, [paperTrades, startingCap])
 
   const evalStats = useMemo(() => {
     const evaluated = suggestions.filter(s => s.status !== 'PENDING')
@@ -79,9 +125,9 @@ export default function WealthTab({ token, preferredMarket }) {
     const sectors = {}
     paperTrades.filter(t => t.status === 'open').forEach(t => {
       const s = t.sector || 'Unknown'
-      sectors[s] = (sectors[s] || 0) + ((t.entry_price || 0) * (t.qty || 0))
+      sectors[s] = (sectors[s] || 0) + ((t.entry_price || 0) * (t.quantity || 0))
     })
-    const total = Object.values(sectors).reduce((a, b) => a + b, STARTING_CAPITAL)
+    const total = Object.values(sectors).reduce((a, b) => a + b, startingCap)
     return Object.entries(sectors).map(([k, v]) => ({ sector: k, value: v, pct: (v / total * 100).toFixed(1) }))
   }, [paperTrades])
 
@@ -90,10 +136,200 @@ export default function WealthTab({ token, preferredMarket }) {
   const wfoLatest90d = wfo?.latest_90d
   const capitalGate = wfo?.capital_gate
 
-  if (loading) return <div style={{ padding: 40, color: '#94a3b8' }}>Loading wealth...</div>
+  if (loading) return (
+    <div style={{ padding: 40, textAlign: 'center', color: '#6B7280', fontFamily: "'Outfit', sans-serif" }}>
+      <div style={{ fontSize: 32, marginBottom: 12 }}>📈</div>
+      Loading your wealth projector…
+    </div>
+  )
+
+  // ── G-Gate live data ────────────────────────────────────────────────────────
+  const closedTradeCount = paperTrades.filter(t => t.status === 'closed').length
+  const auc = smsfData?.model?.auc
+  const topDecileRaw = (() => {
+    try { const m = (smsfData?.model?.notes || '').match(/topDecile=(\d+\.?\d*)/); return m ? parseFloat(m[1]) : null } catch { return null }
+  })()
+  const g1Done = true // Survivorship de-bias complete from MODEL_IMPROVEMENT_LOG Fix 6
+  const g2Done = topDecileRaw != null && topDecileRaw >= 60
+  const g3Done = closedTradeCount >= 60
+  const g3Count = Math.min(closedTradeCount, 60)
+
+  const gGates = [
+    { id: 'G1', done: g1Done, label: 'Survivorship bias removed — 1,858 delisted stocks added', plain: 'Training on realistic market data (includes stocks that went bust)' },
+    { id: 'G2', done: g2Done, label: `WFO top-decile ≥60% OOS — ${topDecileRaw ? topDecileRaw.toFixed(1) + '% current' : 'in progress'}`, plain: `AI wins ${topDecileRaw ? topDecileRaw.toFixed(1) : '—'}% of top picks vs 60% target` },
+    { id: 'G3', done: g3Done, label: `60 paper trades — ${g3Count}/60 logged`, plain: `Paper trading proof: ${g3Count} of 60 test trades complete` },
+    { id: 'G4', done: false, label: 'Micro-live $500–$1K positions', plain: 'First real money: small test trades with real dollars' },
+    { id: 'G5', done: false, label: 'Risk limits consistent + CI ≥ 0.5', plain: '12 months of consistent results before full deployment' },
+  ]
+
+  // ── Projection chart data ───────────────────────────────────────────────────
+  const startYear = new Date().getFullYear()
+  const years = 9
+  const yearLabels = Array.from({ length: years + 1 }, (_, i) => startYear + i)
+  const projections = {}
+  SCENARIOS.forEach(s => { projections[s.key] = projectCapital(startingCap, s.rate, years) })
+  const activeScenario = SCENARIOS.find(s => s.key === scenario)
+  const milestoneYears = [2, 4, 7, 9]
+
+  // ── Calendar ────────────────────────────────────────────────────────────────
+  const currentMonth = new Date().getMonth() // 0 = Jan
+  const nextStrongMonth = CALENDAR_DATA.findIndex((m, i) => i > currentMonth && m.stars >= 2)
+  const currentMonthData = CALENDAR_DATA[currentMonth]
+
+  const fmtK = n => n >= 1000000 ? `$${(n / 1000000).toFixed(2)}M` : `$${Math.round(n / 1000)}K`
 
   return (
-    <div style={{ padding: '20px 24px', maxWidth: 1100, margin: '0 auto' }}>
+    <div style={{ fontFamily: "'Outfit', -apple-system, BlinkMacSystemFont, sans-serif", background: '#F9FAFB', minHeight: '100vh', paddingBottom: 80 }}>
+      <div style={{ maxWidth: 860, margin: '0 auto', padding: '20px 16px' }}>
+
+        {/* ── Wealth Projector ──────────────────────────────────────────────── */}
+        <div style={{ background: '#fff', border: '1px solid #E5E7EB', borderRadius: 12, padding: '20px 22px', marginBottom: 20 }}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: '#0F0F0F', marginBottom: 4 }}>Wealth Projector</div>
+          <div style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>$200K → $1M by 2035 — scenario planner</div>
+
+          {/* Capital input */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+            {editingCap ? (
+              <>
+                <input
+                  type="number"
+                  value={capInput}
+                  onChange={e => setCapInput(e.target.value)}
+                  style={{ border: '1.5px solid #0F0F0F', borderRadius: 8, padding: '6px 12px', fontSize: 16, fontWeight: 700, width: 160 }}
+                  autoFocus
+                />
+                <button onClick={() => { const v = parseFloat(capInput); if (v > 0) setStartingCap(v); setEditingCap(false); }} style={{ background: '#0F0F0F', color: '#fff', border: 'none', borderRadius: 8, padding: '6px 14px', cursor: 'pointer', fontWeight: 700 }}>Save</button>
+                <button onClick={() => setEditingCap(false)} style={{ background: '#F3F4F6', border: 'none', borderRadius: 8, padding: '6px 14px', cursor: 'pointer' }}>Cancel</button>
+              </>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, border: '1px solid #E5E7EB', borderRadius: 8, padding: '8px 14px', cursor: 'pointer' }} onClick={() => { setCapInput(startingCap); setEditingCap(true); }}>
+                <span style={{ fontWeight: 800, fontSize: 18, color: '#0F0F0F' }}>${startingCap.toLocaleString()} SMSF</span>
+                <span style={{ color: '#9CA3AF' }}>✎</span>
+              </div>
+            )}
+          </div>
+
+          {/* Scenario selector */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+            {SCENARIOS.map(s => (
+              <button key={s.key} onClick={() => setScenario(s.key)} style={{
+                padding: '7px 14px', borderRadius: 20, border: '1.5px solid',
+                borderColor: scenario === s.key ? '#0F0F0F' : '#E5E7EB',
+                background: scenario === s.key ? '#0F0F0F' : '#fff',
+                color: scenario === s.key ? '#fff' : '#6B7280',
+                fontWeight: 700, fontSize: 12, cursor: 'pointer',
+              }}>
+                {s.label}<br />
+                <span style={{ fontSize: 10, fontWeight: 400 }}>{(s.rate * 100).toFixed(1)}%/yr net</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Simple ASCII-style projection bar chart */}
+          <div style={{ marginBottom: 20 }}>
+            <div style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 8 }}>Projected SMSF value — {activeScenario?.label} scenario</div>
+            {yearLabels.filter((_, i) => i > 0 && i % 2 === 0 || i === years).map((yr, i) => {
+              const idx = yearLabels.indexOf(yr)
+              const val = projections[scenario][idx]
+              const maxVal = projections['bull'][years]
+              const barWidth = Math.round((val / maxVal) * 100)
+              return (
+                <div key={yr} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <div style={{ fontSize: 11, color: '#6B7280', width: 36, textAlign: 'right', flexShrink: 0 }}>{yr}</div>
+                  <div style={{ flex: 1, background: '#F3F4F6', borderRadius: 4, height: 20, overflow: 'hidden' }}>
+                    <div style={{ width: `${barWidth}%`, height: '100%', background: '#1A6B3C', borderRadius: 4, display: 'flex', alignItems: 'center', paddingLeft: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: '#fff', whiteSpace: 'nowrap' }}>{fmtK(val)}</span>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Milestone cards */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+            {milestoneYears.map(y => (
+              <div key={y} style={{ background: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 8, padding: '10px 12px', textAlign: 'center' }}>
+                <div style={{ fontSize: 11, color: '#9CA3AF' }}>{startYear + y}</div>
+                <div style={{ fontWeight: 800, fontSize: 16, color: '#0F0F0F' }}>{fmtK(projections[scenario][y])}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── SMSF Tax Advantage ────────────────────────────────────────────── */}
+        <div style={{ background: '#fff', border: '1px solid #E5E7EB', borderRadius: 12, padding: '16px 20px', marginBottom: 20 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#0F0F0F', marginBottom: 10 }}>💰 SMSF Tax Advantage</div>
+          {[
+            '15% SMSF tax rate — vs your personal marginal rate (up to 47%). Every dollar saved in tax compounds.',
+            'Fully franked dividends from CBA/BHP add an effective ~0.6%/yr on top of the stated yield.',
+            'Hold satellite trades >12 months → CGT drops to ~10% effective rate (1/3 SMSF discount).',
+          ].map((t, i) => (
+            <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 8, fontSize: 13, color: '#374151' }}>
+              <span style={{ color: '#1A6B3C', fontWeight: 700, flexShrink: 0 }}>●</span>
+              <span>{t}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* ── G-Gate Validation Progress ────────────────────────────────────── */}
+        <div style={{ background: '#fff', border: '1px solid #E5E7EB', borderRadius: 12, padding: '16px 20px', marginBottom: 20 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#0F0F0F', marginBottom: 4 }}>G-GATE VALIDATION PROGRESS</div>
+          <div style={{ fontSize: 12, color: '#6B7280', marginBottom: 14 }}>5 checkpoints before investing real SMSF money</div>
+          {gGates.map((g, i) => (
+            <div key={g.id} style={{ display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: 12 }}>
+              <span style={{ fontSize: 18, flexShrink: 0 }}>{g.done ? '✅' : i === 1 && !g2Done ? '🟡' : i === 2 && !g3Done && g3Count > 0 ? '🟡' : '🔲'}</span>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 13, color: '#0F0F0F' }}>{g.id}: {g.plain}</div>
+                <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 2 }}>{g.label}</div>
+              </div>
+            </div>
+          ))}
+          <div style={{ marginTop: 14, padding: '10px 14px', background: '#E8F5EE', borderRadius: 8, fontSize: 13, color: '#1A6B3C', fontWeight: 600 }}>
+            Estimated live capital date: NOVEMBER 2026
+          </div>
+        </div>
+
+        {/* ── Deployment Calendar ────────────────────────────────────────────── */}
+        <div style={{ background: '#fff', border: '1px solid #E5E7EB', borderRadius: 12, padding: '16px 20px', marginBottom: 20 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#0F0F0F', marginBottom: 4 }}>OPTIMAL DEPLOYMENT MONTHS</div>
+          <div style={{ fontSize: 12, color: '#6B7280', marginBottom: 14 }}>Based on 10+ years of ASX monthly seasonality data</div>
+
+          {/* Current month highlight */}
+          <div style={{ background: currentMonthData.stars >= 2 ? '#E8F5EE' : currentMonthData.stars === 0 ? '#FEF2F2' : '#FFFBEB', border: `1px solid ${currentMonthData.stars >= 2 ? '#1A6B3C' : currentMonthData.stars === 0 ? '#DC2626' : '#D97706'}22`, borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 13 }}>
+            <strong style={{ color: currentMonthData.stars >= 2 ? '#1A6B3C' : currentMonthData.stars === 0 ? '#DC2626' : '#D97706' }}>
+              {CALENDAR_DATA[currentMonth].month} — NOW {currentMonthData.stars >= 3 ? '★★★' : currentMonthData.stars >= 2 ? '★★' : currentMonthData.stars === 1 ? '★' : '✗'}
+            </strong>
+            <span style={{ color: '#6B7280', marginLeft: 8 }}>
+              {currentMonthData.note || (currentMonthData.stars >= 2 ? 'Good month to enter new positions' : currentMonthData.stars === 0 ? 'Avoid new positions this month' : 'Neutral — be selective')}
+            </span>
+            <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 4 }}>
+              Historical avg: {currentMonthData.avg >= 0 ? '+' : ''}{currentMonthData.avg}% · Win rate: {currentMonthData.winRate}%
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 4 }}>
+            {CALENDAR_DATA.map((m, i) => {
+              const isNow = i === currentMonth
+              const starsStr = m.stars >= 3 ? '★★★' : m.stars >= 2 ? '★★' : m.stars === 1 ? '★' : m.note === 'Avoid' ? '✗' : '·'
+              const bgColor = isNow ? '#0F0F0F' : m.stars >= 3 ? '#E8F5EE' : m.stars === 0 ? '#FEF2F2' : '#fff'
+              const textColor = isNow ? '#fff' : m.stars >= 3 ? '#1A6B3C' : m.stars === 0 ? '#DC2626' : '#6B7280'
+              return (
+                <div key={m.month} title={`${m.note || ''} · ${m.avg >= 0 ? '+' : ''}${m.avg}% avg · ${m.winRate}% win rate`} style={{ background: bgColor, border: '1px solid #E5E7EB', borderRadius: 6, padding: '6px 4px', textAlign: 'center', cursor: 'help' }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: isNow ? '#9CA3AF' : '#9CA3AF' }}>{m.month}</div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: textColor }}>{starsStr}</div>
+                </div>
+              )
+            })}
+          </div>
+          <div style={{ fontSize: 11, color: '#9CA3AF', marginTop: 8 }}>
+            November: best entry month of the year — +5.97% avg, 59% win rate.
+          </div>
+        </div>
+
+      {/* ── Existing sections below (WFO, tracking etc) ──────────────────── */}
+      <div style={{ padding: '0' }}>
+
       {/* ── Portfolio Dashboard ────────────────────────────────────────────── */}
       <div style={{ marginBottom: 24 }}>
         <h2 style={{ color: '#e2e8f0', fontSize: 22, margin: '0 0 12px 0' }}>Wealth Dashboard</h2>
@@ -320,6 +556,8 @@ export default function WealthTab({ token, preferredMarket }) {
           </div>
         </div>
       )}
+      </div>
+      </div>
     </div>
   )
 }

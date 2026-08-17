@@ -4926,6 +4926,31 @@ def _paper_trade_snapshot(row, current_price: float) -> dict:
     invested_capital = entry_value + entry_fee
     net_pnl_pct = (net_pnl_value / invested_capital) * 100.0 if invested_capital > 0 else 0.0
 
+    # Fix: compute days_held from entry_date_parsed (column 23) — not created_at.
+    # entry_date_parsed is the actual trade entry date set at paper-trade creation.
+    # created_at is the DB row insert timestamp (= today at 0 days), hence the Day 0/63 bug.
+    days_held = 0
+    entry_date_parsed = row[23] if len(row) > 23 else None
+    try:
+        from datetime import date as _date
+        if entry_date_parsed is not None:
+            # entry_date_parsed may be a date object or an ISO string
+            if hasattr(entry_date_parsed, 'date'):
+                ed = entry_date_parsed.date() if hasattr(entry_date_parsed, 'date') else entry_date_parsed
+            elif isinstance(entry_date_parsed, str):
+                ed = _date.fromisoformat(entry_date_parsed[:10])
+            else:
+                ed = entry_date_parsed
+            days_held = (_date.today() - ed).days
+        elif row[12]:  # fallback: created_at (less accurate, may be 0 on new entries)
+            created = row[12]
+            if hasattr(created, 'date'):
+                days_held = (_date.today() - created.date()).days
+            elif isinstance(created, str):
+                days_held = (_date.today() - _date.fromisoformat(created[:10])).days
+    except Exception:
+        days_held = 0
+
     return {
         "id": row[0],
         "symbol": row[1],
@@ -4951,6 +4976,8 @@ def _paper_trade_snapshot(row, current_price: float) -> dict:
         "position_stage": row[20] or "entered",
         "recommendation_action": row[21],
         "source_reason": row[22],
+        "entry_date_parsed": entry_date_parsed.isoformat() if hasattr(entry_date_parsed, 'isoformat') else (str(entry_date_parsed) if entry_date_parsed else None),
+        "days_held": days_held,
         "unrealized_pnl_pct": round(net_pnl_pct, 2),
         "unrealized_pnl_value": round(net_pnl_value, 2),
         "brokerage_fees": total_brokerage,
@@ -4964,7 +4991,8 @@ def list_paper_trades(user_id: str) -> list[dict]:
                 SELECT id, symbol, market, side, quantity, entry_price, target_price, status,
                       signal_score, signal_trend, signal_warning, notes, created_at, closed_at,
                       peak_price, stop_loss_price, take_profit_price, trailing_stop_pct,
-                      review_date, last_alert_at, position_stage, recommendation_action, source_reason
+                      review_date, last_alert_at, position_stage, recommendation_action, source_reason,
+                      entry_date_parsed
                 FROM paper_trades
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
@@ -6566,6 +6594,94 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         return result
     except Exception as e:
         return {"error": str(e), **result}
+
+
+# ── Screener Summary — fast cached metadata for hero stats ────────────────────
+@app.get("/api/screener/summary")
+async def screener_summary(current_user: dict = Depends(get_current_user)):
+    """Fast O(1) summary: stocks screened, top decile hit, high conviction count, model edge.
+    Returns cached metadata only — no heavy computation. Designed to load before candidate list."""
+    summary = {
+        "stocks_screened": None,
+        "top_decile_hit_pct": None,
+        "high_conviction_count": None,
+        "model_edge_x": None,
+        "auc": None,
+        "last_scan_at": None,
+        "base_rate_pct": None,
+    }
+    try:
+        with db_conn() as c:
+            # Stock count from today's predictions
+            today_str = datetime.utcnow().date().isoformat()
+            cnt = c.execute(text(
+                "SELECT COUNT(*), MAX(created_at) FROM daily_predictions WHERE prediction_date = :d"
+            ), {"d": today_str}).fetchone()
+            if cnt and cnt[0]:
+                summary["stocks_screened"] = cnt[0]
+                summary["last_scan_at"] = cnt[1].isoformat() if cnt[1] else None
+            else:
+                # Fall back to most recent scan date
+                cnt2 = c.execute(text(
+                    "SELECT COUNT(*), MAX(created_at), MAX(prediction_date) FROM daily_predictions "
+                    "WHERE prediction_date = (SELECT MAX(prediction_date) FROM daily_predictions)"
+                )).fetchone()
+                if cnt2 and cnt2[0]:
+                    summary["stocks_screened"] = cnt2[0]
+                    summary["last_scan_at"] = cnt2[1].isoformat() if cnt2[1] else None
+
+            # High conviction = score >= 0.7
+            hc = c.execute(text(
+                "SELECT COUNT(*) FROM daily_predictions "
+                "WHERE prediction_date = (SELECT MAX(prediction_date) FROM daily_predictions) "
+                "AND score >= 0.7"
+            )).fetchone()
+            summary["high_conviction_count"] = hc[0] if hc else 0
+
+            # AUC and top_decile from latest logistic model notes
+            mw = c.execute(text(
+                "SELECT MAX(in_sample_hit_rate), MAX(notes) FROM model_weights_by_date "
+                "WHERE model_type IN ('logistic', 'lgbm_classifier') "
+                "AND trained_at = (SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='logistic')"
+            )).fetchone()
+            if mw and mw[0]:
+                summary["auc"] = round(float(mw[0]), 3)
+                # Parse top decile from notes string e.g. "LogReg+RegBlend topDecile=42% AUC=0.685"
+                notes = mw[1] or ""
+                import re as _re
+                td_match = _re.search(r'topDecile=(\d+\.?\d*)', notes)
+                if td_match:
+                    td = float(td_match.group(1))
+                    summary["top_decile_hit_pct"] = round(td, 1)
+                    # Base rate ~21% on modern window
+                    base_rate = 21.0
+                    summary["base_rate_pct"] = base_rate
+                    if base_rate > 0:
+                        summary["model_edge_x"] = round(td / base_rate, 2)
+
+            # Check lgbm_classifier for better numbers
+            lgbm_row = c.execute(text(
+                "SELECT notes FROM model_weights_by_date "
+                "WHERE model_type='lgbm_classifier' "
+                "AND trained_at = (SELECT MAX(trained_at) FROM model_weights_by_date WHERE model_type='lgbm_classifier')"
+            )).fetchone()
+            if lgbm_row and lgbm_row[0]:
+                import json as _json
+                try:
+                    lgbm_meta = _json.loads(lgbm_row[0])
+                    if lgbm_meta.get("auc"):
+                        summary["auc"] = round(float(lgbm_meta["auc"]), 3)
+                    if lgbm_meta.get("top_decile"):
+                        td = float(lgbm_meta["top_decile"])
+                        summary["top_decile_hit_pct"] = round(td, 1)
+                        base_rate = 21.0
+                        summary["model_edge_x"] = round(td / base_rate, 2)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        summary["error"] = str(e)
+    return summary
 
 
 # ── Core Sleeve API ────────────────────────────────────────────────────────────

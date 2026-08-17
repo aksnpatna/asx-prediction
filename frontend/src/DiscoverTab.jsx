@@ -356,9 +356,22 @@ export default function DiscoverTab({
 }) {
   const [expandedRow, setExpandedRow]   = useState(null)
   const [filterZone, setFilterZone]     = useState('all')
+  const [filterCap, setFilterCap]       = useState('all')
   const [minScore, setMinScore]         = useState(0)
   const [showFinder, setShowFinder]     = useState(false)
   const [showRanked, setShowRanked]     = useState(false)
+  const [scanSummary, setScanSummary]   = useState(null)
+
+  // Load hero stats fast from cached summary endpoint
+  React.useEffect(() => {
+    const token = localStorage.getItem('asx_token')
+    fetch(`${import.meta.env.VITE_API_URL || '/api'}/screener/summary`, {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+      .then(r => r.json())
+      .then(d => setScanSummary(d))
+      .catch(() => {})
+  }, [])
 
   const candidates = cachedScanData?.candidates || []
 
@@ -431,16 +444,10 @@ export default function DiscoverTab({
   const midCap = filtered.filter(c => c.market_cap >= 2000000000 && c.market_cap < 10000000000).sort((a,b)=>(b.score||0)-(a.score||0));
   const smallCap = filtered.filter(c => c.market_cap == null || c.market_cap < 2000000000).sort((a,b)=>(b.score||0)-(a.score||0));
 
-  // If a cap is empty after filtering, grab top 3 from unfiltered candidates of that cap size
-  if (largeCap.length === 0) {
-    largeCap.push(...candidates.filter(c => c.market_cap >= 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
-  }
-  if (midCap.length === 0) {
-    midCap.push(...candidates.filter(c => c.market_cap >= 2000000000 && c.market_cap < 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
-  }
-  if (smallCap.length === 0) {
-    smallCap.push(...candidates.filter(c => c.market_cap == null || c.market_cap < 2000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3));
-  }
+  // Filter-aware lists: if empty after filter, show top 3 from unfiltered
+  const largeFinal = largeCap.length ? largeCap : candidates.filter(c => c.market_cap >= 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3);
+  const midFinal = midCap.length ? midCap : candidates.filter(c => c.market_cap >= 2000000000 && c.market_cap < 10000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3);
+  const smallFinal = smallCap.length ? smallCap : candidates.filter(c => c.market_cap == null || c.market_cap < 2000000000).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,3);
 
   const renderCapTable = (title, list, capType) => (
     <div style={{ marginBottom: 24 }}>
@@ -455,19 +462,18 @@ export default function DiscoverTab({
             <thead>
               <tr>
                 <th>#</th><th>Symbol</th><th>Price</th><th>Score</th>
-                <th>P(≥5%)</th><th>AI Target (3M)</th><th>Analyst Target</th>
-                <th>Entry</th><th></th><th></th>
+                <th>Chance of +5%</th><th>AI Target (3M)</th><th>Analyst Target</th>
+                <th>Entry Signal</th><th></th><th></th>
               </tr>
             </thead>
             <tbody>
               {list.map((c,idx)=>{
-                // Ensure unique key if grabbed from unfiltered list
                 const isFilteredOut = !filtered.find(fc => fc.symbol === c.symbol);
                 return (
                   <React.Fragment key={`${capType}-${c.symbol}`}>
                     {isFilteredOut && idx === 0 && (
                        <tr><td colSpan={10} style={{ padding:'8px 12px', background:'rgba(255, 184, 0, 0.1)', color:'var(--ig-warning)', fontSize:11, fontWeight:600 }}>
-                         Note: Top {list.length} shown below did not meet the "{filterZone}" or score filters, but are listed for reference.
+                         Note: Top {list.length} shown below did not meet the active filter, but are listed for reference.
                        </td></tr>
                     )}
                     <CandidateRow c={c} idx={idx}
@@ -485,43 +491,126 @@ export default function DiscoverTab({
     </div>
   )
 
+  // Hero stats: prefer live summary, fall back to candidates list
+  const screened = scanSummary?.stocks_screened ?? candidates.length ?? null
+  const topDecileHit = scanSummary?.top_decile_hit_pct ?? null
+  const highConviction = scanSummary?.high_conviction_count ?? candidates.filter(c => (c.score || 0) >= 0.7).length
+  const modelEdge = scanSummary?.model_edge_x ?? null
+  const lastScan = scanSummary?.last_scan_at || cachedScanData?.generated_at
+  const aucVal = scanSummary?.auc ?? null
+
+  // User-friendly last scan time
+  const lastScanLabel = (() => {
+    if (!lastScan) return 'never'
+    const d = new Date(lastScan)
+    if (isNaN(d)) return 'recently'
+    const mins = Math.round((Date.now() - d) / 60000)
+    if (mins < 2) return 'just now'
+    if (mins < 60) return `${mins} minutes ago`
+    const hrs = Math.round(mins / 60)
+    if (hrs < 24) return `${hrs} hours ago`
+    return d.toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' })
+  })()
+
+  // Tooltip text for top decile
+  const topDecileTooltip = topDecileHit
+    ? `Out of every 10 stocks the AI ranks highest, ${topDecileHit.toFixed(1)} reach +8% — vs ~21% if chosen randomly.`
+    : 'Percentage of the AI\'s top-ranked stocks that reach the +8% target within 63 days.'
+
   return (
-    <div>
-      {/* ── Header bar ─────────────────────────────────────────── */}
-      <div style={{
-        background:'linear-gradient(135deg,var(--text-primary) 0%,var(--text-primary) 100%)',
-        borderRadius:10, padding:'18px 22px', marginBottom:16,
-        display:'flex', alignItems:'center', justifyContent:'space-between', flexWrap:'wrap', gap:12,
-      }}>
-        <div>
-          <h2 style={{ margin:0, color:'var(--bg-tertiary)', fontSize:18, fontWeight:800 }}>
-            🔍 Discover — {EXCHANGE_LABELS[preferredMarket]} Deep Scan
-          </h2>
-          <p style={{ margin:'4px 0 0', color:'#64748b', fontSize:12 }}>
-            {candidates.length>0
-              ? `${candidates.length} stocks analysed · ${clearCount} clear entries · ${cautionCount} caution · ${avoidCount} avoid`
-              : 'Auto-loaded from 5AM broad scan · 200+ stocks'}
-            {cachedScanData?.generated_at && ` · refreshed ${new Date(cachedScanData.generated_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`}
-          </p>
-        </div>
-        <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
-          {/* Zone filters */}
-          {['all','clear','caution','avoid'].map(z=>(
-            <button key={z}
-              onClick={()=>{ setFilterZone(z); setExpandedRow(null) }}
+    <div style={{ fontFamily: "'Outfit', -apple-system, BlinkMacSystemFont, sans-serif", background: '#F9FAFB', minHeight: '100vh', paddingBottom: 80 }}>
+
+      {/* ── SMSF Screener hero header ────────────────────────────── */}
+      <div style={{ background: '#fff', borderBottom: '1px solid #E5E7EB', padding: '16px 20px 0' }}>
+        <div style={{ maxWidth: 860, margin: '0 auto' }}>
+          {/* Title row */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 14 }}>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: '#0F0F0F', lineHeight: 1.2 }}>
+                SMSF Screener
+              </div>
+              <div style={{ fontSize: 12, color: '#9CA3AF', marginTop: 2 }}>
+                RULE-BASED · AI-ASSISTED · PATH-AWARE MODEL
+              </div>
+            </div>
+            <button
+              onClick={fetchCachedWealthScan}
+              disabled={cachedScanLoading}
               style={{
-                padding:'5px 12px', borderRadius:20, fontSize:11, fontWeight:700, cursor:'pointer', border:'none',
-                background: filterZone===z ? (z==='all'?'var(--text-secondary)':zoneColors[z]||'var(--text-secondary)') : 'var(--text-primary)',
-                color: filterZone===z ? 'var(--bg-secondary)' : '#94a3b8',
-              }}>
-              {z==='all'?'All':zoneEmoji[z]+' '+z.charAt(0).toUpperCase()+z.slice(1)}
-              {z!=='all' && ` (${z==='clear'?clearCount:z==='caution'?cautionCount:avoidCount})`}
+                background: '#0F0F0F', color: '#fff', border: 'none', borderRadius: 20,
+                padding: '8px 18px', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                opacity: cachedScanLoading ? 0.6 : 1,
+              }}
+            >
+              {cachedScanLoading ? '↻ Scanning…' : '↻ RUN NEW SCAN'}
             </button>
-          ))}
-          <button className="btn-secondary" onClick={fetchCachedWealthScan}
-            disabled={cachedScanLoading} style={{ fontSize:11 }}>
-            {cachedScanLoading?'Scanning…':'🔄 Refresh'}
-          </button>
+          </div>
+
+          {/* 4-box hero stats */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 1, background: '#E5E7EB', borderRadius: '8px 8px 0 0', overflow: 'hidden', border: '1px solid #E5E7EB' }}>
+            {[
+              {
+                label: 'STOCKS SCREENED', sub: '(today)',
+                value: screened != null ? screened.toLocaleString() : '—',
+              },
+              {
+                label: 'WINNERS IN TOP PICKS', sub: 'vs 21% at random',
+                value: topDecileHit != null ? `${topDecileHit.toFixed(1)}%` : '—',
+                tooltip: topDecileTooltip,
+                highlight: topDecileHit >= 40,
+              },
+              {
+                label: 'HIGH CONFIDENCE TODAY', sub: 'model very sure',
+                value: highConviction != null ? highConviction : '—',
+              },
+              {
+                label: 'BETTER THAN RANDOM', sub: 'model edge',
+                value: modelEdge != null ? `${modelEdge.toFixed(2)}×` : '—',
+                highlight: modelEdge >= 2,
+              },
+            ].map((stat, i) => (
+              <div key={i} title={stat.tooltip || ''} style={{
+                background: '#fff', padding: '14px 16px', textAlign: 'center',
+                cursor: stat.tooltip ? 'help' : 'default',
+              }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 4 }}>
+                  {stat.label}
+                </div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: stat.highlight ? '#1A6B3C' : '#0F0F0F', lineHeight: 1 }}>
+                  {stat.value}
+                </div>
+                <div style={{ fontSize: 10, color: '#9CA3AF', marginTop: 3 }}>{stat.sub}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Scan metadata + filter chips */}
+          <div style={{ background: '#fff', borderTop: '1px solid #E5E7EB', padding: '10px 0 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+            <div style={{ fontSize: 12, color: '#9CA3AF' }}>
+              Last scan: {lastScanLabel}{aucVal ? ` · AUC ${aucVal.toFixed(3)} (honest modern-window numbers)` : ''}
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', paddingBottom: 10 }}>
+              {[
+                { key: 'all', label: '● ALL PICKS', count: candidates.length },
+                { key: 'clear', label: '≤63D HIGH CONFIDENCE', count: clearCount },
+                { key: 'caution', label: 'WORTH WATCHING', count: cautionCount },
+                { key: 'avoid', label: 'AVOID', count: avoidCount },
+              ].map(f => (
+                <button key={f.key}
+                  onClick={() => { setFilterZone(f.key); setExpandedRow(null) }}
+                  style={{
+                    padding: '4px 12px', borderRadius: 20, fontSize: 11, fontWeight: 700,
+                    cursor: 'pointer', border: '1px solid',
+                    borderColor: filterZone === f.key ? '#0F0F0F' : '#E5E7EB',
+                    background: filterZone === f.key ? '#0F0F0F' : '#fff',
+                    color: filterZone === f.key ? '#fff' : '#6B7280',
+                  }}
+                >
+                  {f.label}{f.key !== 'all' && f.count != null ? ` (${f.count})` : ''}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -554,9 +643,9 @@ export default function DiscoverTab({
           </p>
         ) : (
           <div>
-            {renderCapTable('Large Cap (>$10B)', largeCap, 'large')}
-            {renderCapTable('Mid Cap ($2B - $10B)', midCap, 'mid')}
-            {renderCapTable('Small & Micro Cap (<$2B)', smallCap, 'small')}
+            {renderCapTable('Large Cap (>$10B)', largeFinal, 'large')}
+            {renderCapTable('Mid Cap ($2B - $10B)', midFinal, 'mid')}
+            {renderCapTable('Small & Micro Cap (<$2B)', smallFinal, 'small')}
           </div>
         )}
       </section>

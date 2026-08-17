@@ -9218,6 +9218,18 @@ def init_phase6_tables():
             )
         """))
         conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_verdicts (
+                id SERIAL PRIMARY KEY,
+                run_date DATE NOT NULL,
+                symbol VARCHAR(20) NOT NULL,
+                decision VARCHAR(20) NOT NULL,
+                confidence INTEGER,
+                reasoning TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (run_date, symbol)
+            )
+        """))
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS job_runs (
                 id SERIAL PRIMARY KEY,
                 job_name VARCHAR(100) NOT NULL,
@@ -11271,15 +11283,17 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                     (id, user_id, symbol, market, side, quantity, entry_price, current_price,
                      target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
                      stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
-                     position_stage, recommendation_action, source_reason, updated_at)
+                     position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed)
                 VALUES
                     (:id, :user_id, :symbol, :market, :side, :quantity, :entry_price, :current_price,
                      :target_price, 'open', :signal_score, :signal_trend, :signal_warning, :notes, :entry_price,
                      :stop_loss_price, :take_profit_price, :trailing_stop_pct, :review_date,
-                     :position_stage, :recommendation_action, :source_reason, :updated_at)
+                     :position_stage, :recommendation_action, :source_reason, :updated_at,
+                     :entry_date)
             """),
             {
                 "id": trade_id,
+                "entry_date": datetime.utcnow().date(),
                 "user_id": current_user["id"],
                 "symbol": symbol,
                 "market": market,
@@ -13085,6 +13099,28 @@ def _scheduled_v2_daily_scan():
             print(f"[V2DailyScan] Deep-dive failed for {sym}: {e}")
             continue
 
+    # Persist per-symbol AI verdicts so the Screener can show Layer-2 status
+    try:
+        with db_conn() as conn:
+            for r in ai_results:
+                sym = r.get("symbol", "")
+                if not sym:
+                    continue
+                conn.execute(text("""
+                    INSERT INTO ai_verdicts (run_date, symbol, decision, confidence, reasoning)
+                    VALUES (:d, :s, :dec, :c, :r)
+                    ON CONFLICT (run_date, symbol) DO UPDATE SET
+                        decision=EXCLUDED.decision, confidence=EXCLUDED.confidence,
+                        reasoning=EXCLUDED.reasoning
+                """), {"d": today_key, "s": sym,
+                       "dec": r.get("decision", "REJECT"),
+                       "c": r.get("confidence"),
+                       "r": (r.get("reasoning") or "")[:2000]})
+            conn.commit()
+        print(f"[V2DailyScan] Persisted {len(ai_results)} AI verdicts to ai_verdicts.", flush=True)
+    except Exception as e:
+        print(f"[V2DailyScan] ai_verdicts persist failed: {e}", flush=True)
+
     print(f"[V2DailyScan] Completed {len(ai_results)} deep-dives. Approved: {sum(1 for r in ai_results if r.get('decision')=='APPROVE')}")
     if not ai_results:
         print("[V2DailyScan] No AI results — skipping broadcast.")
@@ -14659,16 +14695,17 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                     (id, user_id, symbol, market, side, quantity, entry_price, current_price,
                      target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
                      stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
-                     position_stage, recommendation_action, source_reason, updated_at)
+                     position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed)
                 VALUES
                     (:id, :user_id, :symbol, :market, 'LONG', :quantity, :entry_price, :entry_price,
                      :target_price, 'open', :signal_score, :signal_trend, NULL,
                      :notes, :entry_price,
                      :stop_loss, :take_profit, 3.0, :review_date,
-                     'entered', 'BUY', :source_reason, :now)
+                     'entered', 'BUY', :source_reason, :now, :entry_date)
             """), {
                 "id": trade_id, "user_id": user_id, "symbol": symbol, "market": market,
                 "quantity": quantity, "entry_price": entry_price,
+                "entry_date": now.date(),
                 "target_price": take_profit_price,
                 "signal_score": signal.get("score"),
                 "signal_trend": signal.get("trend"),
@@ -14795,6 +14832,17 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
         pe_idx = order.index("fund_pe_inv") if "fund_pe_inv" in order else None
         mom_idx = order.index("momentum_20d") if "momentum_20d" in order else None
 
+        # Layer-2 AI verdicts from today's (or latest) deep-dive run
+        ai_verdicts = {}
+        try:
+            with db_conn() as conn:
+                rows = conn.execute(text(
+                    "SELECT symbol, decision, confidence FROM ai_verdicts "
+                    "WHERE run_date = (SELECT MAX(run_date) FROM ai_verdicts)")).fetchall()
+                ai_verdicts = {r[0]: {"decision": r[1], "confidence": r[2]} for r in rows}
+        except Exception:
+            pass
+
         candidates = []
         for p in picks[:200]:
             try:
@@ -14828,6 +14876,9 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                     "franked": p.get("franking_pct") or None,
                     "sector": (p.get("valuation_metrics") or {}).get("sector", "") or p.get("sector", ""),
                 }
+                v = ai_verdicts.get(sym)
+                cand["ai_decision"] = v["decision"] if v else None
+                cand["ai_confidence"] = v["confidence"] if v else None
                 candidates.append(cand)
             except Exception:
                 continue
@@ -14880,6 +14931,15 @@ async def portfolio_nav_breakdown(current_user: dict = Depends(get_current_user)
                 "entry_date": str(p.get("entry_date_parsed") or p.get("created_at"))[:10],
                 "position_stage": p.get("position_stage", ""),
             }
+            if row["entry_date"]:
+                try:
+                    _ed = date.fromisoformat(row["entry_date"])
+                    _dh = (today - _ed).days
+                    row["days_held"] = _dh
+                    row["day_of_63"] = min(_dh, 63)
+                except Exception:
+                    row["days_held"] = 0
+                    row["day_of_63"] = 0
             if is_core:
                 core_value += value
                 out["core_positions"].append(row)
@@ -15085,8 +15145,10 @@ async def dashboard_morning_brief(current_user: dict = Depends(get_current_user)
         for p in paper:
             if p.get("status") != "open":
                 continue
-            ed = p.get("entry_date_parsed")
-            days = (today - ed).days if ed else 0
+            ed = p.get("entry_date_parsed") or p.get("created_at")
+            if isinstance(ed, str):
+                ed = ed[:10]
+            days = (today - date.fromisoformat(str(ed)[:10])).days if ed else 0
             cur = float(p.get("current_price", 0) or 0)
             entry = float(p.get("entry_price", 0) or 0)
             pnl = round((cur / entry - 1) * 100, 1) if entry else 0

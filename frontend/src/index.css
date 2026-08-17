@@ -793,3 +793,7 @@ body {
 .sx-cal-now-block { background: var(--green-light); border-radius: 10px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }
 .sx-cal-stars { letter-spacing: 0.1em; }
 .sx-cal-next { font-size: 13px; margin: 4px 0; color: #374151; }
+
+/* AI verdict badges */
+.sx-ai-ok { color: #1A6B3C; font-weight: 800; font-size: 12px; margin-top: 4px; }
+.sx-ai-no { color: #DC2626; font-weight: 800; font-size: 12px; margin-top: 4px; }

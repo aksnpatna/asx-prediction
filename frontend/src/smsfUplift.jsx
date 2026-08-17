@@ -82,6 +82,9 @@ export function StockCard({ c, onAI, aiOpen }) {
           <span className={`sx-pill ${c.tier === '10pct' ? 'sx-pill-gold' : c.tier === '8pct' ? 'sx-pill-green' : 'sx-pill-grey'}`}>
             {c.tier === '10pct' ? 'HIGH ↑' : c.tier === '8pct' ? 'BUY' : 'WATCH'}
           </span>
+          {c.ai_decision === 'APPROVE' && <div className="sx-ai-ok">✅ AI APPROVED</div>}
+          {c.ai_decision === 'REJECT' && <div className="sx-ai-no">⛔ AI REJECTED</div>}
+          {c.ai_decision == null && <div className="sx-meta">🤖 AI REVIEW PENDING</div>}
         </div>
       </div>
       <div className="sx-price-row">
@@ -391,6 +394,7 @@ export function ScreenerScreen({ token, onRunScan }) {
   const d = data || {}
   const cands = (d.candidates || []).filter(c =>
     filter === 'all' ? true :
+    filter === 'ai_approved' ? c.ai_decision === 'APPROVE' :
     filter === 'reachable' ? c.reachable_63d :
     filter === 'high' ? c.tier === '10pct' :
     filter === 'satellite' ? c.tier !== 'watch' : true)
@@ -417,7 +421,7 @@ export function ScreenerScreen({ token, onRunScan }) {
         Last scan: {d.last_scan || 'never'} · Honest numbers from the live model.
       </div>
       <div className="sx-chips">
-        {[['all', '● ALL PICKS'], ['reachable', '≤63 DAYS — hits target soon'], ['high', 'HIGH CONFIDENCE — model very sure'], ['satellite', 'SATELLITE — AI picks']].map(([k, label]) => (
+        {[['all', '● ALL PICKS'], ['ai_approved', '✅ AI APPROVED'], ['reachable', '≤63 DAYS — hits target soon'], ['high', 'HIGH CONFIDENCE — model very sure'], ['satellite', 'SATELLITE — AI picks']].map(([k, label]) => (
           <button key={k} className={`sx-chip ${filter === k ? 'sx-chip-on' : ''}`} onClick={() => setFilter(k)}>{label}</button>
         ))}
       </div>

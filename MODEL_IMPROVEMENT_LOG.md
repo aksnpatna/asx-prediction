@@ -523,3 +523,20 @@ then crashed' as loss → first-touch base rate expected slightly HIGHER.
   (retried by design), one pandas FutureWarning (cosmetic).
 - **UI:** legacy SMSF tab removed from nav per request (new 4 screens +
   Markets/Analyze remain).
+
+### [2026-08-17] Fix 36: Day 0/63 root cause + Layer-2 AI verdicts persisted
+- **Day 0/63 root cause:** `entry_date_parsed` was NULL on every paper trade —
+  both INSERT paths (manual + auto-create) never wrote it. All open trades
+  showed Day 0 via the API fallbacks. Fixed: both INSERTs now write
+  `entry_date_parsed` (creation date); backfilled 43 existing rows from
+  `created_at::date`; morning-brief and nav-breakdown now fall back to
+  created_at defensively; nav-breakdown returns days_held/day_of_63.
+- **Layer-2 AI verdicts were never persisted:** the V2 scan's per-symbol
+  APPROVE/REJECT decisions existed only in memory (Telegram message only) —
+  the Screener could not show which picks passed the AI debate. New
+  `ai_verdicts` table (UNIQUE run_date+symbol); V2 scan persists every
+  deep-dive verdict. `/api/screener/scan` now returns ai_decision +
+  ai_confidence per candidate; StockCard shows ✅ AI APPROVED / ⛔ AI
+  REJECTED / 🤖 AI REVIEW PENDING and a new "✅ AI APPROVED" filter chip.
+- Note: today's verdicts (8AM run, pre-fix) are unrecoverable — population
+  starts at the next scan. Until then candidates honestly show REVIEW PENDING.

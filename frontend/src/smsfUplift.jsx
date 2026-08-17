@@ -45,19 +45,24 @@ const fmtMoney = (v) => v == null ? '—' : `$${Number(v).toLocaleString('en-AU'
 
 export function CircuitBreakerBanner({ level, drawdown_pct, vix, xjo }) {
   const map = {
-    NORMAL: { cls: 'sx-ok', label: 'NORMAL' },
-    YELLOW: { cls: 'sx-amber', label: 'YELLOW — no new satellite entries' },
-    ORANGE: { cls: 'sx-orange', label: 'ORANGE — cut to ≤4 positions' },
-    RED: { cls: 'sx-red', label: 'RED — SATELLITE FROZEN' },
+    NORMAL: { cls: 'sx-ok', title: 'RISK STATUS: ALL CLEAR ●',
+      text: 'Safe to open new trades today.' },
+    YELLOW: { cls: 'sx-amber', title: 'RISK STATUS: CAUTION ●',
+      text: 'Your portfolio is down from its peak. No new trades until it recovers above the watermark.' },
+    ORANGE: { cls: 'sx-orange', title: 'RISK STATUS: HIGH CAUTION ●',
+      text: 'Drawdown is significant — cut to at most 4 satellite positions. No new buys.' },
+    RED: { cls: 'sx-red', title: 'RISK STATUS: STOP 🛑',
+      text: 'Satellite trading is FROZEN — 8-week cooling period. Your money is safe in cash.' },
   }
   const m = map[level] || map.NORMAL
+  const calm = vix != null ? (vix < 15 ? 'very calm' : vix < 20 ? 'calm' : vix < 25 ? 'elevated' : 'high') : null
   return (
     <div className={`sx-breaker ${m.cls}`}>
-      <span className="sx-breaker-dot" /> CIRCUIT BREAKER: {m.label}
-      <span className="sx-breaker-meta">
-        {vix != null ? `VIX ${vix}` : ''}{vix != null && xjo != null ? ' · ' : ''}
-        {xjo != null ? `XJO ${xjo >= 0 ? 'above' : 'below'} SMA200` : ''}
-      </span>
+      <span className="sx-breaker-dot" /> {m.title}
+      <div className="sx-breaker-meta">
+        {m.text}{' '}
+        {calm != null && `Market volatility (VIX ${vix}) is ${calm}.`}
+      </div>
     </div>
   )
 }
@@ -87,9 +92,9 @@ export function StockCard({ c, onAI, aiOpen }) {
         </div>
       </div>
       <div className="sx-stats">
-        <div className="sx-stat"><div className="sx-meta">EV / TRADE</div><div className="sx-stat-val">{c.ev_est_pct != null ? `${c.ev_est_pct > 0 ? '+' : ''}${c.ev_est_pct.toFixed(2)}%` : '—'}</div></div>
-        <div className="sx-stat"><div className="sx-meta">REACHES +8%</div><div className="sx-stat-val">{c.reachable_63d ? 'LIKELY' : 'UNSURE'}</div></div>
-        <div className="sx-stat"><div className="sx-meta">SMSF SIZE</div><div className="sx-stat-val">{fmtMoney(c.smsf_size)}</div></div>
+        <div className="sx-stat"><div className="sx-meta">EXPECTED VALUE<br />PER TRADE</div><div className="sx-stat-val">{c.ev_est_pct != null ? `${c.ev_est_pct > 0 ? '+' : ''}${c.ev_est_pct.toFixed(2)}%` : '—'}</div></div>
+        <div className="sx-stat"><div className="sx-meta">HITS +8%<br />WITHIN 63 DAYS</div><div className="sx-stat-val">{c.reachable_63d ? 'LIKELY ✓' : 'NOT SURE'}</div></div>
+        <div className="sx-stat"><div className="sx-meta">SUGGESTED<br />SMSF SIZE</div><div className="sx-stat-val">{fmtMoney(c.smsf_size)}</div></div>
       </div>
       <div className="sx-badges">
         <span className="sx-badge">{c.momentum_20d != null ? `↗ 20d ${c.momentum_20d > 0 ? '+' : ''}${c.momentum_20d}%` : ''}</span>
@@ -105,9 +110,9 @@ export function StockCard({ c, onAI, aiOpen }) {
       </button>
       {aiOpen && (
         <div className="sx-ai-note">
-          <div className="sx-ai-sec"><b>BULL CASE:</b> {pct != null && pct >= 24 ? `Institutional ownership ${pct}% vs ~24% market avg — smart money present. ` : ''}{c.momentum_20d != null && c.momentum_20d > 0 ? `Positive 20-day momentum (+${c.momentum_20d}%). ` : ''}{c.rsi != null && c.rsi >= 40 && c.rsi <= 65 ? `RSI ${Number(c.rsi).toFixed(0)} — momentum without overbought.` : ''}</div>
-          <div className="sx-ai-sec"><b>BEAR CASE:</b> Any regime shift (VIX spike or XJO below SMA200) adds drawdown risk beyond the −20% catastrophe stop. Verify no earnings within 14 days before entry.</div>
-          <div className="sx-ai-verdict">SMSF VERDICT: {c.tier === '10pct' ? '✅ SATELLITE BUY' : c.tier === '8pct' ? '🟡 CONDITIONAL BUY' : '❌ WATCH ONLY'} · Size: {fmtMoney(c.smsf_size)} · Stop: −20% · CGT: hold &gt;12m for 10% rate</div>
+          <div className="sx-ai-sec"><b>✅ BULL CASE:</b> {pct != null && pct >= 24 ? `Institutional owners hold ${pct}% (above the ~24% market average) — smart money is present. ` : ''}{c.momentum_20d != null && c.momentum_20d > 0 ? `Price momentum is positive over the last 20 days (+${c.momentum_20d}%). ` : ''}{c.rsi != null && c.rsi >= 40 && c.rsi <= 65 ? `RSI ${Number(c.rsi).toFixed(0)} shows strength without being overbought.` : ''}</div>
+          <div className="sx-ai-sec"><b>⚠️ BEAR CASE:</b> If market volatility spikes (VIX above 25) or the ASX200 falls below its 200-day average, this trade carries drawdown risk beyond the −20% catastrophe stop. Check for earnings announcements in the next 14 days before entering.</div>
+          <div className="sx-ai-verdict">🏦 SMSF VERDICT: {c.tier === '10pct' ? 'BUY (Satellite, 63-day hold)' : c.tier === '8pct' ? 'CONDITIONAL BUY' : 'WATCH ONLY'} · Suggested size: {fmtMoney(c.smsf_size)} · Catastrophe stop: −20% · CGT: hold &gt;12 months for the 10% rate</div>
         </div>
       )}
     </div>
@@ -117,19 +122,26 @@ export function StockCard({ c, onAI, aiOpen }) {
 export function SatelliteClock({ pos }) {
   const d = Math.min(pos.day_of_63 || 0, 63)
   const pct = Math.min(100, Math.round(d / 63 * 100))
-  const cls = pos.target_reached ? 'sx-clock-green' : d >= 56 ? 'sx-clock-red' : d >= 41 ? 'sx-clock-amber' : ''
+  const cls = pos.target_reached ? 'sx-clock-green' : d >= 56 ? 'sx-clock-red' : d >= 41 ? 'sx-clock-amber' : 'sx-clock-grey'
+  let status = { text: 'On track — plenty of time in the 63-day window.', cls: 'sx-meta' }
+  if (pos.target_reached) status = { text: 'Target +8% reached — consider selling to lock in the gain.', cls: 'sx-gain' }
+  else if (d > 63) status = { text: 'Exit window EXPIRED — review urgently: exit or consciously hold.', cls: 'sx-loss' }
+  else if (d >= 56) status = { text: 'Exit within the next few days or consciously hold past the window.', cls: 'sx-loss' }
+  else if (d >= 41) status = { text: 'Window tightening — monitor closely.', cls: 'sx-amber-text' }
   return (
     <div className={`sx-clock-card ${pos.target_reached ? 'sx-ring-green' : ''}`}>
       <div className="sx-clock-head">
         <span className="sx-sym">{pos.symbol}</span>
-        <span className="sx-meta">Day {d}/63</span>
+        <span className="sx-meta">📅 Day {d} of 63</span>
       </div>
       <div className="sx-bar"><div className={`sx-bar-fill ${cls}`} style={{ width: `${pct}%` }} /></div>
       <div className="sx-clock-body">
-        Entry {fmtMoney(pos.entry_price)} · Now {fmtMoney(pos.current_price)} · <b className={pos.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{pos.pnl_pct > 0 ? '+' : ''}{pos.pnl_pct}%</b>
+        Entered {fmtMoney(pos.entry_price)} · Now {fmtMoney(pos.current_price)} ·{' '}
+        <b className={pos.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{pos.pnl_pct > 0 ? '+' : ''}{pos.pnl_pct}%</b>
       </div>
-      {pos.target_reached && <div className="sx-meta">✅ TARGET REACHED (+8%)</div>}
-      {pos.catastrophe_stop_price && <div className="sx-meta">Stop: {fmtMoney(pos.catastrophe_stop_price)} (−20%)</div>}
+      {pos.target_price && <div className="sx-meta">Target: {fmtMoney(pos.target_price)} (+8%) · Stop: {pos.catastrophe_stop_price != null ? fmtMoney(pos.catastrophe_stop_price) : '—'} (−20%)</div>}
+      {pos.time_stop_date && <div className="sx-meta">Exit window closes: {pos.time_stop_date}</div>}
+      <div className={status.cls}>{status.text}</div>
     </div>
   )
 }
@@ -152,6 +164,13 @@ export function CoreSleeveRow({ pos }) {
 
 export function GGateProgress({ gates, paperClosed }) {
   const icons = { done: '✅', amber: '🟡', open: '🔲' }
+  const MEANING = {
+    G1: 'No survivor bias — the model trained on 1,858 stocks that later disappeared. Realistic.',
+    G2: 'The model must pick winners in 60% of its top-ranked stocks (today: ~59% in-sample, still proving itself out-of-sample).',
+    G3: 'We only trade with pretend money until 60 test trades are logged — then real, small positions.',
+    G4: 'First real-money positions of $500–$1,000 — the proving ground.',
+    G5: 'Full SMSF deployment only after consistent results for 12 months.',
+  }
   const list = gates && Object.keys(gates).length ? gates : {
     G1: { status: 'done', label: 'Survivorship de-biased (1,858 delisted added)' },
     G2: { status: 'amber', label: 'WFO top-decile ≥60% OOS — in progress' },
@@ -163,23 +182,56 @@ export function GGateProgress({ gates, paperClosed }) {
     <div className="sx-ggate">
       <div className="sx-ggate-icons">{Object.keys(list).map(k => <span key={k}>{icons[list[k].status] || '🔲'} {k}</span>)}</div>
       {Object.entries(list).map(([k, v]) => (
-        <div key={k} className="sx-ggate-row"><b>{k}:</b> {v.label}</div>
+        <div key={k} className="sx-ggate-row"><b>{k}:</b> {v.label}
+          <div className="sx-meta">— {MEANING[k] || ''}</div>
+        </div>
       ))}
-      <div className="sx-meta">Estimated live capital date: NOVEMBER 2026</div>
+      <div className="sx-meta">Estimated date to start investing real money: NOVEMBER 2026 — and only if the paper results hold up.</div>
     </div>
   )
 }
 
 export function CalendarBar() {
-  const months = ['Jul ★★★', 'Aug ★★', 'Sep ⚠️', 'Oct ⚠️', 'Nov ★★★', 'Dec ★', 'Jan ★★', 'Feb ✗', 'Mar ✗', 'Apr ★★★', 'May ★', 'Jun ✗']
-  const now = new Date().getMonth()
+  const CAL = [
+    { m: 'Jan', stars: 2, note: '' },
+    { m: 'Feb', stars: 0, note: 'Historically weak — reduce exposure' },
+    { m: 'Mar', stars: 0, note: 'Historically weak — reduce exposure' },
+    { m: 'Apr', stars: 3, note: 'Strong entry month' },
+    { m: 'May', stars: 1, note: '' },
+    { m: 'Jun', stars: 0, note: 'Historically weak — reduce exposure' },
+    { m: 'Jul', stars: 3, note: 'Strong entry month' },
+    { m: 'Aug', stars: 2, note: 'Moderate entry — safe to open up to 3 new trades' },
+    { m: 'Sep', stars: 0, note: 'Statistically weak — consider waiting' },
+    { m: 'Oct', stars: 0, note: 'Statistically weak — consider waiting' },
+    { m: 'Nov', stars: 3, note: 'Best entry month of the year (+5.97% avg, 59% hit rate)' },
+    { m: 'Dec', stars: 1, note: '' },
+  ]
+  const now = new Date()
+  const thisMonth = now.getMonth()
+  const thisYear = now.getFullYear()
+  const cur = CAL[thisMonth]
+  const stars = '★'.repeat(cur.stars) + '☆'.repeat(3 - cur.stars)
+  const nextBest = CAL.map((c, i) => ({ ...c, i })).filter(c => c.stars === 3 && c.i !== thisMonth)
+  const nextAvoid = CAL.map((c, i) => ({ ...c, i })).filter(c => c.stars === 0 && c.i !== thisMonth)
+  const later = (i) => i > thisMonth ? i : i + 12
+  const soonBest = nextBest.sort((a, b) => later(a.i) - later(b.i))[0]
+  const soonAvoid = nextAvoid.sort((a, b) => later(a.i) - later(b.i))[0]
   return (
     <div className="sx-cal">
-      <div className="sx-meta">OPTIMAL DEPLOYMENT MONTHS</div>
-      <div className="sx-cal-bar">{months.map((m, i) => (
-        <span key={m} className={`sx-cal-m ${i === now ? 'sx-cal-now' : ''}`}>{m}</span>
+      <div className="sx-meta">BEST MONTHS TO OPEN NEW POSITIONS</div>
+      <div className="sx-cal-now">
+        <b>{cur.m} {thisYear} — NOW</b> <span className="sx-cal-stars">{stars} {cur.stars >= 3 ? 'MAX CONVICTION' : cur.stars === 2 ? 'MODERATE ENTRY' : cur.stars === 1 ? 'NEUTRAL' : 'REDUCE EXPOSURE'}</span>
+      </div>
+      <div className="sx-meta">“{cur.note}.”</div>
+      {soonBest && soonBest.i !== thisMonth && (
+        <div className="sx-cal-next">NEXT BEST: <b>{soonBest.m} ★★★</b> — “{soonBest.note}”</div>
+      )}
+      {soonAvoid && soonAvoid.i !== thisMonth && (
+        <div className="sx-cal-next">AVOID: <b>{soonAvoid.m} ⚠️</b> — “{soonAvoid.note}”</div>
+      )}
+      <div className="sx-cal-bar">{CAL.map((c, i) => (
+        <span key={c.m} className={`sx-cal-m ${i === thisMonth ? 'sx-cal-now' : ''}`}>{c.m} {'★'.repeat(c.stars) || '✗'}</span>
       ))}</div>
-      <div className="sx-meta">November: best entry month — +5.97% avg, 59% win rate</div>
     </div>
   )
 }
@@ -239,6 +291,20 @@ export function DashboardScreen({ token, onRunScan }) {
   const { data } = useApi('/dashboard/morning-brief', token)
   const [runState, setRunState] = useState('idle')
   const d = data || {}
+  const hour = new Date().getHours()
+  const greeting = hour < 12 ? 'Good morning ☀️' : hour < 17 ? 'Good afternoon' : 'Good evening'
+  const openCount = d.satellite_summary?.length || 0
+  const now = new Date()
+  const marketOpen = now.getDay() >= 1 && now.getDay() <= 5 && hour >= 10 && hour < 16
+  const edge = d.model?.top_decile ? (d.model.top_decile / 21.3).toFixed(1) : null
+  const posStatus = (p) => {
+    if (p.flag === 'target_reached') return { text: 'Target +8% reached — consider selling to lock in the gain.', cls: 'sx-gain' }
+    const days = p.days || 0
+    if (days > 63) return { text: 'Exit window has EXPIRED — review: exit or consciously hold.', cls: 'sx-loss' }
+    if (days >= 56) return { text: 'Exit window closes soon — plan your exit within days.', cls: 'sx-loss' }
+    if (days >= 41) return { text: 'Window tightening — monitor this one closely.', cls: 'sx-amber-text' }
+    return { text: 'Still within your 63-day exit window — plenty of time.', cls: 'sx-meta' }
+  }
   const runScan = () => {
     setRunState('running')
     axios.post(`${API_BASE}/broad-scan/run`, {}, authH(token)).catch(() => {})
@@ -246,18 +312,26 @@ export function DashboardScreen({ token, onRunScan }) {
     setTimeout(() => setRunState('done'), 1500)
   }
   return (
-    <Screen title="Morning Briefing" subtitle={new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}>
+    <Screen title={greeting} subtitle={new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}>
+      <div className="sx-greeting">
+        Your SMSF is tracking <b>{openCount} active {openCount === 1 ? 'trade' : 'trades'}</b>.
+        <br />{marketOpen
+          ? 'The market is open — today\'s opportunities are being scanned.'
+          : d.regime?.allow_new === false
+            ? 'The model\'s safety rules are pausing new buys right now.'
+            : 'The market is closed right now — the next scan runs before open.'}
+      </div>
       <CircuitBreakerBanner level={d.circuit_breaker?.level} drawdown_pct={d.circuit_breaker?.drawdown_pct} vix={d.regime?.vix} xjo={d.regime?.xjo_vs_sma200_pct} />
       <div className="sx-regime">
-        ● MARKET REGIME: <b>{d.regime?.label || 'UNKNOWN'}</b>
-        {d.regime?.vix != null && <> — VIX {d.regime.vix}</>}
-        {d.regime?.xjo_vs_sma200_pct != null && <> · XJO {d.regime.xjo_vs_sma200_pct >= 0 ? '+' : ''}{d.regime.xjo_vs_sma200_pct}%</>}
-        {d.regime?.allow_new === false ? ' · ⛔ no new satellite entries' : ' · enter freely (bear breaker armed)'}
+        ● MARKET OUTLOOK: <b>{d.regime?.label || 'UNKNOWN'}</b>
+        {d.regime?.vix != null && <> — volatility (VIX {d.regime.vix}) is {d.regime.vix < 15 ? 'very calm' : d.regime.vix < 20 ? 'calm' : d.regime.vix < 25 ? 'elevated' : 'high'}</>}
+        {d.regime?.xjo_vs_sma200_pct != null && <> · ASX200 is {d.regime.xjo_vs_sma200_pct >= 0 ? 'above' : 'below'} its 200-day average</>}
+        {d.regime?.allow_new === false ? ' · ⛔ safety rules pause new buys' : ' · safe to open new trades'}
       </div>
 
       {d.actions && d.actions.length > 0 && (
         <div className="sx-actions">
-          <div className="sx-section-title">TODAY'S ACTION REQUIRED</div>
+          <div className="sx-section-title">TODAY'S ACTIONS</div>
           {d.actions.map((a, i) => (
             <div key={i} className={`sx-action ${a.kind === 'exit' ? 'sx-action-red' : 'sx-action-green'}`}>
               {a.kind === 'exit' ? '🔴' : '✅'} <b>{a.symbol}:</b> {a.text}
@@ -266,21 +340,27 @@ export function DashboardScreen({ token, onRunScan }) {
         </div>
       )}
 
-      <div className="sx-section-title">SATELLITE POSITIONS ({d.satellite_summary?.length || 0} open)</div>
+      <div className="sx-section-title">MY ACTIVE TRADES ({openCount} open)</div>
       <div className="sx-summary-list">
-        {(d.satellite_summary || []).map((s, i) => (
-          <div key={i} className="sx-summary-row">
-            <span className="sx-sym">{s.symbol}</span>
-            <div className="sx-bar sx-bar-sm"><div className="sx-bar-fill sx-clock-grey" style={{ width: `${Math.min(100, (s.days || 0) / 63 * 100)}%` }} /></div>
-            <span className="sx-meta">Day {s.days}/63</span>
-            <b className={s.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{s.pnl_pct > 0 ? '+' : ''}{s.pnl_pct}%</b>
-            {s.flag === 'exit_window' && ' 🔴'}{s.flag === 'target_reached' && ' ✅'}
-          </div>
-        ))}
+        {(d.satellite_summary || []).map((s, i) => {
+          const st = posStatus(s)
+          return (
+            <div key={i} className="sx-summary-card">
+              <div className="sx-summary-row">
+                <span className="sx-sym">{s.symbol}</span>
+                <div className="sx-bar sx-bar-sm"><div className={`sx-bar-fill ${s.days >= 56 ? 'sx-clock-red' : s.days >= 41 ? 'sx-clock-amber' : 'sx-clock-grey'}`} style={{ width: `${Math.min(100, (s.days || 0) / 63 * 100)}%` }} /></div>
+                <span className="sx-meta">Day {s.days}/63</span>
+                <b className={s.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{s.pnl_pct > 0 ? '+' : ''}{s.pnl_pct}%</b>
+                {s.flag === 'exit_window' && ' 🔴'}{s.flag === 'target_reached' && ' ✅'}
+              </div>
+              <div className={st.cls}>{st.text}</div>
+            </div>
+          )
+        })}
       </div>
 
       {d.announcements && d.announcements.length > 0 && (
-        <div className="sx-section-title">RECENT ANNOUNCEMENTS</div>
+        <div className="sx-section-title">LATEST COMPANY NEWS</div>
       )}
       {d.announcements && d.announcements.map((a, i) => (
         <div key={i} className="sx-action">
@@ -288,10 +368,13 @@ export function DashboardScreen({ token, onRunScan }) {
         </div>
       ))}
 
-      <div className="sx-section-title">MODEL HEALTH</div>
-      <div className="sx-meta">
-        AUC: {d.model?.auc ?? '—'} · Top decile: {d.model?.top_decile != null ? d.model.top_decile + '%' : '—'} ·
-        Modern window · LGBM + consensus tiers
+      <div className="sx-section-title">MODEL HEALTH {d.model?.top_decile != null && d.model.top_decile >= 45 ? '✅ STRONG' : '🟡 WATCH'}</div>
+      <div className="sx-model-plain">
+        {d.model?.top_decile != null ? (
+          <>The AI correctly picked winners in <b>{d.model.top_decile}%</b> of its top-ranked stocks
+            — vs about <b>21%</b> if you picked at random.{edge != null && <> That's <b>{edge}× better than chance</b>.</>}{' '}
+            It learns from the last 10 months of ASX data and re-trains every morning.</>
+        ) : 'Model health data is being prepared — check back after the morning training run.'}
       </div>
       <button className="sx-run-btn" onClick={runScan} disabled={runState === 'running'}>
         {runState === 'running' ? '⏳ SCANNING…' : '🔍 RUN TODAY\'S SCAN'}
@@ -321,14 +404,20 @@ export function ScreenerScreen({ token, onRunScan }) {
     <Screen title="SMSF Screener" subtitle="RULE-BASED · AI-ASSISTED · PATH-AWARE MODEL"
       right={<button className="sx-run-btn" onClick={runScan} disabled={runState === 'running'}>{runState === 'running' ? '⏳ SCANNING…' : '↻ RUN NEW SCAN'}</button>}>
       <div className="sx-hero">
-        <div className="sx-hero-cell"><div className="sx-meta">STOCKS SCREENED</div><div className="sx-hero-num">{d.stocks_screened || '—'}</div></div>
-        <div className="sx-hero-cell"><div className="sx-meta">TOP DECILE HIT</div><div className="sx-hero-num">{d.top_decile_hit != null ? d.top_decile_hit + '%' : '—'}</div></div>
-        <div className="sx-hero-cell"><div className="sx-meta">HIGH CONVICTION</div><div className="sx-hero-num">{d.high_conviction ?? '—'}</div></div>
-        <div className="sx-hero-cell"><div className="sx-meta">MODEL EDGE</div><div className="sx-hero-num">{d.model_edge != null ? d.model_edge.toFixed(2) + '×' : '—'}</div></div>
+        <div className="sx-hero-cell"><div className="sx-hero-num">{d.stocks_screened || '—'}</div><div className="sx-meta">STOCKS SCREENED<br />(today)</div></div>
+        <div className="sx-hero-cell"><div className="sx-hero-num">{d.top_decile_hit != null ? d.top_decile_hit + '%' : '—'}</div><div className="sx-meta">WINNERS IN TOP<br />RANKED STOCKS</div></div>
+        <div className="sx-hero-cell"><div className="sx-hero-num">{d.high_conviction ?? '—'}</div><div className="sx-meta">HIGH CONFIDENCE<br />PICKS TODAY</div></div>
+        <div className="sx-hero-cell"><div className="sx-hero-num">{d.model_edge != null ? d.model_edge.toFixed(2) + '×' : '—'}</div><div className="sx-meta">BETTER THAN<br />RANDOM PICKS</div></div>
       </div>
-      <div className="sx-meta sx-last-scan">Last scan: {d.last_scan || 'never'} · AUC {d.auc ?? '—'} (honest modern-window numbers)</div>
+      <div className="sx-meta sx-last-scan">
+        {d.top_decile_hit != null ? (
+          <>Out of every 10 stocks the AI ranks highest, about <b>{(d.top_decile_hit / 10).toFixed(1)}</b> hit +8%
+            within 63 days — vs <b>2.1</b> if you picked at random.{' '}</>
+        ) : null}
+        Last scan: {d.last_scan || 'never'} · Honest numbers from the live model.
+      </div>
       <div className="sx-chips">
-        {[['all', '● ALL CANDIDATES'], ['reachable', 'REACHABLE ≤63D'], ['high', 'HIGH CONVICTION'], ['satellite', 'SATELLITE']].map(([k, label]) => (
+        {[['all', '● ALL PICKS'], ['reachable', '≤63 DAYS — hits target soon'], ['high', 'HIGH CONFIDENCE — model very sure'], ['satellite', 'SATELLITE — AI picks']].map(([k, label]) => (
           <button key={k} className={`sx-chip ${filter === k ? 'sx-chip-on' : ''}`} onClick={() => setFilter(k)}>{label}</button>
         ))}
       </div>
@@ -347,7 +436,7 @@ export function PortfolioScreen({ token }) {
   const d = data || {}
   const cb = breaker.data?.circuit_breaker || {}
   return (
-    <Screen title="Portfolio" subtitle="Core + satellite, 63-day clocks, CGT countdowns">
+    <Screen title="My SMSF Portfolio" subtitle="What you own, how it's doing, what needs attention">
       <CircuitBreakerBanner level={cb.level} drawdown_pct={cb.drawdown_pct} />
       <div className="sx-nav-card">
         <div className="sx-hero-num">{fmtMoney(d.nav)}</div>
@@ -356,18 +445,25 @@ export function PortfolioScreen({ token }) {
           <div className="sx-bar-fill sx-split-core" style={{ width: `${d.core_pct || 0}%` }} />
           <div className="sx-bar-fill sx-split-sat" style={{ width: `${d.satellite_pct || 0}%` }} />
         </div>
-        <div className="sx-meta">CORE {d.core_pct || 0}% · SATELLITE {d.satellite_pct || 0}%</div>
+        <div className="sx-meta">CORE HOLDINGS {d.core_pct || 0}% · AI PICKS {d.satellite_pct || 0}%</div>
+        <div className="sx-model-plain">
+          Your core holdings (buy-and-hold blue chips) make up {d.core_pct || 0}% of your SMSF;
+          the AI picks {d.satellite_pct || 0}% — {d.satellite_pct != null && d.satellite_pct <= 40 ? 'within your 30–40% safety target. ✅' : 'above the 40% safety target — new AI entries are paused until it comes back down. ⚠️'}
+        </div>
       </div>
 
-      <div className="sx-section-title">CORE SLEEVE</div>
+      <div className="sx-section-title">CORE HOLDINGS — BUY &amp; HOLD</div>
       {(d.core_positions || []).map(p => <CoreSleeveRow key={p.id} pos={p} />)}
       {(!d.core_positions || d.core_positions.length === 0) && <div className="sx-meta">No core positions yet (CBA/BHP/WOW/ETFs per strategy).</div>}
 
-      <div className="sx-section-title">SATELLITE — THE 63-DAY CLOCK</div>
+      <div className="sx-section-title">AI PICKS — THE 63-DAY CLOCK</div>
       {(d.satellite_positions || []).map(p => <SatelliteClock key={p.id} pos={p} />)}
 
       {(d.cgt_alerts || []).map((a, i) => (
-        <div key={i} className="sx-action sx-action-amber">💡 CGT ALERT: {a.symbol} — ${Math.round(a.gain).toLocaleString()} gain. {a.days_to_discount} days to 12-month discount.</div>
+        <div key={i} className="sx-action sx-action-amber">
+          💡 TAX TIP: {a.symbol} has a ${Math.round(a.gain).toLocaleString()} gain.
+          Holding {a.days_to_discount} more days (past 12 months) saves ~${Math.round(a.gain * 0.05).toLocaleString()} in tax.
+        </div>
       ))}
       {d.gate_alerts && d.gate_alerts.map((g, i) => (
         <div key={i} className="sx-action sx-action-red">⚠️ {g}</div>

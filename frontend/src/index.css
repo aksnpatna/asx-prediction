@@ -784,3 +784,12 @@ body {
   .sx-stats { flex-wrap: wrap; }
   .sx-stat { min-width: 30%; }
 }
+
+/* Fix 35: investor-language blocks */
+.sx-greeting { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; font-size: 15px; margin-bottom: 12px; line-height: 1.5; }
+.sx-model-plain { background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; font-size: 14px; line-height: 1.55; color: #374151; margin-bottom: 10px; }
+.sx-amber-text { color: #B45309; font-weight: 600; font-size: 13px; margin-top: 4px; }
+.sx-summary-card { background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; }
+.sx-cal-now-block { background: var(--green-light); border-radius: 10px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }
+.sx-cal-stars { letter-spacing: 0.1em; }
+.sx-cal-next { font-size: 13px; margin: 4px 0; color: #374151; }

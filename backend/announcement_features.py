@@ -32,7 +32,7 @@ import requests
 ANNOUNCEMENT_CHECK_URL = "https://www.asx.com.au/asx/1/company/{code}/announcements"
 
 # ── Configuration ────────────────────────────────────────────────────────────
-MAX_SYMBOLS = int(os.getenv("ANNOUNCEMENT_NLP_MAX_SYMBOLS", "25"))
+MAX_SYMBOLS = int(os.getenv("ANNOUNCEMENT_NLP_MAX_SYMBOLS", "50"))
 LOOKBACK_DAYS = int(os.getenv("ANNOUNCEMENT_NLP_LOOKBACK_DAYS", "7"))
 MAX_ANNS_PER_SYMBOL = 10
 

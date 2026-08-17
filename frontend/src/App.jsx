@@ -3,7 +3,6 @@ import axios from 'axios'
 import { Line } from 'react-chartjs-2'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 import './App.css'
-import SmsfTab from './SmsfTab'
 import SmsfUplift from './smsfUplift'
 import DiscoverTab from './DiscoverTab'
 import NewsSentimentMonitor from './NewsSentimentMonitor'
@@ -1941,9 +1940,6 @@ function App() {
             <p style={{ margin: 0, fontSize: 14, lineHeight: 1.6 }}>{aiBanner.summary}</p>
           </div>
         )}
-        <div style={{ display: activeTab === 'smsf' ? 'block' : 'none' }}>
-          <SmsfTab />
-        </div>
         {activeTab === 'markets' && <GlobalMarketsTab />}
         {activeTab === 'candidates' && (
             <>

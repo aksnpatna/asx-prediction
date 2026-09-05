@@ -155,6 +155,13 @@ PAPER_BOOTSTRAP_MODE = os.getenv("PAPER_BOOTSTRAP_MODE", "1").strip() in {"1", "
 PAPER_BOOTSTRAP_MAX_POSITIONS = int(os.getenv("PAPER_BOOTSTRAP_MAX_POSITIONS", "5"))
 PAPER_BOOTSTRAP_AUTO_EXECUTE = os.getenv("PAPER_BOOTSTRAP_AUTO_EXECUTE", "1").strip() in {"1", "true", "yes", "on"}
 
+# ── Model lock-in: freeze the adopted classifier so daily retraining does NOT
+# re-adopt a new artifact. Live validation only makes sense if the model is held
+# absolutely fixed while paper trades resolve their 63-day outcome windows —
+# otherwise the "60% top decile" can't be pinned to a specific model version.
+# Set MODEL_LOCK_IN=1 to freeze; leave unset/0 to keep the challenger winner-rule.
+MODEL_LOCK_IN = os.getenv("MODEL_LOCK_IN", "1").strip() in {"1", "true", "yes", "on"}
+
 # ── EODHD Rate Limiter (thread-safe token bucket for 20 calls/min free tier) ──
 _EODHD_RATE_LOCK = threading.Lock()
 _EODHD_LAST_CALL = 0.0
@@ -882,6 +889,37 @@ def init_db():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_core_positions_status ON core_positions(symbol, status)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_core_positions_open ON core_positions(symbol) WHERE status = 'active'"))
+
+        # ── ETF Pipeline tables ────────────────────────────────────────────
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS etf_signals (
+                run_date DATE PRIMARY KEY,
+                regime TEXT NOT NULL DEFAULT 'neutral',
+                payload TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS etf_positions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL DEFAULT 'AU',
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'CORE',
+                status TEXT NOT NULL DEFAULT 'active',
+                entry_reason TEXT,
+                exit_reason TEXT,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_etf_positions_status ON etf_positions(user_id, status)"))
 
         # ── Kill Switch state ──────────────────────────────────────────────
         conn.execute(text("""
@@ -2088,24 +2126,39 @@ def _compute_portfolio_state(uid: str = None) -> dict:
             closed_pnl = conn.execute(text(
                 f"SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) FROM paper_trades WHERE status='closed'{uid_filter}"
             ), params).fetchone()
+            # Fix 54: fetch BOTH entry cost AND current market value for open
+            # positions so unrealised PnL is correctly included in total equity.
             open_rows = conn.execute(text(
-                f"SELECT symbol, COALESCE(entry_price,0)*COALESCE(quantity,0) AS cost "
+                f"SELECT symbol, "
+                f"COALESCE(entry_price,0)*COALESCE(quantity,0) AS cost, "
+                f"COALESCE(current_price,0)*COALESCE(quantity,0) AS market "
                 f"FROM paper_trades WHERE status='open'{uid_filter}"
             ), params).fetchall()
         total_pnl = float(closed_pnl[0] or 0)
         invested = sum(float(r[1] or 0) for r in open_rows)
-        equity = start_cap + total_pnl
-        available = equity - invested
+        market_value = sum(float(r[2] or 0) for r in open_rows)
+        # Unrealised PnL = current market value of open positions minus their
+        # entry cost. This is the +12.3% SGP gain that was previously invisible.
+        unrealized_pnl = market_value - invested
+        # Equity = starting capital + realised (closed) PnL + unrealised (open) PnL.
+        equity = start_cap + total_pnl + unrealized_pnl
+        available = equity - market_value
         return {
             "starting_capital": start_cap,
             "total_equity": round(equity, 2),
             "invested": round(invested, 2),
             "available_cash": round(available, 2),
             "realized_pnl": round(total_pnl, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "total_pnl": round(total_pnl + unrealized_pnl, 2),
+            "pnl_pct": round((equity / start_cap - 1) * 100, 2) if start_cap else 0,
+            "inception_return_pct": round((equity / start_cap - 1) * 100, 2) if start_cap else 0,
         }
     except Exception:
         return {"total_equity": start_cap, "available_cash": start_cap,
-                "invested": 0, "realized_pnl": 0}
+                "invested": 0, "realized_pnl": 0, "unrealized_pnl": 0,
+                "total_pnl": 0, "pnl_pct": 0, "inception_return_pct": 0,
+                "starting_capital": start_cap}
 
 
 def _get_sector_exposure(uid: str = None) -> dict:
@@ -2420,6 +2473,11 @@ def _enrich_candidates_with_tiers(candidates: list):
                            "mgmt_confidence_delta"):
                     feat[_k] = float(_ann.get(_k, 0) or 0)
         feat["mean_reversion_score"] = 0.0  # no intraday range/volume history live
+        # Interaction features (macro × technical)
+        feat["ix_vix_mom20"] = 0.0
+        feat["ix_cg_macd"] = 0.0
+        feat["ix_vix_atr"] = 0.0
+        feat["ix_yc_mom63"] = 0.0
 
         # ── Fix 17: LGBM path — proba + ridge head over artifact feature order ──
         if _lgbm_art is not None:
@@ -2427,6 +2485,7 @@ def _enrich_candidates_with_tiers(candidates: list):
                 _order = _lgbm_art["feature_order"]
                 _vals = np.array([float(feat.get(col, 0.0) or 0.0)
                                   for col in _order], dtype=np.float64)
+                _vals = np.nan_to_num(_vals, nan=0.0, posinf=0.0, neginf=0.0)
                 # T3-C: retain the raw feature row for the AI debate context
                 c["_feat_row"] = [float(v) for v in _vals]
                 _raw = float(
@@ -2442,8 +2501,11 @@ def _enrich_candidates_with_tiers(candidates: list):
                             _vals.reshape(1, -1))[0, 1])
                 _mean = np.array(_lgbm_art["scaler_mean"], dtype=np.float64)
                 _scale = np.array(_lgbm_art["scaler_scale"], dtype=np.float64)
-                _vals = np.where(_scale > 1e-9, (_vals - _mean) / _scale, 0.0)
-                c["_ridge_raw"] = float(np.dot(_lgbm_art["ridge_coefs"], _vals))
+                _vals_scaled = np.where(_scale > 1e-9, (_vals - _mean) / _scale, 0.0)
+                _ridge = float(np.dot(_lgbm_art["ridge_coefs"], _vals_scaled))
+                if math.isnan(_ridge) or math.isinf(_ridge):
+                    _ridge = 0.0
+                c["_ridge_raw"] = _ridge
             except Exception:
                 c["_lgbm_proba"] = None
 
@@ -2478,11 +2540,13 @@ def _enrich_candidates_with_tiers(candidates: list):
             model_score_raw = sum(float(_weights.get(col, 0)) * feat_arr[i] for i, col in enumerate(feature_order))
         elif _weights:
             model_score_raw = sum(float(_weights.get(k, 0)) * float(v) for k, v in feat.items())
-        c["_model_score"] = round(model_score_raw, 2)
-        c["_model_confidence"] = min(99, max(1, round(100.0 / (1.0 + math.exp(-model_score_raw / 50.0)))))
-
+        if math.isnan(model_score_raw) or math.isinf(model_score_raw):
+            model_score_raw = 0.0
         c["_model_score"] = round(model_score_raw, 4)
-        c["_model_confidence"] = min(99, max(1, round(max(0, model_score_raw) * 100)))
+        try:
+            c["_model_confidence"] = min(99, max(1, round(100.0 / (1.0 + math.exp(-model_score_raw / 50.0)))))
+        except (OverflowError, ValueError):
+            c["_model_confidence"] = 1 if model_score_raw < 0 else 99
 
     # ── Fix 17: LGBM path — rank-blend proba (0.6) + ridge head (0.4) ──────
     # Mirrors training-time blending exactly (batch-relative ranks, as the
@@ -3619,26 +3683,20 @@ def bullish_confluence_score(symbol: str, market: str, indicators: dict, predict
     }
 
 
-def _get_strategy_params(dollar_volume: float) -> dict:
-    """Return cap-tier calibrated strategy parameters.
+def _get_strategy_params(dollar_volume: float = 0) -> dict:
+    """Return the v2 strategy parameters (single source of truth).
 
-    Targets are enforced to an asymmetric 2:1 Reward:Risk ratio.
-      Large/mid cap: 4% target, 2% stop → R:R 2.0
-      Small cap: 5% target, 2.5% stop → R:R 2.0
-    Aligned for 3-4% per-cycle compound strategy (12-13% annualised).
+    Fix 49: the legacy "3-4% per-cycle compound" tiers (4%/2%, 5%/2.5%) were
+    retired by v2 (Part 9). Every trade path — auto-scan, Telegram, and the
+    manual web journal — now uses the SAME uniform +8% target / −20% catastrophe
+    stop (path-aware label hit_8pct_before_m8pct). trailing_stop retired (Fix
+    46 removed the 3% trailing-stop trigger as stop-harvesting noise).
     """
-    if dollar_volume > 5_000_000:
-        return {
-            "target_pct": 0.040,
-            "stop_pct": 0.020,
-            "trailing_stop_pct": 2.5,
-            "tier": "large_mid",
-        }
     return {
-        "target_pct": 0.050,
-        "stop_pct": 0.025,
-        "trailing_stop_pct": 3.0,
-        "tier": "small",
+        "target_pct": 0.08,
+        "stop_pct": 0.20,
+        "trailing_stop_pct": 0.0,
+        "tier": "v2_uniform",
     }
 
 
@@ -4978,6 +5036,8 @@ def _paper_trade_snapshot(row, current_price: float) -> dict:
         "source_reason": row[22],
         "entry_date_parsed": entry_date_parsed.isoformat() if hasattr(entry_date_parsed, 'isoformat') else (str(entry_date_parsed) if entry_date_parsed else None),
         "days_held": days_held,
+        "catastrophe_stop_price": float(row[25]) if len(row) > 25 and row[25] is not None else None,
+        "time_stop_date": str(row[26])[:10] if len(row) > 26 and row[26] else None,
         "unrealized_pnl_pct": round(net_pnl_pct, 2),
         "unrealized_pnl_value": round(net_pnl_value, 2),
         "brokerage_fees": total_brokerage,
@@ -4992,7 +5052,7 @@ def list_paper_trades(user_id: str) -> list[dict]:
                       signal_score, signal_trend, signal_warning, notes, created_at, closed_at,
                       peak_price, stop_loss_price, take_profit_price, trailing_stop_pct,
                       review_date, last_alert_at, position_stage, recommendation_action, source_reason,
-                      entry_date_parsed, current_price
+                      entry_date_parsed, current_price, catastrophe_stop_price, time_stop_date
                 FROM paper_trades
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
@@ -6558,6 +6618,14 @@ async def smsf_dashboard(current_user: dict = Depends(get_current_user)):
         # Data state
         result["data_from"] = "2015"
         result["data_to"] = datetime.utcnow().strftime("%Y-%m")
+
+        # ── ETF Regime Signal (signal-strengthening layer) ────────────────
+        # Pre-emptive regime gate that fires before the NAV circuit breaker.
+        try:
+            from etf_pipeline import compute_etf_regime
+            result["etf_regime"] = compute_etf_regime()
+        except Exception as e:
+            result["etf_regime"] = {"regime": "UNKNOWN", "reason": str(e)}
 
         # ── Core Sleeve ───────────────────────────────────────────────────
         if _CORE_SLEEVE_AVAILABLE and compute_core_sleeve_state:
@@ -11043,6 +11111,7 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
             _sp = _get_strategy_params(_dv)
             stop_loss_price = round(execution_price * (1 - _sp["stop_pct"]), 2)
             stop_pct_display = int(_sp["stop_pct"] * 100)
+            strat_target = round(execution_price * (1 + _sp["target_pct"]), 2)
             target_pct = round(((analyst_target - execution_price) / execution_price) * 100, 2) if analyst_target and execution_price > 0 else None
             target_str = f"${analyst_target:.2f} ({target_pct:+.1f}%)" if analyst_target and target_pct else "N/A"
 
@@ -11050,7 +11119,8 @@ async def record_advice_action(payload: AdviceActionCreate, current_user: dict =
                 f"<b>✅ {'BUY' if action_type in ('BUY', 'ADD') else action_type} RECORDED — {symbol}.{market}</b>\n"
                 f"Shares: {quantity} @ ${execution_price:.2f}\n"
                 f"Total invested: ${gross_amount:,.2f}\n"
-                f"Stop loss target: ~${stop_loss_price:.2f} (-{stop_pct_display}%)\n"
+                f"Strategy target: ~${strat_target:.2f} (+{int(_sp['target_pct']*100)}%)\n"
+                f"Stop (catastrophe): ~${stop_loss_price:.2f} (−{stop_pct_display}%)\n"
                 f"Analyst target: {target_str}\n"
                 f"Monitoring active \U0001f4e1 — you'll be notified when conditions change."
             )
@@ -11260,21 +11330,34 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
     else:
         entry_price = live_price
 
-    # ── Cap-tier calibrated targets ───────────────────────────────────────────
-    # Large/mid cap: 4% target, 2% stop → R:R 2.0
-    # Small cap: 5% target, 2.5% stop → R:R 2.0
-    # Aligned for 3-4% per-cycle compound strategy (12-13% annualised).
+    # ── v2 uniform target/stop (Fix 49): +8% target, −20% catastrophe stop ─────
+    # The legacy cap-tier "4%/2%, 5%/2.5%" per-cycle compound params were retired
+    # by v2. Every path now uses the SAME uniform path-aware label (+8% before −8%).
     signal = get_probability_and_score(symbol)
     avg_vol_5d = float(stock_data.get("avg_volume_5d") or 0)
     dollar_volume = avg_vol_5d * entry_price
     _params = _get_strategy_params(dollar_volume)
+
+    # ── Model-quality FLAG (not block) for manual journaling ──────────────────
+    # The manual web journal records trades the user already made, so it does NOT
+    # hard-block below-top-decile symbols (unlike auto-scan/Telegram auto-buy).
+    # But it flags them clearly, so the record stays honest about model edge.
+    _mj_notes = ""
+    try:
+        _qt = _get_symbol_scan_tier(symbol)
+        if _qt.get("tier", "watch") not in ("10pct", "8pct"):
+            _pct = f"{float(_qt['proba'])*100:.1f}%" if _qt.get("proba") is not None else "n/a"
+            _mj_notes = (f"[Model flag: {symbol} is {_qt.get('tier','watch')}-tier "
+                         f"(P ≈ {_pct}) — outside the model's top decile.] ")
+    except Exception:
+        pass
 
     if side == "LONG":
         target_price = round(entry_price * (1 + _params["target_pct"]), 4)
     else:  # SHORT
         target_price = round(entry_price * (1 - _params["target_pct"]), 4)
 
-    # ── Stop-loss (cap-tier calibrated for R:R alignment) ─────────────────────
+    # ── Stop-loss: −20% catastrophe stop (v2 Part 7), same for both sides ─────
     if side == "SHORT":
         stop_loss_price = round(entry_price * (1 + _params["stop_pct"]), 4)
     else:
@@ -11312,7 +11395,7 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                 "signal_score": signal.get("score"),
                 "signal_trend": signal.get("trend"),
                 "signal_warning": signal.get("warning_message"),
-                "notes": payload.notes,
+                "notes": (_mj_notes + (payload.notes or "")).strip() or None,
                 "peak_price": entry_price,
                 "stop_loss_price": stop_loss_price,
                 "take_profit_price": target_price,
@@ -11366,7 +11449,8 @@ async def create_paper_trade(payload: PaperTradeCreate, current_user: dict = Dep
                 f"<b>✅ {'BUY' if side == 'LONG' else 'SHORT'} RECORDED (Web) — {symbol}.{market}</b>\n"
                 f"Shares: {float(payload.quantity or 1)} @ ${entry_price:.2f}\n"
                 f"Total invested: ${gross_amount:,.2f}\n"
-                f"Stop loss target: ~${stop_loss_price:.2f} (-{stop_pct_display}%)\n"
+                f"Strategy target: ~${target_price:.2f} (+{int(_params['target_pct']*100)}%)\n"
+                f"Stop (catastrophe): ~${stop_loss_price:.2f} (−{stop_pct_display}%)\n"
                 f"Analyst target: {target_str}\n"
                 f"Monitoring active 📡 — you'll be notified when conditions change."
             )
@@ -12077,31 +12161,42 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
 
                 if side == 'LONG':
                     new_peak = max(peak or entry, cp)
-                    drop_from_peak = (new_peak - cp) / new_peak if new_peak > 0 else 0
-                    trailing_pct = float(trailing_stop_pct or 3.0) / 100.0
 
-                    if take_profit_price and cp >= float(take_profit_price) and position_stage != 'trim_signal':
-                        stage_update = 'trim_signal'
-                        alert = _rich_alert(
-                            "🎯 TAKE PROFIT TRIGGER",
-                            f"Price {cp:.2f} ≥ target {float(take_profit_price):.2f}. "
-                            f"Consider trimming 50% and raising trailing stop to lock gains."
-                        )
-                    elif stop_loss_price and cp <= float(stop_loss_price) and position_stage != 'exit_signal':
-                        stage_update = 'exit_signal'
-                        alert = _rich_alert(
-                            "🛑 STOP LOSS TRIGGER",
-                            f"Price {cp:.2f} ≤ stop {float(stop_loss_price):.2f}. "
-                            f"Thesis may be broken. Review for exit to protect capital."
-                        )
-                    elif drop_from_peak >= trailing_pct and position_stage != 'exit_signal':
-                        stage_update = 'exit_signal'
-                        alert = _rich_alert(
-                            "⚠️ TRAILING STOP TRIGGER",
-                            f"Down {drop_from_peak*100:.1f}% from peak ${new_peak:.2f}. "
-                            f"Momentum reversing. Consider closing to preserve gains."
-                        )
-                    # Time stop: position flat > 30 days with < 2% gain
+                    if take_profit_price and cp >= float(take_profit_price):
+                        if position_stage != 'trim_signal':
+                            stage_update = 'trim_signal'
+                            alert = _rich_alert(
+                                "🎯 TAKE PROFIT TRIGGER",
+                                f"Price {cp:.2f} ≥ target {float(take_profit_price):.2f}. "
+                                f"Consider trimming 50% and raising trailing stop to lock gains."
+                            )
+                        else:
+                            _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_take_profit")
+                            stage_update = 'closed'
+                            alert = _rich_alert(
+                                "🎯 AUTO-CLOSED: Target Hit",
+                                f"Take-profit target met for 2 cycles. Auto-closed at {cp:.2f} to lock gains."
+                            )
+                    elif stop_loss_price and cp <= float(stop_loss_price):
+                        if position_stage != 'exit_signal':
+                            stage_update = 'exit_signal'
+                            alert = _rich_alert(
+                                "🛑 STOP LOSS TRIGGER",
+                                f"Price {cp:.2f} ≤ stop {float(stop_loss_price):.2f}. "
+                                f"Thesis may be broken. Review for exit to protect capital."
+                            )
+                        else:
+                            _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_catastrophe_stop")
+                            stage_update = 'closed'
+                            alert = _rich_alert(
+                                "🛑 AUTO-STOPPED: Stop Hit",
+                                f"Stop-loss triggered for 2 cycles. Auto-closed at {cp:.2f} to protect capital."
+                            )
+                    # NOTE: the old tight trailing-stop (3% drop from peak) was removed
+                    # per v2 Part 7 — it fires on normal intra-quarter noise (−9% to
+                    # −15% is typical) and converts a positive-EV strategy into a
+                    # stop-harvesting machine. Position-level risk now flows through
+                    # the catastrophe stop in the Exit Engine block below.
                     elif days_held >= 30 and abs(pnl_pct) < 2.0 and position_stage not in ('exit_signal', 'trim_signal'):
                         stage_update = 'review'
                         alert = _rich_alert(
@@ -12147,6 +12242,29 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                         except Exception as e:
                             pass  # exit engine non-blocking
 
+                    # ── Trend-degradation signal (silent fall — no news needed) ──
+                    # Detects continuous decline even without a new announcement:
+                    # price below 50-day MA AND below entry by a material-but-non-
+                    # catastrophic margin. Builds cadence of trust on the dashboard.
+                    if stage_update is None and side == 'LONG':
+                        try:
+                            hist = get_historical_data(symbol, period="3mo")
+                            if hist is not None and len(hist) >= 50:
+                                ind = calculate_technical_indicators(hist)
+                                sma50 = ind.get("sma_50")
+                                below_ma50 = sma50 is not None and cp < sma50
+                                fell_from_peak = peak and cp < float(peak) * 0.95
+                                if below_ma50 and fell_from_peak and pnl_pct < -3.0:
+                                    stage_update = 'review'
+                                    alert = _rich_alert(
+                                        "📉 TREND DEGRADATION — CONTINUOUS FALL",
+                                        f"Price {cp:.2f} below 50-day MA {sma50:.2f} and down "
+                                        f"{pnl_pct:+.1f}% from entry, drifting with no recovery. "
+                                        f"Review whether this trade is failing silently."
+                                    )
+                        except Exception:
+                            pass
+
                     conn.execute(text("""
                         UPDATE paper_trades
                         SET current_price = :cp,
@@ -12160,8 +12278,6 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
 
                 elif side == 'SHORT':
                     new_trough = min(peak or entry, cp)
-                    jump_from_trough = (cp - new_trough) / new_trough if new_trough > 0 else 0
-                    trailing_pct = float(trailing_stop_pct or 3.0) / 100.0
 
                     if take_profit_price and cp <= float(take_profit_price) and position_stage != 'trim_signal':
                         stage_update = 'trim_signal'
@@ -12177,13 +12293,8 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                             f"Price {cp:.2f} ≥ stop {float(stop_loss_price):.2f}. "
                             f"Cover position to limit further loss."
                         )
-                    elif jump_from_trough >= trailing_pct and position_stage != 'exit_signal':
-                        stage_update = 'exit_signal'
-                        alert = _rich_alert(
-                            "⚠️ SHORT TRAILING STOP TRIGGER",
-                            f"Rebounded {jump_from_trough*100:.1f}% from trough ${new_trough:.2f}. "
-                            f"Momentum turning against short. Review for exit."
-                        )
+                    # NOTE: tight trailing-stop removed per v2 Part 7; shorts follow
+                    # the same catastrophe-stop discipline via the Exit Engine.
                     conn.execute(text("""
                         UPDATE paper_trades
                         SET current_price = :cp,
@@ -13053,18 +13164,32 @@ def _scheduled_v2_daily_scan():
             if res:
                 candidates.append(res)
     
-    # Filter for top tier candidates
-    valid_candidates = [c for c in candidates if (c.get("prob_ge_5pct") or 0) >= 55.0]
-    pool = sorted(valid_candidates, key=lambda x: x.get("wealth_rank", 0), reverse=True)
-    
+    # ── Enrich with consensus tier (LGBM decile + RF + ridge) ────────────────
+    # The tier is the calibrated rank signal (top decile = 60.5% hit-rate).
+    # The AI deep-dive must ONLY re-scan the top decile — NOT the legacy
+    # prob_ge_5pct>=55 heuristic pool (which admitted FLT/STO, both watch-tier
+    # with sub-base-rate true probabilities).
+    try:
+        _enrich_candidates_with_tiers(candidates)
+    except Exception as e:
+        print(f"[V2DailyScan] Tier enrichment failed (non-blocking): {e}")
+
+    # Filter for top decile ONLY (the zone the trained model actually backs)
+    top_decile = [c for c in candidates if c.get("_target_tier") in ("10pct", "8pct")]
+    top_decile.sort(key=lambda x: x.get("_lgbm_proba") or 0, reverse=True)
+    print(f"[V2DailyScan] Top-decile candidates: {len(top_decile)} of {len(candidates)} "
+          f"(10pct/8pct only — AI will NOT re-scan watch-tier).")
+
+    pool = top_decile
+
     MAX_AI = int(os.getenv("TOPTIER_MAX_AI_DEEP_DIVES", "0"))
     if MAX_AI > 0:
         selected = pool[:MAX_AI]
     else:
-        # Default cap if unlimited is risky: only deep dive top 5
-        selected = pool[:5]
+        # Default cap if unlimited is risky: deep dive the top decile (up to 8)
+        selected = pool[:8]
 
-    print(f"[V2DailyScan] Selected {len(selected)} top-tier candidates for AI deep-dive.")
+    print(f"[V2DailyScan] Selected {len(selected)} top-decile candidates for AI deep-dive.")
 
     ai_results = []
     for i, cand in enumerate(selected):
@@ -13086,6 +13211,8 @@ def _scheduled_v2_daily_scan():
             val["model_tier"] = cand.get("_target_tier", "none")
             val["model_score"] = cand.get("_model_score", 0)
             val["model_tier_label"] = cand.get("_tier_label", "")
+            val["model_proba"] = cand.get("_lgbm_proba")  # true P(hit +8%) from the trained LGBM
+            val["model_base_rate"] = 0.21  # modern-window base rate (Fix 26) — the line below which the model has NO edge
 
             # T3-C: model-aware debate context (feature drivers + kNN setups)
             try:
@@ -13138,6 +13265,18 @@ def _scheduled_v2_daily_scan():
     approved = [r for r in ai_results if r.get("decision") == "APPROVE"]
     rejected = [r for r in ai_results if r.get("decision") == "REJECT"]
 
+    # ── Fix 53: model trades IRRESPECTIVE of AI (agreed plan) ──────────────
+    # The model's top decile (10pct/8pct tier) is the source of truth for what
+    # gets auto-traded. The AI verdict is logged in ai_verdicts for the ~1-month
+    # WFO comparison (AI-approved vs AI-rejected vs raw) but does NOT gate entry.
+    # This makes live trading consistent with the AI-independent WFO validation.
+    # `trade_candidates` = all top-decile picks that were deep-dived, regardless
+    # of the AI decision attached to them.
+    trade_candidates = [
+        r for r in ai_results
+        if (r.get("candidate") or {}).get("_target_tier") in ("10pct", "8pct")
+    ]
+
     lines = [
         f"<b>🤖 V2 AI DAILY SCAN — {today_key}</b>",
         f"",
@@ -13182,9 +13321,10 @@ def _scheduled_v2_daily_scan():
         print(f"[V2DailyScan] Broadcast failed: {e}")
 
     # Process buys — per-user portfolio sizing
-    if approved:
-        num_approved = len(approved)
-        print(f"[V2DailyScan] {num_approved} approved. Processing per-user paper trades...")
+    # Fix 53: iterate top-decile candidates (AI-independent), NOT just AI-approved.
+    if trade_candidates:
+        num_targets = len(trade_candidates)
+        print(f"[V2DailyScan] {num_targets} top-decile candidates. Processing per-user paper trades (AI-independent)...")
 
         try:
             with db_conn() as conn:
@@ -13196,7 +13336,7 @@ def _scheduled_v2_daily_scan():
             recipients = get_user_telegram_recipients(uid)
             if not recipients:
                 continue
-            for a in approved:
+            for a in trade_candidates:
                 # Per-user portfolio state for correct position sizing
                 pf = _compute_portfolio_state(uid)
                 available_capital = pf["available_cash"]
@@ -13236,7 +13376,7 @@ def _scheduled_v2_daily_scan():
 
                 size = _calculate_position_size(
                     price=price, stop_loss_pct=-abs(stop_pct),
-                    account_balance=available_capital, num_picks=num_approved,
+                    account_balance=available_capital, num_picks=num_targets,
                     avg_volume=int(adv), current_sector_exposure=sector_exp,
                     candidate_sector=sector,
                 )
@@ -13266,7 +13406,19 @@ def _scheduled_v2_daily_scan():
                 auto_trade_id = None
                 if PAPER_BOOTSTRAP_MODE and PAPER_BOOTSTRAP_AUTO_EXECUTE and qty > 0:
                     gate = _wfo_position_gate()
-                    if gate["allowed"]:
+                    # ── Model-quality guardrail (closes the FLT/STO loophole) ──
+                    # The tier is the CALIBRATED signal: '10pct' = top decile of the
+                    # trained model's ranking, which hits +8% 60.5% of the time
+                    # (artifact 'deciles': [60.5, ...]). The raw _lgbm_proba is
+                    # rank-compressed (never exceeds ~30%), so a hard 21% raw-proba
+                    # cut would wrongly block the top decile. Gate on tier (rank),
+                    # and use proba only to detect a corrupt/zero-scoring model.
+                    _proba = cand.get("_lgbm_proba")
+                    _tier = cand.get("_target_tier", "watch")
+                    is_top_decile = _tier in ("10pct", "8pct")
+                    proba_positive = _proba is not None and float(_proba) > 0.0
+                    quality_ok = is_top_decile and proba_positive
+                    if gate["allowed"] and quality_ok:
                         auto_trade_id = _auto_create_paper_trade(
                             uid, sym, market, qty, price,
                             source_reason="v2_daily_scan",
@@ -13274,17 +13426,23 @@ def _scheduled_v2_daily_scan():
                         )
                         if auto_trade_id:
                             warn_note += "\n🤖 AUTO-EXECUTED (bootstrap mode)"
+                    elif gate["allowed"] and not quality_ok:
+                        warn_note += f"\n⛔ MODEL-QUALITY GATE: tier={_tier} proba={float(_proba or 0)*100:.1f}% — not in top decile, not auto-traded"
                     else:
                         warn_note += f"\n⛔ Bootstrap gate: {gate['reason']}"
 
+                # Annotate the buy message with the AI verdict (sentiment layer),
+                # but the TRADE is model-driven (top-decile) — AI opinion is logged,
+                # not obeyed (Fix 53).
+                ai_verdict_emoji = "🟢 AI AGREES" if a.get("decision") == "APPROVE" else "🟡 AI CAUTION"
                 buy_msg = (
-                    f"<b>✅ V2 AI-APPROVED — {tier}</b>\n"
+                    f"<b>✅ V2 MODEL PICK — {tier}</b>\n"
                     f"{sym} — {cand.get('name', sym)}\n\n"
-                    f"{tier_emoji} <b>Target: {tier_pct} (2:1 R:R)</b>\n"
+                    f"{ai_verdict_emoji} · {tier_emoji} <b>Target: {tier_pct} (2:1 R:R)</b>\n"
                     f"💰 Price: ${price:.2f} | Stop: ${stop_p:.2f} (-{abs(stop_pct):.1f}%)\n"
                     f"📊 {qty} shares = ${cost:.0f} ({size['pct_of_account']}% of portfolio)\n"
                     f"🎯 Risk: ${risk:.0f} ({PORTFOLIO_RISK_PER_TRADE_PCT}% of capital per trade)\n"
-                    f"💼 Portfolio: ${available_capital:.0f} available | {num_approved} picks today{warn_note}\n\n"
+                    f"💼 Portfolio: ${available_capital:.0f} available | {num_targets} top-decile today{warn_note}\n\n"
                     f"<i>AI: {a.get('reasoning','')[:120]}...</i>"
                 )
                 kb = {"inline_keyboard": [[
@@ -13469,7 +13627,6 @@ def _wfo_position_gate(user_id: str = None) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _WFO_TABLE_SQL = """
-    DROP TABLE IF EXISTS wfo_metrics CASCADE;
     CREATE TABLE IF NOT EXISTS wfo_metrics (
         run_id TEXT PRIMARY KEY,
         run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -13578,7 +13735,7 @@ def _scheduled_walk_forward_oos():
                 with db_conn() as conn:
                     conn.execute(text("""
                         INSERT INTO wfo_metrics (run_id, horizon_window_days, total_signals, notes)
-                        VALUES (:rid, :hd, 0, 'INSUFFICIENT_DATA: no scan cache entries ≥ horizon_days old')
+                        VALUES (:rid, :hd, 0, 'INSUFFICIENT_DATA: no scan cache entries ≥ horizon_days old yet')
                         ON CONFLICT (run_id) DO UPDATE SET
                             run_at = NOW(), total_signals = EXCLUDED.total_signals,
                             notes = EXCLUDED.notes
@@ -13593,6 +13750,20 @@ def _scheduled_walk_forward_oos():
         all_signals = []
         top_10pct_symbols = set()
         top_8pct_symbols = set()
+        # ── Load AI verdicts (symbol → decision) so WFO can segment hit-rate by
+        # whether the AI debate APPROVED / REJECTED / never saw the signal. This
+        # is the independent AI-gate measurement: raw top-decile vs approved vs
+        # rejected hit-rates answer "does the AI gate add value?".
+        _ai_decisions = {}
+        try:
+            with db_conn() as _c:
+                _ar = _c.execute(text(
+                    "SELECT symbol, decision FROM ai_verdicts"
+                )).fetchall()
+                _ai_decisions = {r[0]: r[1] for r in _ar}
+        except Exception:
+            pass
+
         for picks_json, gen_at in rows:
             candidates = json.loads(picks_json) if isinstance(picks_json, str) else (picks_json or [])
             for c in candidates:
@@ -13605,6 +13776,11 @@ def _scheduled_walk_forward_oos():
                 mc = (c.get("valuation") or {}).get("market_cap")
                 sector = (c.get("valuation") or {}).get("sector", "Unknown")
                 tier = c.get("_target_tier", "8pct")
+                # ── Epoch split ──────────────────────────────────────────────
+                # 'frozen' = carries the CURRENT `10pct`/`8pct` tier (Aug-12+),
+                # attributable to the locked model. 'legacy' = pre-v2 signals
+                # (`5pct`/`(none)`/`watch`) that must NOT drive the WFO decision.
+                epoch = "frozen" if tier in ("10pct", "8pct") else "legacy"
                 if tier == "10pct":
                     top_10pct_symbols.add(sym)
                 elif tier == "8pct":
@@ -13614,6 +13790,8 @@ def _scheduled_walk_forward_oos():
                     "screened_at": str(gen_at)[:10] if gen_at else str(cutoff_date),
                     "entry_price": price, "predicted_change_pct": pred_chg,
                     "trend": trend, "market_cap": mc, "sector": sector, "tier": tier,
+                    "ai_decision": _ai_decisions.get(sym, "UNSEEN"),
+                    "epoch": epoch,
                 })
 
         if not all_signals:
@@ -13668,7 +13846,10 @@ def _scheduled_walk_forward_oos():
                 predicted_up = sig["trend"] == "bullish"
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
-                hit = actual_return >= 3.0
+                # ── v2 label: +8% before −8% (Part 9 path-aware). WFO must measure
+                # the SAME threshold the model was trained to predict, else the
+                # hit-rate is not comparable to the advertised 60.5% top decile.
+                hit = actual_return >= 8.0
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
@@ -13683,45 +13864,80 @@ def _scheduled_walk_forward_oos():
                     "tier": tier,
                     "sector": sector,
                     "screen_to_entry_gap_pct": round(screen_to_entry_gap, 2),
+                    "ai_decision": sig.get("ai_decision", "UNSEEN"),
+                    "epoch": sig.get("epoch", "legacy"),
                 })
             except Exception:
                 continue
 
-        n = len(evaluated)
+        n_total = len(evaluated)
         if dropped_corporate_action > 0:
             print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
 
-        # ── Minimum 20 evaluated signals for statistically meaningful Sharpe ──
+        # ── Epoch split (frozen model vs legacy) determined here, before the
+        # minimum-signal gate, so both buckets are counted correctly.
+        frozen_eval = [e for e in evaluated if e.get("epoch") == "frozen"]
+        legacy_eval = [e for e in evaluated if e.get("epoch") == "legacy"]
+        n = len(frozen_eval)
+
+        # ── Minimum 20 FROZEN-model signals for statistically meaningful Sharpe ──
         # (Sharpe on <20 observations has CI width >0.4 — not actionable)
-        # Horizons without enough data go to INSUFFICIENT_DATA, not AMBER/RED.
-        # This includes 63d and 90d horizons at Day 30 — they won't be evaluable
-        # until enough signals age to that window.
+        # Legacy (pre Aug-12 `5pct`/no-tier) signals are EXCLUDED from the decision
+        # metric — they predate the locked model and use a different target.
         if n < 20:
-            # Write INSUFFICIENT_DATA record so we know the horizon was checked
             try:
                 with db_conn() as conn:
+                    frozen_earliest = conn.execute(text(
+                        "SELECT MIN(generated_at) FROM wealth_scan_history "
+                        "WHERE scan_mode='broad' AND picks::text LIKE '%10pct%'"
+                    )).scalar()
+                    countdown_note = "INSUFFICIENT_DATA(frozen)"
+                    if frozen_earliest:
+                        fd = frozen_earliest.date() if hasattr(frozen_earliest, 'date') else frozen_earliest
+                        elapsed_trading = int((date.today() - fd).days * 5 / 7)
+                        remaining_trading = max(0, horizon_days - elapsed_trading)
+                        remaining_cal = int(remaining_trading * 7 / 5)
+                        countdown_note = (
+                            f"INSUFFICIENT_DATA(frozen): {n} frozen-model signals evaluated (need >=20); "
+                            f"legacy={len(legacy_eval)} excluded. "
+                            f"Frozen-model earliest signal {fd} ({elapsed_trading} trading days elapsed); "
+                            f"~{remaining_cal} calendar days (~{remaining_trading} trading) until first "
+                            f"h{horizon_days}d decision-relevant result."
+                        )
+                    else:
+                        countdown_note = (
+                            f"INSUFFICIENT_DATA(frozen): {n} frozen-model signals; "
+                            f"legacy={len(legacy_eval)} excluded; no `10pct`-tier scan in history yet."
+                        )
                     conn.execute(text("""
                         INSERT INTO wfo_metrics (run_id, horizon_window_days, total_signals, notes)
-                        VALUES (:rid, :hd, :n, 'INSUFFICIENT_DATA')
+                        VALUES (:rid, :hd, :n, :notes)
                         ON CONFLICT (run_id) DO UPDATE SET
                             run_at = NOW(), total_signals = EXCLUDED.total_signals,
                             notes = EXCLUDED.notes
-                    """), {"rid": horizon_key, "hd": horizon_days, "n": n})
+                    """), {"rid": horizon_key, "hd": horizon_days, "n": n, "notes": countdown_note})
                     conn.commit()
             except Exception:
                 pass
-            print(f"[WFO] h{horizon_days}d: only {n} evaluated signals (need ≥20). Status: INSUFFICIENT_DATA")
+            print(f"[WFO] h{horizon_days}d: only {n} FROZEN signals evaluated (legacy {len(legacy_eval)} excluded). Status: INSUFFICIENT_DATA(frozen)")
             continue
 
-        hits = sum(1 for e in evaluated if e["hit"])
-        dir_correct = sum(1 for e in evaluated if e["direction_correct"])
-        returns = [e["actual_return_pct"] for e in evaluated]
-        preds = [e["predicted_change_pct"] for e in evaluated]
+        # ── Epoch split: decision metrics come from the FROZEN epoch ONLY ───────
+        # The legacy (`5pct`/no-tier) signals predate the locked model and must
+        # NOT drive RED/AMBER/GREEN. We keep them as a separate reference bucket.
+        hits = sum(1 for e in frozen_eval if e["hit"])
+        dir_correct = sum(1 for e in frozen_eval if e["direction_correct"])
+        returns = [e["actual_return_pct"] for e in frozen_eval]
+        preds = [e["predicted_change_pct"] for e in frozen_eval]
+        n = len(frozen_eval)
         avg_return = sum(returns) / n
         avg_pred = sum(preds) / n
         stdev_return = (sum((r - avg_return) ** 2 for r in returns) / (n - 1)) ** 0.5 if n > 1 else 1.0
         hit_rate = hits / n * 100
         dir_acc = dir_correct / n * 100
+        legacy_n = len(legacy_eval)
+        legacy_hits = sum(1 for e in legacy_eval if e["hit"])
+        legacy_hit_rate = round(legacy_hits / legacy_n * 100, 1) if legacy_n else None
 
         # ── OOS Sharpe: cross-sectional across signals evaluated today ────────
         # Each signal is an independent observation.  We annualize by scaling
@@ -13769,6 +13985,21 @@ def _scheduled_walk_forward_oos():
         tier8_picks = [e for e in evaluated if e.get("symbol") in top_8pct_symbols]
         tier10_hit_rate = round(sum(1 for x in tier10_picks if x["hit"]) / len(tier10_picks) * 100, 1) if tier10_picks else None
         tier8_hit_rate = round(sum(1 for x in tier8_picks if x["hit"]) / len(tier8_picks) * 100, 1) if tier8_picks else None
+
+        # ── AI-gate segmented WFO (independent measurement of the AI debate) ─
+        # Answers "does the AI gate add value?" — raw top-decile hit-rate vs the
+        # hits among signals the AI APPROVED vs REJECTED vs never saw (UNSEEN).
+        ai_approved = [e for e in evaluated if e.get("ai_decision") == "APPROVE"]
+        ai_rejected = [e for e in evaluated if e.get("ai_decision") == "REJECT"]
+        ai_unseen = [e for e in evaluated if e.get("ai_decision") not in ("APPROVE", "REJECT")]
+        ai_hit_approved = round(sum(1 for x in ai_approved if x["hit"]) / len(ai_approved) * 100, 1) if ai_approved else None
+        ai_hit_rejected = round(sum(1 for x in ai_rejected if x["hit"]) / len(ai_rejected) * 100, 1) if ai_rejected else None
+        ai_hit_unseen = round(sum(1 for x in ai_unseen if x["hit"]) / len(ai_unseen) * 100, 1) if ai_unseen else None
+        ai_segments = {
+            "approved": {"n": len(ai_approved), "hit_rate_pct": ai_hit_approved},
+            "rejected": {"n": len(ai_rejected), "hit_rate_pct": ai_hit_rejected},
+            "unseen": {"n": len(ai_unseen), "hit_rate_pct": ai_hit_unseen},
+        }
 
         # ── Regime-segmented WFO ─────────────────────────────────────────────
         regime_map = {"bull": [], "bear": [], "sideways": []}
@@ -13911,6 +14142,22 @@ def _scheduled_walk_forward_oos():
         full_notes_parts = [f"{edge_status}: {action}"]
         full_notes_parts.append(f"Regime={current_regime} HitRate={regime_hit.get(current_regime,'?')}% | PeakHitRate={peak_hit_rate}% vs CloseHitRate={close_hit_rate}%")
         full_notes_parts.append(f"10pct_tier_hit={tier10_hit_rate}% | 8pct_tier_hit={tier8_hit_rate}%")
+        full_notes_parts.append(
+            f"FROZEN-model n={n} vs LEGACY n={legacy_n} "
+            f"(legacy_hit={legacy_hit_rate if legacy_hit_rate is not None else 'n/a'}% — excluded from decision)"
+        )
+        # AI-gate segmentation (independent measurement of the AI debate layer)
+        _apr = ai_segments["approved"]["hit_rate_pct"]
+        _rej = ai_segments["rejected"]["hit_rate_pct"]
+        _uns = ai_segments["unseen"]["hit_rate_pct"]
+        full_notes_parts.append(
+            f"AI-approved_hit={_apr if _apr is not None else 'n/a'}% "
+            f"(n={ai_segments['approved']['n']}) | "
+            f"AI-rejected_hit={_rej if _rej is not None else 'n/a'}% "
+            f"(n={ai_segments['rejected']['n']}) | "
+            f"AI-unseen_hit={_uns if _uns is not None else 'n/a'}% "
+            f"(n={ai_segments['unseen']['n']})"
+        )
         if concentration_warning:
             full_notes_parts.append(concentration_warning)
         if gap_warning:
@@ -13922,6 +14169,7 @@ def _scheduled_walk_forward_oos():
             f"Sharpe={oos_sharpe:.3f} (95% CI [{sharpe_ci_lower:.3f}, {sharpe_ci_upper:.3f}]) | "
             f"Bmk={benchmark_ret}% | Excess={excess_ret}% | "
             f"10%Tier={tier10_hit_rate}% | 8%Tier={tier8_hit_rate}% | "
+            f"AI[appr={_apr}%/{ai_segments['approved']['n']}, rej={_rej}%/{ai_segments['rejected']['n']}, unseen={_uns}%/{ai_segments['unseen']['n']}] | "
             f"Regime={current_regime}({regime_hit.get(current_regime,'?')}%) | "
             f"PeakHit={peak_hit_rate}% vs CloseHit={close_hit_rate}% | "
             f"{edge_status}"
@@ -14139,15 +14387,15 @@ def _scheduled_positions_monitor():
                 alert = None
                 alert_type = None
 
-                if pnl_pct <= -8:
+                if pnl_pct <= -20:
                     alert_type = "stop_loss"
                     alert = (
-                        f"<b>🔴 STOP LOSS WARNING — {sym}.{market}</b>\n\n"
+                        f"<b>🔴 CATASTROPHE STOP WARNING — {sym}.{market}</b>\n\n"
                         f"Your entry: ${avg_cost:.2f} | Current: ${live_price:.2f}\n"
                         f"P&amp;L: -${abs(invested * abs(pnl_pct) / 100):,.2f} ({pnl_pct:+.1f}%)\n"
-                        f"⚠️ Down more than 8% from entry\n\n"
+                        f"⚠️ Down more than 20% from entry (catastrophe stop, v2 Part 7)\n\n"
                         f"📊 <b>Action recommended:</b> Review immediately. Consider cutting losses or hedging.\n"
-                        f"Stop loss reference: ~${round(avg_cost * 0.92, 2)}"
+                        f"Stop reference: ~${round(avg_cost * 0.80, 2)}"
                     )
                 elif target_mean and live_price >= float(target_mean) and pnl_pct > 0:
                     alert_type = "profit_target"
@@ -14544,6 +14792,36 @@ def _send_telegram_reply(chat_id: str, text: str) -> None:
         pass
 
 
+def _get_symbol_scan_tier(symbol: str) -> dict:
+    """Look up a symbol's tier + LGBM probability from the latest scan cache.
+
+    The LGBM tier (10pct/8pct/watch) is batch-relative — assigned during the
+    daily broad scan. This helper reads the most recent wealth_scan_cache and
+    returns the candidate's {tier, proba, score} so entry paths (Telegram BUY,
+    manual API) can apply the SAME model-quality gate the v2 auto-scan uses.
+    Returns {'tier': 'watch', 'proba': None, 'score': None} when unknown.
+    """
+    try:
+        import json as _json
+        with db_conn() as conn:
+            row = conn.execute(text(
+                "SELECT picks FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+            )).fetchone()
+        if not row or not row[0]:
+            return {"tier": "watch", "proba": None, "score": None}
+        picks = _json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
+        for c in picks:
+            if str(c.get("symbol", "")).upper() == symbol.upper():
+                return {
+                    "tier": c.get("_target_tier", "watch"),
+                    "proba": c.get("_lgbm_proba"),
+                    "score": c.get("score"),
+                }
+        return {"tier": "watch", "proba": None, "score": None}
+    except Exception:
+        return {"tier": "watch", "proba": None, "score": None}
+
+
 def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: float, entry_price: float,
                              source_reason: str = "telegram_buy", notes: str = None) -> Optional[str]:
     """Create a paper trade with sensible defaults for auto-monitoring.
@@ -14552,6 +14830,26 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
     Blocks trades if model quality is below threshold (R² < 0.05).
     """
     try:
+        # ── Model-quality gate (v2): require top-decile tier from the latest scan ──
+        # The LGBM tier (10pct/8pct) is a batch-relative rank assigned during the
+        # daily scan. A manual/Telegram BUY for a symbol the trained model does NOT
+        # rank in the top quartile is the exact FLT/STO failure mode — block it the
+        # same way the v2 auto-scan gate does. (Single source of truth for every
+        # trade entry path, not just auto-execution.)
+        try:
+            import json as _json
+            _qv = _get_symbol_scan_tier(symbol)
+            _q_tier = _qv.get("tier", "watch")
+            _q_proba = _qv.get("proba")
+            if _q_tier not in ("10pct", "8pct"):
+                print(f"[AutoCreate] MODEL-QUALITY BLOCK {symbol}: tier={_q_tier} "
+                      f"proba={(_q_proba or 0)*100 if _q_proba is not None else 'n/a'}% "
+                      f"— not in top decile of latest scan")
+                return None
+        except Exception as e:
+            # Non-blocking only if the scan cache is unavailable; log and continue.
+            print(f"[AutoCreate] Model-quality check unavailable (allowing trade): {e}")
+
         # ── Model quality gate — block trades if model is random noise ──────
         try:
             with db_conn() as conn:
@@ -14617,9 +14915,16 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 try:
                     _macro_ctx = _get_macro_data_cached()
                     _vix_ctx = float(_macro_ctx.get("vix", {}).get("current", 20) or 20)
+                    _etf_regime = None
+                    try:
+                        from etf_pipeline import compute_etf_regime
+                        _etf_regime = compute_etf_regime().get("regime")
+                    except Exception:
+                        pass
                     _PORTFOLIO_GATE.set_market_context(
                         vix_level=_vix_ctx,
                         xjo_above_sma200=(_get_axjo_vs_sma200() >= 0),
+                        etf_regime=_etf_regime,
                     )
                 except Exception:
                     pass
@@ -14689,11 +14994,27 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 pass
 
         signal = get_probability_and_score(symbol)
-        predicted = float(signal.get("predicted_price_3m") or 0)
-        # For a LONG trade, target must be > entry. If the model is bearish, default to 12% upside.
-        target_price = predicted if predicted > entry_price else entry_price * 1.12
-        stop_loss_price = round(entry_price * 0.92, 3)   # 8% stop
-        take_profit_price = round(target_price, 3)
+        # ── v2 target: uniform +8% path-aware (Part 9 label: first_touch +8%/−8%) ──
+        # The Screener and strategy docs advertise +8%; keep the stored target
+        # consistent with that single source of truth (no model-price divergence).
+        target_price = round(entry_price * 1.08, 3)
+        take_profit_price = target_price
+        # ── v2 exit discipline (Part 7): catastrophe stop = max(−20%, −2.5×ATR), ──
+        # NOT a mechanical −8% stop (which v2 retired as stop-harvesting noise).
+        atr_pct = 0.05  # conservative default annualised→ATR proxy if history unavailable
+        try:
+            hist = get_historical_data(symbol, period="3mo")
+            if hist is not None and len(hist) >= 20:
+                ind = calculate_technical_indicators(hist)
+                atr_pct = (ind.get("atr_pct") or 5.0) / 100.0
+        except Exception:
+            pass
+        catastrophe_stop_pct = max(0.20, 2.5 * atr_pct)
+        catastrophe_stop_price = round(entry_price * (1 - catastrophe_stop_pct), 3)
+        # stop_loss_price kept as the catastrophe stop too (single source of truth;
+        # the tight −8% hard stop is retired per v2).
+        stop_loss_price = catastrophe_stop_price
+        time_stop_date = (now + timedelta(days=63)).date()
         trade_id = str(uuid4())
         now = datetime.utcnow()
         trade_notes = notes or f'Auto-created from {source_reason}'
@@ -14703,13 +15024,15 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                     (id, user_id, symbol, market, side, quantity, entry_price, current_price,
                      target_price, status, signal_score, signal_trend, signal_warning, notes, peak_price,
                      stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
-                     position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed)
+                     position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed,
+                     catastrophe_stop_price, time_stop_date)
                 VALUES
                     (:id, :user_id, :symbol, :market, 'LONG', :quantity, :entry_price, :entry_price,
                      :target_price, 'open', :signal_score, :signal_trend, NULL,
                      :notes, :entry_price,
                      :stop_loss, :take_profit, 3.0, :review_date,
-                     'entered', 'BUY', :source_reason, :now, :entry_date)
+                     'entered', 'BUY', :source_reason, :now, :entry_date,
+                     :cat_stop, :time_stop)
             """), {
                 "id": trade_id, "user_id": user_id, "symbol": symbol, "market": market,
                 "quantity": quantity, "entry_price": entry_price,
@@ -14722,6 +15045,8 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
                 "now": now,
                 "source_reason": source_reason,
                 "notes": trade_notes,
+                "cat_stop": catastrophe_stop_price,
+                "time_stop": time_stop_date,
             })
         log_position_event(trade_id, user_id, "opened",
                            f"Auto-opened via {source_reason}: {symbol}",
@@ -14732,8 +15057,9 @@ def _auto_create_paper_trade(user_id: str, symbol: str, market: str, quantity: f
         return None
 
 
-def _auto_close_paper_trade(user_id: str, symbol: str, market: str, close_price: float) -> Optional[str]:
-    """Close the most recent open paper trade for a symbol. Returns trade_id or None."""
+def _auto_close_paper_trade(user_id: str, symbol: str, market: str, close_price: float, reason: str = "auto") -> Optional[str]:
+    """Close the most recent open paper trade for a symbol. Returns trade_id or None.
+    reason: 'telegram', 'auto_take_profit', 'auto_catastrophe_stop', 'smsf_pipeline', 'announcement'"""
     try:
         with db_conn() as conn:
             row = conn.execute(text("""
@@ -14744,18 +15070,26 @@ def _auto_close_paper_trade(user_id: str, symbol: str, market: str, close_price:
             if not row:
                 return None
             trade_id = row[0]
+            reason_label = {
+                "auto_take_profit": "Closed via auto-take-profit",
+                "auto_catastrophe_stop": "Closed via auto-catastrophe-stop",
+                "telegram": "Closed via Telegram SELL command",
+                "smsf_pipeline": "Closed via SMSF pipeline",
+                "announcement": "Closed via critical announcement",
+            }.get(reason, "Closed automatically")
             conn.execute(text("""
                 UPDATE paper_trades
                 SET status = 'closed', current_price = :cp, closed_at = :now,
                     position_stage = 'closed', updated_at = :now,
-                    notes = COALESCE(notes, '') || ' | Closed via Telegram SELL command'
+                    notes = COALESCE(notes, '') || ' | ' || :note
                 WHERE id = :tid AND user_id = :uid
-            """), {"cp": close_price, "now": datetime.utcnow(), "tid": trade_id, "uid": user_id})
+            """), {"cp": close_price, "now": datetime.utcnow(), "tid": trade_id, "uid": user_id, "note": reason_label})
         log_position_event(trade_id, user_id, "closed",
-                           f"Closed via Telegram SELL command at {close_price}",
-                           {"close_price": close_price})
+                           f"{reason_label} at {close_price}",
+                           {"close_price": close_price, "reason": reason})
         return trade_id
-    except Exception:
+    except Exception as e:
+        print(f"[AutoClose] FAILED: {symbol} at {close_price} — {e}", flush=True)
         return None
 
 
@@ -14791,6 +15125,47 @@ def _smsf_position_size(entry_price: float, atr_pct: float, nav: float = 200000.
     stop_pct = max(0.20, 2.5 * (atr_pct / 100.0) if atr_pct else 0.20)
     value = nav * 0.015 / stop_pct
     return round(min(value, nav * 0.07), 0)
+
+
+@app.get("/api/screener/sparklines")
+async def screener_sparklines(symbols: str = "", days: int = 63,
+                              current_user: dict = Depends(get_current_user)):
+    """Return recent daily closes for a list of symbols in one batch query.
+
+    Used to render the inline price sparkline in each StockCard. Reads the local
+    eod_ohl_history table (market='AU') — no per-symbol EODHD/yfinance calls, so
+    the whole card grid lights up in a single cheap request.
+    """
+    del current_user
+    syms = [s.strip().upper().replace(".AX", "").replace(".NS", "")
+            for s in symbols.split(",") if s.strip()]
+    if not syms:
+        return {"sparklines": {}}
+    days = max(10, min(int(days), 250))
+    out = {}
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(text("""
+                SELECT symbol, trade_date, close
+                FROM eod_ohl_history
+                WHERE market = 'AU'
+                  AND symbol IN :syms
+                  AND trade_date >= CURRENT_DATE - INTERVAL '400 days'
+                ORDER BY symbol, trade_date ASC
+            """), {"syms": tuple(syms)}).fetchall()
+        hist = {}
+        for sym, d, c in rows:
+            hist.setdefault(sym, []).append((str(d), float(c) if c is not None else None))
+        for sym in syms:
+            series = hist.get(sym, [])
+            series = series[-days:]
+            out[sym] = {
+                "points": series,
+                "count": len(series),
+            }
+    except Exception:
+        pass
+    return {"sparklines": out}
 
 
 @app.get("/api/screener/scan")
@@ -14878,17 +15253,32 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                 row_f = p.get("_feat_row") or []
                 price = float(p.get("current_price", 0) or p.get("entry_price", 0) or 0)
                 atr = float(row_f[order.index("atr_pct")]) if row_f and "atr_pct" in order else 0.02
-                ev = 0.08 * float(proba or 0) - 0.08 * (1 - float(proba or 0))
+                # ── EV + reachable, calibrated to the actual strategy (Fix 49) ──
+                # The LGBM proba is RANK-COMPRESSED (max ~0.25-0.30, never 0.5), so
+                # a >=0.5 "reachable" gate was always false. Reachable = proba above
+                # the ~21% concurrent base rate (the model has genuine edge), NOT a
+                # fictiona 50% coin-flip. EV uses the real +8% target / -20%
+                # catastrophe stop, trimmed at +8%.
+                proba_f = float(proba or 0)
+                # reachable = in a deployable tier (R2/R1 consensus) OR proba above
+                # base rate. The tier is the calibrated signal — an 8pct/10pct stock
+                # is "hits +8% within 63d" reachable even if its raw proba is
+                # = rank-compressed just below 0.21 (e.g. AUB 19.96%).
+                _tier = p.get("_target_tier", "watch")
+                reachable = _tier in ("10pct", "8pct") or proba_f >= 0.21
+                _TIER_HIT_RATE = {"10pct": 0.58, "8pct": 0.45, "watch": 0.21}
+                _empirical_hit = _TIER_HIT_RATE.get(_tier, 0.21)
+                ev = 0.08 * _empirical_hit - 0.20 * (1 - _empirical_hit) * 0.35
                 cand = {
                     "symbol": sym,
                     "name": p.get("company_name", "") or p.get("name", ""),
                     "price": round(price, 2) if price else None,
-                    "score": round(float(proba or 0) * 100, 1),
+                    "score": round(proba_f * 100, 1),
                     "tier": p.get("_target_tier", "watch"),
                     "tier_label": p.get("_tier_label", ""),
                     "target_price": round(price * 1.08, 2) if price else None,
                     "ev_est_pct": round(ev, 2),
-                    "reachable_63d": bool(proba and float(proba) >= 0.5),
+                    "reachable_63d": reachable,
                     "smsf_size": _smsf_position_size(price, atr),
                     "institutional_pct": round(float(row_f[inst_idx]), 1) if inst_idx is not None and row_f and len(row_f) > inst_idx and row_f[inst_idx] else None,
                     "pe": round(100.0 / float(row_f[pe_idx]), 1) if pe_idx is not None and row_f and len(row_f) > pe_idx and row_f[pe_idx] and float(row_f[pe_idx]) > 0 else None,
@@ -14910,13 +15300,77 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                 candidates.append(cand)
             except Exception:
                 continue
-        candidates.sort(key=lambda c: c["score"], reverse=True)
+        # ── Sort by model quality (tier first, then proba) ─────────────────────
+        # The calibrated tier (10pct > 8pct > watch) is the primary signal; proba
+        # breaks ties within a tier. This guarantees genuine top-decile picks
+        # (MGR/DXS/AUB) always surface above watch-tier stocks that happen to
+        # have a similar raw proba. Consistent with the entry guardrail (Fix 41).
+        _tier_order = {"10pct": 0, "8pct": 1, "watch": 2, "signal": 3, "none": 4}
+        candidates.sort(key=lambda c: (_tier_order.get(c.get("tier"), 9), -c["score"]))
         out["candidates"] = candidates
         out["high_conviction"] = sum(1 for c in candidates if c["tier"] == "10pct")
         return out
     except Exception as e:
         out["error"] = str(e)
         return out
+
+
+@app.get("/api/etf/universe")
+async def etf_universe(current_user: dict = Depends(get_current_user)):
+    """List the ETF universe (separate instrument class from the stock screen)."""
+    del current_user
+    try:
+        from etf_universe import ETFS
+        return {"count": len(ETFS), "etfs": list(ETFS.values())}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/regime")
+async def etf_regime(current_user: dict = Depends(get_current_user)):
+    """Current ETF regime (risk_on / neutral / risk_off) + market proxy state."""
+    del current_user
+    try:
+        from etf_pipeline import detect_regime
+        regime, info = detect_regime()
+        return {"regime": regime, **info}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/signals")
+async def etf_signals(current_user: dict = Depends(get_current_user)):
+    """Today's ETF momentum/trend signals + target allocation."""
+    del current_user
+    try:
+        from etf_pipeline import generate_signals
+        return generate_signals()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/backtest")
+async def etf_backtest(start: str = "2020-01-01",
+                       current_user: dict = Depends(get_current_user)):
+    """Run the ETF trend/momentum backtest (returns summary + monthly log)."""
+    del current_user
+    try:
+        from etf_pipeline import backtest
+        return backtest(start=start)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/etf/backfill")
+async def etf_backfill(current_user: dict = Depends(get_current_user)):
+    """Trigger ETF OHLC backfill from EODHD (into eod_ohl_history)."""
+    del current_user
+    try:
+        from eodhd_backfill import backfill_etf_universe
+        result = backfill_etf_universe()
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/portfolio/nav-breakdown")
@@ -15045,6 +15499,22 @@ async def model_health_summary(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         out["error"] = str(e)
     try:
+        # Live evaluation metrics (9.8% hit rate vs expected 58.2%)
+        with db_conn() as conn:
+            eval_result = evaluate_signal_outcomes(conn)
+            out.update({
+                "live_evaluation": {
+                    "status": eval_result.get("status"),
+                    "observations": eval_result.get("observations"),
+                    "evaluated": eval_result.get("evaluated"),
+                    "wins": eval_result.get("wins"),
+                    "hit_rate": eval_result.get("hit_rate"),
+                    "freeze": eval_result.get("freeze"),
+                    "warning": eval_result.get("warning"),
+                    "description": eval_result.get("description"),
+                }
+            })
+        
         wfo = get_current_wfo_state()
         out["wfo_state"] = wfo.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
         out["gates"] = {
@@ -15056,8 +15526,57 @@ async def model_health_summary(current_user: dict = Depends(get_current_user)):
         }
         with db_conn() as conn:
             closed = conn.execute(text(
-                "SELECT COUNT(*) FROM paper_trades WHERE status='closed' AND COALESCE(exit_reason, '') <> 'legacy_model_retired'")).fetchone()
-            out["gates"]["G3"]["progress"] = f"{closed[0]}/60 closed"
+                "SELECT COUNT(*) FROM paper_trades WHERE status='closed' "
+                "AND COALESCE(exit_reason, '') NOT IN "
+                "('legacy_model_retired', 'duplicate_position', 'manual_remove_flt', 'manual_remove_sto', 'manual_remove_below_base')"
+                " AND source_reason LIKE 'v2_daily_scan%'")).fetchone()
+            out["gates"]["G3"]["progress"] = f"{closed[0]}/60 closed (v2 model trades only)"
+        # ── Live validation countdown (honest "when will we know") ─────────────
+        # Two separate milestones, because the strategy changed on Aug 16-17:
+        #   - LEGACY earliest signal (Jul 18) mixes pre-v2 picks (no `10pct` tier,
+        #     `5pct`/`(none)` conventions) — NOT attributable to the frozen model.
+        #   - FROZEN-MODEL earliest signal = first scan carrying the current
+        #     `10pct`/`8pct` tier (Aug 12). Only these validate the LOCKED model.
+        # The decision-relevant number is the FROZEN-model milestone, not the
+        # legacy one. Reporting both prevents acting on contaminated data.
+        try:
+            with db_conn() as conn:
+                legacy_min = conn.execute(text(
+                    "SELECT MIN(generated_at) FROM wealth_scan_history WHERE scan_mode='broad'"
+                )).scalar()
+                frozen_min = conn.execute(text(
+                    "SELECT MIN(generated_at) FROM wealth_scan_history "
+                    "WHERE scan_mode='broad' AND picks::text LIKE '%10pct%'"
+                )).scalar()
+            lv = {}
+            if frozen_min:
+                fd = frozen_min.date() if hasattr(frozen_min, 'date') else frozen_min
+                f_elapsed = int((date.today() - fd).days * 5 / 7)
+                f_remain = max(0, 30 - f_elapsed)
+                lv["frozen_model_earliest_signal"] = str(fd)
+                lv["frozen_model_elapsed_trading_days"] = f_elapsed
+                lv["days_until_frozen_model_wfo_30d"] = f_remain
+                lv["frozen_model_first_result_calendar"] = (
+                    (date.today() + __import__("datetime").timedelta(days=int(f_remain * 7 / 5))).isoformat()
+                    if f_remain > 0 else str(date.today())
+                )
+            if legacy_min:
+                ld = legacy_min.date() if hasattr(legacy_min, 'date') else legacy_min
+                lv["legacy_earliest_signal"] = str(ld)
+                lv["legacy_is_mixed"] = True
+                lv["legacy_note"] = (
+                    "Legacy signals (pre Aug-12) use the old `5pct`/no-tier convention "
+                    "and are NOT attributable to the frozen model — excluded from the "
+                    "decision-relevant WFO hit-rate."
+                )
+            lv["note"] = (
+                "The decision-relevant validation (frozen Top-Decile model hitting +8% live) "
+                "lands ~" + str(lv.get("frozen_model_first_result_calendar", "TBD")) + ". "
+                "Model is FROZEN under MODEL_LOCK_IN — no re-training drift."
+            )
+            out["live_validation"] = lv
+        except Exception:
+            pass
     except Exception:
         pass
     return out
@@ -15235,6 +15754,70 @@ async def dashboard_morning_brief(current_user: dict = Depends(get_current_user)
                     out["model"] = {"auc": notes.get("auc"), "top_decile": notes.get("top_decile")}
         except Exception:
             pass
+        # ── WFO capital gate, watchlist, live evaluation (Dashboard) ────
+        try:
+            _wfo = get_current_wfo_state()
+            _gate = _wfo.get("rules", {})
+            out["wfo_gate"] = {
+                "state": _wfo.get("state", "INSUFFICIENT_DATA"),
+                "allow_new_positions": _gate.get("allow_new_positions", False),
+                "max_new_positions": _gate.get("max_positions", 0),
+                "description": _gate.get("description", ""),
+            }
+            try:
+                with db_conn() as conn:
+                    _frozen_min = conn.execute(text(
+                        "SELECT MIN(generated_at) FROM wealth_scan_history "
+                        "WHERE scan_mode='broad' AND picks::text LIKE '%10pct%'"
+                    )).scalar()
+                if _frozen_min:
+                    from datetime import date as _dt_date
+                    _fd = _frozen_min.date() if hasattr(_frozen_min, 'date') else _frozen_min
+                    _days_since = (_dt_date.today() - _fd).days
+                    _remain = max(0, 30 - _days_since)
+                    out["wfo_gate"]["frozen_signals_elapsed"] = _days_since
+                    out["wfo_gate"]["frozen_signals_remaining"] = _remain
+                    out["wfo_gate"]["first_result_calendar"] = str(_fd + timedelta(days=30))
+            except Exception:
+                pass
+            try:
+                with db_conn() as conn:
+                    _row = conn.execute(text(
+                        "SELECT picks FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+                    )).fetchone()
+                if _row:
+                    _picks = json.loads(_row[0]) if isinstance(_row[0], str) else (_row[0] or [])
+                    _top = [p for p in _picks if p.get("_target_tier") in ("10pct", "8pct")][:5]
+                    _WL_TIER_EV = {"10pct": 0.58, "8pct": 0.45}
+                    out["watchlist"] = [{
+                        "symbol": p.get("symbol"),
+                        "score": round(float(p.get("_lgbm_proba") or p.get("_model_confidence", 0) / 100.0), 3),
+                        "tier": p.get("_target_tier"),
+                        "ev_est_pct": round(
+                            _WL_TIER_EV.get(p.get("_target_tier"), 0.21) * 0.08
+                            + (1 - _WL_TIER_EV.get(p.get("_target_tier"), 0.21)) * (-0.20) * 0.35, 3
+                        ),
+                        "name": p.get("company_name") or p.get("name", ""),
+                        "price": p.get("current_price") or p.get("entry_price"),
+                        "trend": p.get("trend", ""),
+                    } for p in _top]
+                    out["wfo_gate"]["deployable_count"] = len(_top)
+            except Exception:
+                pass
+            try:
+                from model_health import evaluate_signal_outcomes
+                with db_conn() as conn:
+                    _eval = evaluate_signal_outcomes(conn)
+                    out["model_eval"] = {
+                        "evaluated": _eval.get("evaluated", 0),
+                        "hit_rate": _eval.get("hit_rate", 0),
+                        "freeze": _eval.get("freeze", False),
+                        "status": _eval.get("status", "unknown"),
+                    }
+            except Exception:
+                pass
+        except Exception:
+            pass
         return out
     except Exception as e:
         out["error"] = str(e)
@@ -15375,19 +15958,36 @@ async def telegram_bot_webhook(request: Request):
                 else:
                     trade_id = _auto_create_paper_trade(user_id, symbol, market, quantity, price)
                     if trade_id:
-                        stop = round(price * 0.92, 2)
-                        target = round(result.get("holdings", [{}])[0].get("avg_cost", price) * 1.12, 2) if action == "BUY" else round(price * 1.12, 2)
+                        stop = round(price * 0.80, 2)   # catastrophe stop (−20%), v2 Part 7
+                        target = round(price * 1.08, 2)  # uniform +8% target, v2 Part 9
                         monitoring_msg = (
                             f"\n\n<b>Monitoring started</b>\n"
-                            f"Stop-loss: <b>${stop:.2f}</b> (8% below entry)\n"
-                            f"Target: model forecast | Trailing stop: 3%\n"
-                            f"You'll get alerts if price hits stop, target, or goes flat 30 days."
+                            f"Stop-loss: <b>${stop:.2f}</b> (catastrophe stop −20%)\n"
+                            f"Target: <b>${target:.2f}</b> (+8%) | Trailing stop: retired\n"
+                            f"You'll get alerts if price hits stop, target, or goes flat 63 days."
                         )
+                    else:
+                        # trade declined — surface WHY (duplicate / model quality / gate)
+                        _qt = _get_symbol_scan_tier(symbol)
+                        if _qt.get("tier", "watch") not in ("10pct", "8pct"):
+                            _pct = f"{float(_qt['proba'])*100:.1f}%" if _qt.get("proba") is not None else "n/a"
+                            monitoring_msg = (
+                                f"\n\n<b>⛔ BLOCKED by model-quality gate:</b>\n"
+                                f"{symbol} is tier <b>{_qt.get('tier', 'watch')}</b> "
+                                f"(model P(win) {_pct}) — outside the top decile the "
+                                f"trained model backs. The v2 strategy only permits "
+                                f"10pct/8pct-tier entries."
+                            )
+                        else:
+                            monitoring_msg = (
+                                "\n\n<b>⛔ Trade not recorded</b> (duplicate open "
+                                "position or portfolio gate limit)."
+                            )
 
         # Auto-close paper trade monitor on SELL/REDUCE
         closed_id = None
         if action in {"SELL", "REDUCE"}:
-            closed_id = _auto_close_paper_trade(user_id, symbol, market, price)
+            closed_id = _auto_close_paper_trade(user_id, symbol, market, price, reason="telegram")
             if closed_id:
                 monitoring_msg = "\n\n<b>Position monitoring closed.</b>"
 
@@ -15491,11 +16091,51 @@ def _scheduled_inc_update():
         _log_job_finish(jid, status="error", error=str(e), started_at=started)
         print(f"[IncUpdate] Failed: {e}")
 
+
+def _scheduled_etf_signal():
+    """4:30 PM mon-fri: compute ETF regime + momentum signals, persist snapshot."""
+    jid = _log_job_start("etf_signal")
+    started = datetime.utcnow()
+    try:
+        from etf_pipeline import generate_signals, detect_regime
+        regime, info = detect_regime()
+        signals = generate_signals(regime=regime)
+        payload = json.dumps(signals, default=str)
+        with db_conn() as conn:
+            conn.execute(text("""
+                INSERT INTO etf_signals (run_date, regime, payload)
+                VALUES (CURRENT_DATE, :r, :p)
+                ON CONFLICT (run_date) DO UPDATE SET
+                    regime = EXCLUDED.regime, payload = EXCLUDED.payload,
+                    updated_at = NOW()
+            """), {"r": regime, "p": payload})
+        _log_job_finish(jid, rows_affected=1, started_at=started)
+        picks = ", ".join(signals.get("momentum_picks", [])) or "none"
+        print(f"[ETFSignal] regime={regime} picks={picks}")
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[ETFSignal] Failed: {e}")
+
 def _scheduled_model_training():
-    """7 AM: Build training matrix and fit model weights (after broad scan data available)."""
+    """Weekly: Build training matrix + fit model weights.
+
+    Fix 51: under MODEL_LOCK_IN the production LGBM artifact is FROZEN — the
+    weekly retrain (LGBM challenger + 3-fold isotonic on 157K historical rows,
+    ~2.5h) is skipped entirely. The training MATRIX is only consumed by the
+    retrain path, and WFO evidence reads wealth_scan_history (not the matrix),
+    so nothing needs refreshing while locked. This removes both the wasted
+    compute AND the ambiguity where the 8AM scan ran mid-retrain.
+    """
     jid = _log_job_start("model_training")
     started = datetime.utcnow()
     try:
+        # ── MODEL_LOCK_IN short-circuit: skip the entire retrain ───────────────
+        if MODEL_LOCK_IN:
+            _log_job_finish(jid, rows_affected=0, started_at=started)
+            print(f"[ModelTrain] MODEL_LOCK_IN active — skipped weekly retrain. "
+                  f"Frozen artifact unchanged (AUC 0.744 / top-decile 58.2%).")
+            return
+
         from model_training import daily_training_pipeline
         result = daily_training_pipeline()
         rows = result.get("matrix", {}).get("rows_inserted", 0)
@@ -15504,6 +16144,23 @@ def _scheduled_model_training():
     except Exception as e:
         _log_job_finish(jid, status="error", error=str(e), started_at=started)
         print(f"[ModelTrain] Failed: {e}")
+
+
+def _scheduled_training_matrix_update():
+    """Daily training MATRIX refresh (no model retrain) under MODEL_LOCK_IN.
+    Keeps training data fresh without touching the frozen LGBM artifact."""
+    jid = _log_job_start("training_matrix_update")
+    started = datetime.utcnow()
+    try:
+        from model_training import build_training_matrix
+        result = build_training_matrix(incremental=True)
+        rows = result.get("rows_inserted", 0)
+        _log_job_finish(jid, rows_affected=rows, started_at=started)
+        print(f"[TrainMatrix] Incremental update: {rows} rows inserted")
+    except Exception as e:
+        _log_job_finish(jid, status="error", error=str(e), started_at=started)
+        print(f"[TrainMatrix] Failed: {e}")
+
 
 def _scheduled_channel_calibration():
     """9 AM: Recalibrate per-channel hit rates from evaluated outcomes."""
@@ -15587,7 +16244,8 @@ def _scheduled_smsf_pipeline():
                     if result.get("verdict") == "BROKEN":
                         alerts.append(f"🚨 SENTINEL BROKEN: {result['symbol']} — {result.get('reason','')[:100]}")
                         _auto_close_paper_trade(uid, result["symbol"], "AU",
-                                                float(pos.get("current_price", 0)))
+                                                float(pos.get("current_price", 0)),
+                                                reason="smsf_pipeline")
                     elif result.get("verdict") == "WEAKENED":
                         alerts.append(f"⚠️ SENTINEL WEAKENED: {result['symbol']} — {result.get('reason','')[:100]}")
                 except Exception as e:
@@ -15648,7 +16306,8 @@ def _scheduled_smsf_announcement_check():
                     for a in critical:
                         uid = a.get("user_id") or user.get("id")
                         _auto_close_paper_trade(uid, a["code"], "AU",
-                                                float(a.get("current_price", 0)))
+                                                float(a.get("current_price", 0)),
+                                                reason="announcement")
     except Exception as e:
         print(f"[AnnCheck] Failed: {e}")
 
@@ -16042,6 +16701,11 @@ if SCHEDULER_AVAILABLE:
             id="sunday_rotation", max_instances=1,
         )
         scheduler.add_job(
+            _scheduled_etf_signal, "cron",
+            minute=30, hour=16, day_of_week="mon-fri",
+            id="etf_signal_1630", max_instances=1,
+        )
+        scheduler.add_job(
             _scheduled_smsf_announcement_check, "cron",
             minute="0", hour="10-15", day_of_week="mon-fri",
             id="smsf_ann_check", max_instances=1,
@@ -16060,14 +16724,18 @@ if SCHEDULER_AVAILABLE:
         # ── Paper Trade Monitoring ───────────────────────────────────────
         scheduler.add_job(
             _scheduled_paper_trade_monitor, "cron",
-            minute="0,15,30,45", id="paper_trade_monitor",
+            minute="0,15,30,45", day_of_week="mon-fri", id="paper_trade_monitor",
         )
 
         # ── Essential Data Pipeline ──────────────────────────────────────
+        # Fix 51: model is FROZEN under MODEL_LOCK_IN, so a daily 2.5h retrain is
+        # wasted. The job now short-circuits (matrix refresh only) when locked, and
+        # the heavyweight challenger fit only runs when explicitly unlocked. Kept
+        # on a weekly cadence so the training matrix stays current for WFO evidence.
         scheduler.add_job(
             _scheduled_model_training, "cron",
-            minute=0, hour=7, day_of_week="mon-fri",
-            id="model_training_7am", max_instances=1,
+            minute=0, hour=7, day_of_week="sun",
+            id="model_training_weekly", max_instances=1,
         )
         scheduler.add_job(
             _scheduled_monthly_fundamentals, "cron",
@@ -16080,6 +16748,13 @@ if SCHEDULER_AVAILABLE:
             _scheduled_v2_daily_scan, "cron",
             minute=0, hour=8, day_of_week="mon-fri",
             id="v2_daily_scan_8am", max_instances=1,
+        )
+
+        # ── Training Matrix Incremental Update (daily, model frozen) ─────
+        scheduler.add_job(
+            _scheduled_training_matrix_update, "cron",
+            hour=6, minute=40, day_of_week="mon-fri",
+            id="training_matrix_update", max_instances=1,
         )
 
         # ── T4-A: ASX announcement NLP features (9:45am, after scan) ─────
@@ -16167,6 +16842,27 @@ if SCHEDULER_AVAILABLE:
                     print(f"[StartupCatchup] Broad scan fresh ({scan_age_hours:.1f}h old) — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] broad_scan check failed: {_e}")
+
+            _st.sleep(5)
+
+            # ── 3. V2 daily scan — run if scan cache is from before today (missed 8AM weekday scan) ──
+            try:
+                with db_conn() as _conn:
+                    _row = _conn.execute(text(
+                        "SELECT MAX(generated_at) FROM wealth_scan_history WHERE scan_mode='broad'"
+                    )).fetchone()
+                v2_scan_stale = True
+                if _row and _row[0]:
+                    _gen = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
+                    v2_scan_stale = _gen.date() < now_local.date()
+                if v2_scan_stale:
+                    print(f"[StartupCatchup] V2 scan stale (last: {_gen if _row and _row[0] else 'none'}) — running now …")
+                    _scheduled_v2_daily_scan()
+                    tasks_run.append("v2_scan")
+                else:
+                    print(f"[StartupCatchup] V2 scan fresh (today's scan exists) — skipping.")
+            except Exception as _e:
+                print(f"[StartupCatchup] v2_scan check failed: {_e}")
 
             _st.sleep(10)
 

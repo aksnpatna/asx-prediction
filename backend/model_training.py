@@ -63,6 +63,8 @@ FEATURE_COLS = [
     # ASX announcement NLP features (T4-A — self-guarding: zero-variance until
     # the announcement_features table accumulates coverage)
     "ann_sentiment_7d", "guidance_revision_score", "mgmt_confidence_delta",
+    # Interaction features (macro × technical)
+    "ix_vix_mom20", "ix_cg_macd", "ix_vix_atr", "ix_yc_mom63",
 ]
 
 
@@ -208,6 +210,12 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     squeeze_dur = in_squeeze_s * (in_squeeze_s.groupby(in_squeeze_s.diff().ne(0).cumsum()).cumsum())
     fm["squeeze_duration"] = squeeze_dur.fillna(0)
     fm["rsi_during_squeeze"] = (fm["rsi"].fillna(50) * in_squeeze_s).rolling(10, min_periods=1).mean().fillna(50)
+    
+    # ── Interaction features (macro × technical) ───────────────────────────────
+    fm["ix_vix_mom20"] = fm["vix_level"] * fm["momentum_20d"]
+    fm["ix_cg_macd"] = fm["copper_gold_ratio"] * fm["macd_hist"]
+    fm["ix_vix_atr"] = fm["vix_level"] * fm["atr_pct"]
+    fm["ix_yc_mom63"] = fm["yield_curve_slope"] * fm["momentum_63d"]
 
 
     # ── Market regime features ────────────────────────────────────────────────
@@ -592,12 +600,19 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
             close = df["Close"].astype(float)
 
             rows_to_insert = []
-            max_date_idx = len(fm) - FORWARD_WINDOW_DAYS - 1
+            # Allow partial forward windows (minimum 5 future days) so the training
+            # set extends closer to the present. Full 63-day labels exist up to
+            # (len(fm) - 64); beyond that, labels use whatever future data is
+            # available. The model query filters on forward_peak_return_63d IS NOT NULL
+            # so these partial rows are included but with shorter-horizon labels.
+            max_date_idx = len(fm) - 5
             warmup = 50
 
             cutoff_date = None
             if incremental and symbol in max_dates:
-                # We want to re-process the last 65 days of known signals to update forward-looking labels (like 63d returns)
+                # Re-process the last 65 days of known signals to update forward-looking
+                # labels (63d returns change as new data arrives). New dates beyond
+                # max_dates[symbol] are appended with whatever forward window is available.
                 cutoff_date = max_dates[symbol] - timedelta(days=65)
 
             for idx in range(warmup, min(max_date_idx, len(fm) - 5)):
@@ -767,18 +782,12 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         print(f"[Fit] {len(rows)} < {min_samples} — insufficient")
         return None
 
-    # ── Fix 23: fill fundamentals from the same DB maps the classifier uses ──
-    # Previously the ensemble trained on raw matrix JSON where EODHD +
-    # historical fundamental features were 0.0 → all 14 dropped as
-    # zero-variance → scaler stats inconsistent with the classifier's weights.
+    # ── Fix 64: PIT-safe training — do NOT fill EODHD, latest-snapshot
+    # fundamentals, or latest historical ratios for historical rows.
+    # Same lookahead fix as train_classifier. Only PIT P/E from eps_history.
     from smsf_classifier import (
-        _load_latest_fundamentals, _load_historical_fundamentals,
-        _load_eodhd_features, _load_eps_history, _fill_fundamentals,
-        _fill_point_in_time_pe, _fill_historical, _fill_eodhd,
+        _load_eps_history, _fill_point_in_time_pe,
     )
-    fund_map = _load_latest_fundamentals(db_conn)
-    hist_map = _load_historical_fundamentals(db_conn)
-    eodhd_map = _load_eodhd_features(db_conn)
     eps_map = _load_eps_history(db_conn)
 
     X_list, y_list, dates_list = [], [], []
@@ -786,10 +795,7 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         try:
             feats = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
             symbol, entry_price, signal_date = row[3], float(row[4] or 0), row[2]
-            feats = _fill_fundamentals(feats, symbol, fund_map, entry_price)
             feats = _fill_point_in_time_pe(feats, symbol, signal_date, entry_price, eps_map)
-            feats = _fill_historical(feats, symbol, hist_map)
-            feats = _fill_eodhd(feats, symbol, eodhd_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 continue

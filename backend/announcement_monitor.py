@@ -6,7 +6,7 @@ Critical keywords trigger immediate sentinel review.
 """
 
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 CRITICAL_KEYWORDS = [
@@ -24,7 +24,7 @@ WATCH_KEYWORDS = [
     "substantial holder", "becoming substantial",
 ]
 
-ANNOUNCEMENT_CHECK_URL = "https://www.asx.com.au/asx/1/company/{code}/announcements"
+ANNOUNCEMENT_CHECK_URL = "https://asx.api.markitdigital.com/asx-research/1.0/companies/{code}/announcements"
 
 
 def check_symbol_announcements(code: str) -> Dict:
@@ -40,6 +40,7 @@ def check_symbol_announcements(code: str) -> Dict:
         r = requests.get(
             ANNOUNCEMENT_CHECK_URL.format(code=code.upper()),
             params={"count": 20},
+            headers={"Accept": "application/json"},
             timeout=10,
         )
         if r.status_code != 200:
@@ -47,16 +48,18 @@ def check_symbol_announcements(code: str) -> Dict:
             return results
 
         data = r.json()
-        announcements = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+        # markitdigital response: {"data": {"items": [ {...} ]}}
+        announcements = (data.get("data", {}) or {}).get("items", []) if isinstance(data, dict) else []
 
         cutoff = datetime.now() - timedelta(hours=24)
         recent = []
 
         for ann in announcements:
             try:
-                ann_date_str = ann.get("document_date", "") or ann.get("date", "")
+                ann_date_str = ann.get("date", "")
+                # e.g. "2026-07-15T22:39:08.000Z" (UTC) — convert to local
                 if "T" in ann_date_str:
-                    ann_dt = datetime.strptime(ann_date_str[:19], "%Y-%m-%dT%H:%M:%S")
+                    ann_dt = datetime.strptime(ann_date_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).astimezone()
                 else:
                     ann_dt = datetime.strptime(ann_date_str[:10], "%Y-%m-%d")
                 if ann_dt < cutoff:
@@ -64,11 +67,11 @@ def check_symbol_announcements(code: str) -> Dict:
             except Exception:
                 continue
 
-            title = (ann.get("header", "") or ann.get("title", "")).lower()
+            title = (ann.get("headline", "") or ann.get("title", "")).lower()
             url = ann.get("url", "") or ann.get("pdf_url", "")
             recent.append({
                 "date": str(ann_dt),
-                "title": ann.get("header", ""),
+                "title": ann.get("headline", ""),
                 "url": url,
             })
 
@@ -76,7 +79,7 @@ def check_symbol_announcements(code: str) -> Dict:
                 if kw in title:
                     results["critical_flags"].append({
                         "keyword": kw,
-                        "title": ann.get("header", ""),
+                        "title": ann.get("headline", ""),
                         "url": url,
                         "date": str(ann_dt),
                     })
@@ -86,7 +89,7 @@ def check_symbol_announcements(code: str) -> Dict:
                     if kw in title:
                         results["watch_flags"].append({
                             "keyword": kw,
-                            "title": ann.get("header", ""),
+                            "title": ann.get("headline", ""),
                             "url": url,
                             "date": str(ann_dt),
                         })

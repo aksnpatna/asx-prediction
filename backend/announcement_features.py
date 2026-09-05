@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-ANNOUNCEMENT_CHECK_URL = "https://www.asx.com.au/asx/1/company/{code}/announcements"
+ANNOUNCEMENT_CHECK_URL = "https://asx.api.markitdigital.com/asx-research/1.0/companies/{code}/announcements"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 MAX_SYMBOLS = int(os.getenv("ANNOUNCEMENT_NLP_MAX_SYMBOLS", "50"))
@@ -70,28 +70,31 @@ def _ensure_table(db_conn) -> None:
 def _fetch_announcements(code: str) -> List[Dict]:
     try:
         r = requests.get(ANNOUNCEMENT_CHECK_URL.format(code=code.upper()),
-                         params={"count": MAX_ANNS_PER_SYMBOL}, timeout=10)
+                         params={"count": MAX_ANNS_PER_SYMBOL},
+                         headers={"Accept": "application/json"}, timeout=10)
         if r.status_code != 200:
             return []
         data = r.json()
-        anns = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        # markitdigital response: {"data": {"items": [ {...} ]}}
+        anns = (data.get("data", {}) or {}).get("items", []) if isinstance(data, dict) else []
         cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
         out = []
         for ann in anns:
             try:
-                ann_date_str = ann.get("document_date", "") or ann.get("date", "")
+                ann_date_str = ann.get("date", "")
+                # e.g. "2026-07-15T22:39:08.000Z"
                 if "T" in ann_date_str:
                     ann_dt = datetime.strptime(ann_date_str[:19], "%Y-%m-%dT%H:%M:%S")
                 else:
                     ann_dt = datetime.strptime(ann_date_str[:10], "%Y-%m-%d")
                 if ann_dt < cutoff:
                     continue
-                title = (ann.get("header", "") or ann.get("title", "")).strip()
+                title = (ann.get("headline", "") or ann.get("title", "")).strip()
                 if not title:
                     continue
                 out.append({"date": ann_dt.strftime("%Y-%m-%d"),
                             "title": title,
-                            "url": ann.get("url", "") or ann.get("pdf_url", "")})
+                            "url": ann.get("url", "") or ann.get("pdf_url", "") or ""})
             except Exception:
                 continue
         return out

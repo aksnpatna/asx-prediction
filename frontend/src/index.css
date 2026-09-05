@@ -706,8 +706,12 @@ body {
 .sx-pill-gold { background: #FEF3C7; color: #92400E; }
 .sx-pill-green { background: var(--green-light); color: var(--green); }
 .sx-pill-grey { background: #F3F4F6; color: var(--ink-muted); }
-.sx-price-row { display: flex; gap: 24px; margin: 14px 0 10px; }
+.sx-price-row { display: flex; gap: 24px; margin: 14px 0 10px; align-items: flex-start; }
 .sx-price { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sx-spark-wrap { display: flex; justify-content: center; align-items: center; padding: 10px 0 2px; }
+.sx-spark { display: flex; flex-direction: column; align-items: center; gap: 4px; max-width: 100%; }
+.sx-spark svg { display: block; width: 100%; max-width: 280px; height: 44px; }
+.sx-spark-meta { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .sx-target { position: relative; }
 .sx-reach { color: var(--green); font-size: 12px; font-weight: 700; }
 .sx-stats { display: flex; gap: 10px; margin-bottom: 10px; }
@@ -752,6 +756,17 @@ body {
 .sx-action-red { border-left-color: var(--red); }
 .sx-action-green { border-left-color: var(--green); }
 .sx-action-amber { border-left-color: var(--amber); }
+
+/* Live Validation panel */
+.sx-chart { background: #fff; border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 6px 0 14px; box-shadow: 0 1px 2px rgba(15,15,15,0.04); }
+.sx-chart .sx-section-title { margin-top: 0; }
+.sx-lv-hero { margin: 6px 0 4px; font-size: 15px; }
+.sx-lv-hero b { font-size: 16px; }
+.sx-lv-table { margin: 10px 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.sx-lv-row { display: flex; gap: 16px; padding: 8px 12px; font-size: 14px; font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--border); }
+.sx-lv-row:last-child { border-bottom: none; }
+.sx-lv-row > * { min-width: 88px; }
+
 .sx-summary-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
 .sx-summary-row .sx-sym { min-width: 48px; }
 
@@ -802,3 +817,31 @@ body {
 .sx-news { background: #F9FAFB; border: 1px solid var(--border); border-left: 4px solid #D1D5DB; border-radius: 10px; padding: 8px 10px; font-size: 13px; margin-bottom: 10px; }
 .sx-news-pos { border-left-color: #1A6B3C; background: #F0F9F4; }
 .sx-news-neg { border-left-color: #DC2626; background: #FEF2F2; }
+
+/* WFO Gate Pill */
+.sx-wfo-gate { border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; border: 2px solid; }
+.sx-wfo-insuff { background: #F0F4FF; border-color: #8B9DC3; }
+.sx-wfo-green { background: #F0F9F4; border-color: #1A6B3C; }
+.sx-wfo-amber { background: #FFFBEB; border-color: #D97706; }
+.sx-wfo-red { background: #FEF2F2; border-color: #DC2626; }
+.sx-wfo-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.sx-wfo-icon { font-size: 22px; }
+.sx-wfo-countdown { font-size: 12px; color: #6B7280; font-weight: 500; }
+.sx-wfo-stats { display: flex; gap: 16px; flex-wrap: wrap; }
+.sx-wfo-stat { text-align: center; }
+.sx-wfo-stat b { display: block; font-size: 20px; }
+.sx-wfo-stat span { font-size: 10px; color: #6B7280; text-transform: uppercase; letter-spacing: 0.5px; }
+.sx-watchlist { margin-top: 12px; border-top: 1px solid #E5E7EB; padding-top: 10px; }
+.sx-watchlist-title { font-size: 11px; font-weight: 700; color: #6B7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.sx-watchlist-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.sx-watch-item { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px 12px; border-radius: 8px; background: #F9FAFB; border: 1px solid #E5E7EB; min-width: 70px; }
+.sx-watch-10pct { background: #F0F9F4; border-color: #1A6B3C; border-width: 2px; }
+.sx-watch-8pct { background: #EFF6FF; border-color: #3B82F6; }
+.sx-watch-watch { background: #F9FAFB; border-color: #D1D5DB; }
+.sx-watch-sym { font-weight: 800; font-size: 14px; }
+.sx-watch-score { font-size: 11px; color: #374151; font-weight: 600; }
+.sx-watch-tier { font-size: 10px; }
+.sx-watch-ev { font-size: 10px; font-weight: 600; }
+
+/* Screener WFO status line */
+.sx-wfo-screener-status { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #F0F4FF; border-radius: 8px; margin-bottom: 14px; font-size: 13px; border: 1px solid #8B9DC3; }

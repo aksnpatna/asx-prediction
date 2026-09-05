@@ -169,12 +169,34 @@ def _format_data_blob(state: AgentState) -> str:
 
     knn_section = ""
     if model_ctx.get("knn_setups"):
-        knn_section = "Similar Historical Setups (same symbol, nearest features):\n"
-        for s in model_ctx["knn_setups"][:3]:
+        knn_section = "Similar Historical Setups (same symbol, nearest features, last 12mo):\n"
+        for s in model_ctx["knn_setups"][:5]:
             outcome = ("+8% before -8%" if s.get("hit_8pct_before_m8pct")
                        else ("+8% first-touch" if s.get("hit_8pct_first_touch") else "neither hit"))
             knn_section += (f"  {s.get('signal_date','?')}: 63d={s.get('forward_return_63d_pct','?')}% "
                             f"[{outcome}] (dist {s.get('distance','?')})\n")
+
+    # ── Priority 2 event + continuity context (ai_review.md) ───────────────
+    # days_to_earnings, short_ratio, and prior AI verdicts — the qualitative
+    # blind spots the model can't see but a debate must weigh.
+    event_section = ""
+    ev_parts = []
+    if model_ctx.get("days_to_earnings") is not None:
+        ev_parts.append(f"days_to_earnings: {model_ctx['days_to_earnings']}")
+    if model_ctx.get("next_earnings_date"):
+        ev_parts.append(f"next_earnings_date: {model_ctx['next_earnings_date']}")
+    if model_ctx.get("short_ratio") is not None:
+        ev_parts.append(f"short_ratio (short interest % float): {model_ctx['short_ratio']}")
+    if ev_parts:
+        event_section = "Event Risk Context:\n  " + "\n  ".join(ev_parts) + "\n"
+
+    verdict_section = ""
+    if model_ctx.get("prior_verdicts"):
+        verdict_section = "Prior AI Verdicts (last 3 days — anchor to continuity):\n"
+        for v in model_ctx["prior_verdicts"]:
+            verdict_section += (f"  {v.get('date','?')}: {v.get('decision','?')} "
+                                f"(confidence {v.get('confidence','?')})\n")
+        verdict_section += "  If REJECTED before, state whether the reason has RESOLVED; if not, reject again.\n"
 
     macro_section = ""
     if state.get("macro_data"):
@@ -187,14 +209,31 @@ def _format_data_blob(state: AgentState) -> str:
     if model_ctx.get("tier_label"):
         tier_info = f"Model Tier: {model_ctx['tier_label']} (score: {model_ctx.get('model_score','?')})"
 
+    # Guardrail context: surface the TRUE model probability vs base rate so the
+    # debate cannot approve a stock the model rates below coin-flip (the FLT bug).
+    model_proba_line = ""
+    try:
+        mp = val.get("model_proba")
+        if mp is not None:
+            base = val.get("model_base_rate", 0.21)
+            edge = "has edge" if float(mp) >= base else "NO EDGE (below base rate)"
+            model_proba_line = (f"MODEL PROBABILITY (P(+8% before −8%)): {float(mp)*100:.1f}% "
+                                f"(base rate {base*100:.0f}%) — {edge}. "
+                                f"Do NOT approve if below base rate regardless of narrative.")
+    except Exception:
+        pass
+
     return f"""Symbol: {state['symbol']} ({state['market']})
 Confluence: {confluence.get('confidence', 'unknown').upper()} — {confluence.get('bullish_channels', '?')}/{confluence.get('total_channels', '?')} channels bullish
 {chr(10).join(ch_strs)}
 
 {tier_info}
+{model_proba_line}
 {feature_breakdown}
 {peer_section}
 {knn_section}
+{event_section}
+{verdict_section}
 {macro_section}
 {wfo_section}
 

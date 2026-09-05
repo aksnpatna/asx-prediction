@@ -278,6 +278,103 @@ def incremental_daily_update() -> dict:
     return {"status": "ok", "rows_inserted": inserted}
 
 
+def backfill_etf_universe(max_workers: int = 3) -> dict:
+    """Populate eod_ohl_history with OHLC for the ETF universe + XJO index.
+
+    ETF symbols are NOT in the common-stock list (Type='Common Stock' filter),
+    so they are backfilled here explicitly by trading ticker. XJO (ASX200 index)
+    is also backfilled here since it is not in the common-stock list and is
+    needed by the ETF regime signal (XJO vs SMA200).
+
+    IMPORTANT — isolation from the stock universe: rows are written with
+    market='ETF' (NOT 'AU'), so they do NOT leak into config/universe.py's
+    ranked list (which filters market='AU') or the stock satellite scan. This
+    avoids feeding ETFs/indexes into the stock model's fundamental fetch path.
+    Idempotent via ON CONFLICT in _insert_ohlc_batch.
+    """
+    global _EODHD_KEY
+    _EODHD_KEY = os.getenv("EODHD_API_KEY", "").strip()
+    if not _EODHD_KEY:
+        print("[ETFFill] No EODHD_API_KEY set. Aborting.")
+        return {"status": "no_key", "fetched": 0}
+
+    from etf_universe import all_etf_symbols
+    from main import db_conn
+
+    symbols = all_etf_symbols()
+    index_targets = {"XJO": "XJO.INDX"}   # local symbol -> EODHD end-of-day code
+    today = date.today().isoformat()
+    mkt = "ETF"
+
+    results = {"fetched": 0, "failed": [], "symbols": len(symbols) + len(index_targets)}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _rows_for(code, market=mkt):
+        data = _eodhd_historical(code, FROM_DATE, today, _EODHD_KEY)
+        if not data:
+            return []
+        rows = []
+        for d in data:
+            dt = d.get("date", "")
+            if not dt:
+                continue
+            adjusted = d.get("adjusted_close")
+            raw_close = d.get("close", 0)
+            stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
+            rows.append((code, market, dt, d.get("open"), d.get("high"),
+                         d.get("low"), stored_close, d.get("volume", 0)))
+        return rows
+
+    def _run(sym):
+        rows = _rows_for(sym, mkt)
+        if rows:
+            with db_conn() as conn:
+                _insert_ohlc_batch(conn, rows)
+        return (sym, len(rows))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_run, s): s for s in symbols}
+        for fut in as_completed(futs):
+            sym, n = fut.result()
+            if n:
+                results["fetched"] += 1
+            else:
+                results["failed"].append(sym)
+
+    # Backfill index targets (XJO) — indices use the .INDX suffix (NOT .AU),
+    # fetched with a direct request and stored under the local bare symbol.
+    for local, code in index_targets.items():
+        try:
+            url = f"https://eodhd.com/api/eod/{code}"
+            r = requests.get(url, params={"api_token": _EODHD_KEY, "fmt": "json",
+                                          "from": FROM_DATE, "to": today}, timeout=30)
+            rows = []
+            if r.status_code == 200 and isinstance(r.json(), list):
+                for d in r.json():
+                    dt = d.get("date", "")
+                    if not dt:
+                        continue
+                    adjusted = d.get("adjusted_close")
+                    raw_close = d.get("close", 0)
+                    stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
+                    rows.append((local, mkt, dt, d.get("open"), d.get("high"),
+                                 d.get("low"), stored_close, d.get("volume", 0)))
+            if rows:
+                with db_conn() as conn:
+                    _insert_ohlc_batch(conn, rows)
+                results["fetched"] += 1
+                results["failed"] = [f for f in results["failed"] if f != local]
+            elif local not in results["failed"]:
+                results["failed"].append(local)
+        except Exception:
+            if local not in results["failed"]:
+                results["failed"].append(local)
+
+    print(f"[ETFFill] Done: {results['fetched']}/{results['symbols']} populated (market='{mkt}'), failed={results['failed']}")
+    return results
+
+
 def get_ohlc_for_symbol(symbol: str, from_date: str = None, to_date: str = None) -> pd.DataFrame:
     """Return OHLC DataFrame from the local eod_ohl_history table.
 
@@ -334,7 +431,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="EODHD OHLC backfill tool")
-    parser.add_argument("--mode", choices=["backfill", "incremental", "status"], default="status")
+    parser.add_argument("--mode", choices=["backfill", "incremental", "etf", "status"], default="status")
     parser.add_argument("--batch", type=int, default=500, help="Max tickers to backfill per run")
     parser.add_argument("--workers", type=int, default=4, help="Parallel fetch workers")
     parser.add_argument("--from-date", type=str, default=None, help="Override FROM_DATE (YYYY-MM-DD)")
@@ -348,6 +445,9 @@ if __name__ == "__main__":
         print(json.dumps(result, indent=2, default=str))
     elif args.mode == "incremental":
         result = incremental_daily_update()
+        print(json.dumps(result, indent=2, default=str))
+    elif args.mode == "etf":
+        result = backfill_etf_universe()
         print(json.dumps(result, indent=2, default=str))
     elif args.mode == "status":
         state = _load_state()

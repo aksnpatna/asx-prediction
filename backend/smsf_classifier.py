@@ -413,16 +413,17 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             os.getenv("DATABASE_URL", "sqlite:///data/shares.db"))
         db_conn = lambda: _standalone_engine.connect()
 
-    print(f"[Classifier] Loading {target_col} data with fundamentals...", flush=True)
+    print(f"[Classifier] Loading {target_col} data (PIT-safe: Fix 64)...", flush=True)
     t0 = time.time()
 
-    # Load auxiliary maps first (small, in-memory)
-    fund_map = _load_latest_fundamentals(db_conn)
-    hist_map = _load_historical_fundamentals(db_conn)
-    eodhd_map = _load_eodhd_features(db_conn)
+    # Fix 64: EODHD snapshots (Aug 2026 only) and latest fundamental/historical
+    # snapshots are lookahead for 2015-2025 training rows. Only eps_history (PIT)
+    # and announcement_features (self-guarding) are loaded. EODHD/fundamental
+    # maps are still loaded for the live scoring path (_enrich_candidates_with_tiers).
     eps_map = _load_eps_history(db_conn)
     ann_map = _load_announcement_features(db_conn)
-    print(f"[Fund] Loaded {len(fund_map)} snapshot + {len(hist_map)} historical + {len(eodhd_map)} EODHD + {len(eps_map)} EPS-history + {len(ann_map)} announcement symbols", flush=True)
+    print(f"[Fund] PIT-safe: {len(eps_map)} EPS-history + {len(ann_map)} announcement symbols "
+          f"(EODHD/snapshot fills skipped — lookahead Fix 64)", flush=True)
 
     # Stream training rows in batches (server-side cursor) — avoids the ~2GB
     # fetchall spike that OOMs a 4GB container. Preallocated float32 array.
@@ -459,10 +460,14 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 try:
                     symbol, entry_price, signal_date, feats_raw, label, fwd_ret = row
                     feats = json.loads(feats_raw) if isinstance(feats_raw, str) else (feats_raw or {})
-                    feats = _fill_fundamentals(feats, symbol, fund_map, float(entry_price or 0))
+                    # Fix 64: PIT-safe training — do NOT fill EODHD, latest-snapshot
+                    # fundamentals, or latest historical ratios for historical rows.
+                    # These data sources only have snapshots from Aug 2026; filling
+                    # 2015-2025 rows from them is pure lookahead inflation.
+                    # The backtest (BACKTEST_DROP_FEATURES) already zeroed these;
+                    # train_classifier must match. Only PIT P/E from eps_history is
+                    # genuinely point-in-time and safe to fill.
                     feats = _fill_point_in_time_pe(feats, symbol, signal_date, float(entry_price or 0), eps_map)
-                    feats = _fill_historical(feats, symbol, hist_map)
-                    feats = _fill_eodhd(feats, symbol, eodhd_map)
                     feats = _fill_announcement(feats, symbol, ann_map)
                     bad = False
                     for j, c in enumerate(FEATURE_COLS):
@@ -484,7 +489,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                     y[i] = int(label) if label is not None else 0
                     y_reg[i] = fwd_ret
                     dates[i] = np.datetime64(signal_date, "D")
-                    if symbol in fund_map:
+                    if symbol in eps_map:
                         filled += 1
                     i += 1
                 except Exception:
@@ -684,6 +689,33 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
               f"{(lgbm_challenger or {}).get('error', 'unknown')}", flush=True)
 
     if adopt_lgbm:
+        # ── MODEL_LOCK_IN freeze ──────────────────────────────────────────────
+        # Freeze the model VERSION, not the artifact FILE. When locked:
+        #   - if a frozen artifact already exists on disk → keep it, skip write
+        #   - if the artifact is MISSING (e.g. container rebuilt on ephemeral FS)
+        #     → regenerate it so the live path never silently falls back to linear.
+        # This prevents the ".pkl vanished after restart" failure mode while
+        # still guaranteeing the live model bytes don't change while paper trades
+        # resolve their 63-day windows.
+        try:
+            import os as _os
+            if _os.getenv("MODEL_LOCK_IN", "1").strip() in {"1", "true", "yes", "on"}:
+                # path resolution mirrors the load path in main._load_lgbm_classifier
+                _probe = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                       "data", "lgbm_classifier.pkl")
+                if not _os.path.exists(_probe):
+                    _probe = "/app/data/lgbm_classifier.pkl"
+                if _os.path.exists(_probe):
+                    print("[Classifier] MODEL_LOCK_IN active — frozen artifact exists, "
+                          "challenger evaluated but NOT adopted.", flush=True)
+                    adopt_lgbm = False
+                else:
+                    print("[Classifier] MODEL_LOCK_IN active but artifact MISSING — "
+                          "regenerating from DB so the live path is not degraded.", flush=True)
+        except Exception:
+            pass
+
+    if adopt_lgbm:
         try:
             import joblib
             import hashlib
@@ -730,16 +762,30 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
         # Challenger ran and was rejected by the winner rule: remove any
         # previously adopted artifact so live scoring cannot keep serving a
         # model the current verdict rejected, and record the rejection loudly.
-        for _p in (
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "lgbm_classifier.pkl"),
-            "/app/data/lgbm_classifier.pkl",
-        ):
-            try:
-                if os.path.exists(_p):
-                    os.remove(_p)
-                    print(f"[Classifier] ⚠️ LGBM rejected — removed stale artifact {_p}", flush=True)
-            except OSError:
-                pass
+        #
+        # Fix 52: this deletion is INVALID under MODEL_LOCK_IN. When the model is
+        # frozen, the existing artifact is authoritative regardless of a
+        # challenger's daily/noisy verdict — deleting it silently degrades live
+        # scoring to the logistic fallback. When frozen, skip the delete entirely.
+        try:
+            import os as _os
+            _locked = _os.getenv("MODEL_LOCK_IN", "1").strip() in {"1", "true", "yes", "on"}
+        except Exception:
+            _locked = True
+        if _locked:
+            print("[Classifier] MODEL_LOCK_IN active — challenger rejected but "
+                  "existing artifact KEPT (frozen).", flush=True)
+        else:
+            for _p in (
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "lgbm_classifier.pkl"),
+                "/app/data/lgbm_classifier.pkl",
+            ):
+                try:
+                    if os.path.exists(_p):
+                        os.remove(_p)
+                        print(f"[Classifier] ⚠️ LGBM rejected — removed stale artifact {_p}", flush=True)
+                except OSError:
+                    pass
         try:
             _rej_note = json.dumps(
                 {k: v for k, v in lgbm_challenger.items() if k not in ("model", "isotonic")})[:500]

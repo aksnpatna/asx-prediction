@@ -77,9 +77,12 @@ services:
       PAPER_BOOTSTRAP_MODE: ${PAPER_BOOTSTRAP_MODE:-1}
       PAPER_BOOTSTRAP_MAX_POSITIONS: ${PAPER_BOOTSTRAP_MAX_POSITIONS:-5}
       PAPER_BOOTSTRAP_AUTO_EXECUTE: ${PAPER_BOOTSTRAP_AUTO_EXECUTE:-1}
+      MODEL_LOCK_IN: ${MODEL_LOCK_IN:-1}
       STARTING_CAPITAL: ${STARTING_CAPITAL:-30000}
       RISK_PER_TRADE_PCT: ${RISK_PER_TRADE_PCT:-1.5}
       MAX_SECTOR_PCT: ${MAX_SECTOR_PCT:-25}
+    volumes:
+      - backend_data:/app/data
     ports:
       - "8000:8000"
     healthcheck:
@@ -238,8 +241,8 @@ services:
       - GENERIC_TIMEZONE=Australia/Sydney
       # Pass broker API URL into n8n so workflows can reference it
       - BROKER_API_URL=http://broker-backend:8001
-       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
     volumes:
       - n8n_data:/home/node/.n8n
     healthcheck:
@@ -290,5 +293,6 @@ networks:
 
 volumes:
   postgres_data:
+  backend_data:
   ollama_data:
   n8n_data:

@@ -78,7 +78,7 @@ def _percentile(arr, v):
 
 
 def _knn_setups(symbol: str, feat_values: Dict[str, float], artifact: Dict,
-                db_conn=None, k: int = 3) -> List[Dict]:
+                db_conn=None, k: int = 5) -> List[Dict]:
     if db_conn is None or not artifact:
         return []
     try:
@@ -109,7 +109,7 @@ def _knn_setups(symbol: str, feat_values: Dict[str, float], artifact: Dict,
                 "hit_8pct_first_touch, COALESCE(forward_return_63d, 0) "
                 "FROM model_training_set "
                 "WHERE symbol = :sym AND features IS NOT NULL "
-                "AND signal_date >= CURRENT_DATE - INTERVAL '18 months' "
+                "AND signal_date >= CURRENT_DATE - INTERVAL '12 months' "
                 "ORDER BY signal_date DESC LIMIT 400"
             ), {"sym": symbol})
             for r in result.yield_per(20000):
@@ -137,6 +137,33 @@ def _knn_setups(symbol: str, feat_values: Dict[str, float], artifact: Dict,
                 "hit_8pct_first_touch": bool(hit_ft),
                 "forward_return_63d_pct": round(fwd, 1),
             })
+        return out
+    except Exception:
+        return []
+
+
+def _prior_verdicts(symbol: str, db_conn=None, days: int = 3) -> List[Dict]:
+    """Recent AI verdicts for this symbol (last N trading days) — anchors the
+    debate to prior decisions instead of blank-slate re-analysis each morning.
+
+    Priority 2 (ai_review.md): the AI currently has no continuity. Feeding the
+    last 3 days of verdicts lets it say "REJECTED yesterday for X — has X
+    resolved?" rather than re-judging from scratch.
+    """
+    if db_conn is None:
+        return []
+    try:
+        from sqlalchemy import text as _text
+        with db_conn() as conn:
+            rows = conn.execute(_text(
+                "SELECT run_date, decision, confidence "
+                "FROM ai_verdicts "
+                "WHERE symbol = :sym AND run_date >= CURRENT_DATE - INTERVAL '7 days' "
+                "ORDER BY run_date DESC LIMIT :d"
+            ), {"sym": symbol.upper(), "d": days}).fetchall()
+        out = []
+        for r in rows:
+            out.append({"date": str(r[0]), "decision": r[1], "confidence": r[2]})
         return out
     except Exception:
         return []
@@ -209,6 +236,30 @@ def build_model_context(symbol: str, market: str, technicals: Optional[Dict],
                 ctx["top_features"] = top_features[:5]
 
         ctx["knn_setups"] = _knn_setups(symbol, feat_values, artifact, db_conn)
+
+        # ── Priority 2 input-quality enrichments (ai_review.md) ─────────────
+        # days_to_earnings + short_ratio + prior_verdicts — qualitative event &
+        # continuity context the model is blind to but the debate should see.
+        val = valuation or {}
+        try:
+            if val.get("days_to_earnings") is not None:
+                ctx["days_to_earnings"] = val.get("days_to_earnings")
+            if val.get("next_earnings_date"):
+                ctx["next_earnings_date"] = val.get("next_earnings_date")
+        except Exception:
+            pass
+        try:
+            sr = val.get("short_pct_float") or val.get("short_ratio")
+            if sr is not None:
+                ctx["short_ratio"] = sr
+        except Exception:
+            pass
+        try:
+            pv = _prior_verdicts(symbol, db_conn)
+            if pv:
+                ctx["prior_verdicts"] = pv
+        except Exception:
+            pass
 
         mkt = _market_percentile(db_conn) if db_conn else _MKT_CACHE
         ctx["sector_peer_comparison"] = {

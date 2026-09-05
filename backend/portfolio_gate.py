@@ -45,12 +45,19 @@ class PortfolioGate:
         self._market_context = None
 
     def set_market_context(self, vix_level: Optional[float] = None,
-                           xjo_above_sma200: Optional[bool] = None) -> None:
+                           xjo_above_sma200: Optional[bool] = None,
+                           etf_regime: Optional[str] = None) -> None:
         """Point-in-time macro state; call before can_open_position each batch.
-        Callers that never set context are unaffected (breaker stays inactive)."""
+        Callers that never set context are unaffected (breaker stays inactive).
+
+        etf_regime: RISK_ON / NEUTRAL / RISK_OFF — the ETF momentum regime gate
+        (signal-strengthening). NEUTRAL caps satellite at 4 positions; RISK_OFF
+        suspends new entries entirely, firing before the NAV circuit breaker.
+        """
         self._market_context = {
             "vix": vix_level,
             "xjo_above_sma200": xjo_above_sma200,
+            "etf_regime": etf_regime,
         }
 
     def bear_breaker_active(self) -> bool:
@@ -60,6 +67,17 @@ class PortfolioGate:
         vix = self._market_context.get("vix")
         xjo = self._market_context.get("xjo_above_sma200")
         return (vix is not None and vix >= BEAR_BREAKER_VIX) and (xjo is not None and not xjo)
+
+    def satellite_cap(self) -> int:
+        """Effective max satellite positions, incl. ETF regime strengthening."""
+        etf_regime = (self._market_context or {}).get("etf_regime")
+        if etf_regime == "RISK_OFF":
+            return 0
+        if etf_regime == "NEUTRAL":
+            return self.NEUTRAL_SATELLITE_CAP
+        return MAX_SATELLITE_POSITIONS
+
+    NEUTRAL_SATELLITE_CAP = 4
 
     def can_open_position(
         self,
@@ -73,13 +91,21 @@ class PortfolioGate:
         is_core: bool = False,
     ) -> Dict:
         max_single = MAX_SINGLE_POSITION_PCT_CORE if is_core else MAX_SINGLE_POSITION_PCT
-        max_positions = MAX_TOTAL_POSITIONS if is_core else MAX_SATELLITE_POSITIONS
+        max_positions = MAX_TOTAL_POSITIONS if is_core else self.satellite_cap()
 
         if self.bear_breaker_active():
             vix = self._market_context.get("vix")
             return {
                 "approved": False,
                 "reason": f"BEAR_BREAKER: VIX {vix:.1f} >= {BEAR_BREAKER_VIX:.0f} and XJO below SMA200 — no new entries",
+                "checks_passed": 0,
+            }
+
+        # ETF regime suspension: RISK_OFF blocks new satellite entries outright.
+        if not is_core and self.satellite_cap() == 0:
+            return {
+                "approved": False,
+                "reason": "ETF_REGIME RISK_OFF: satellite new entries suspended",
                 "checks_passed": 0,
             }
 

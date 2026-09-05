@@ -39,7 +39,42 @@ function useApi(path, token, deps = []) {
   return { data, error, loading }
 }
 
+// Module-level cache — avoids refetching the (already-fast) read-only endpoints
+// every time the user switches tabs. Screener/portfolio/wealth data rarely changes
+// within a session, so this eliminates the felt "loads slowly" tab-switch penalty.
+const _apiCache = new Map()
+const _CACHE_TTL_MS = 60 * 1000 // 60s freshness for the fast endpoints
+
+function useApiCached(path, token, deps = []) {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+  const [loading, setLoading] = useState(true)
+  useEffect(() => {
+    if (!token) return
+    let alive = true
+    const hit = _apiCache.get(path)
+    if (hit && Date.now() - hit.at < _CACHE_TTL_MS) {
+      setData(hit.data)
+      setLoading(false)
+      return () => { alive = false }
+    }
+    axios.get(`${API_BASE}${path}`, authH(token))
+      .then(r => {
+        if (!alive) return
+        _apiCache.set(path, { data: r.data, at: Date.now() })
+        setData(r.data); setError(null)
+      })
+      .catch(e => { if (alive) setError(e.message) })
+      .finally(() => { if (alive) setLoading(false) })
+    return () => { alive = false }
+  }, [token, path, ...deps])
+  return { data, error, loading }
+}
+
 const fmtMoney = (v) => v == null ? '—' : `$${Number(v).toLocaleString('en-AU', { maximumFractionDigits: 0 })}`
+// Share prices need real precision (2–3 decimals). Whole-dollar rounding hides
+// true P&L — integrity requires showing the actual entry/current/target/stop.
+const fmtPrice = (v) => v == null || v === '' ? '—' : `$${Number(v).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 3 })}`
 
 // ══════════════════════════════ Components ══════════════════════════════
 
@@ -67,7 +102,99 @@ export function CircuitBreakerBanner({ level, drawdown_pct, vix, xjo }) {
   )
 }
 
-export function StockCard({ c, onAI, aiOpen }) {
+// Small inline SVG price sparkline — PAST price history (not a forecast),
+// showing the last ~63 days of closes. No extra ChartJS instance per card.
+function PriceSpark({ spark }) {
+  if (!spark || !spark.points || spark.count < 2) return null
+  const pts = spark.points.map(p => p[1]).filter(v => v != null)
+  if (pts.length < 2) return null
+  const w = 120, h = 36
+  const min = Math.min(...pts), max = Math.max(...pts)
+  const range = max - min || 1
+  const stepX = w / (pts.length - 1)
+  const coords = pts.map((v, i) => `${(i * stepX).toFixed(1)},${(h - ((v - min) / range) * h).toFixed(1)}`)
+  const up = pts[pts.length - 1] >= pts[0]
+  const color = up ? '#22c55e' : '#ef4444'
+  const first = pts[0], last = pts[pts.length - 1]
+  const chg = ((last - first) / first) * 100
+  return (
+    <div className="sx-spark">
+      <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+        <polyline points={coords.join(' ')} fill="none" stroke={color} strokeWidth="1.5"
+          strokeLinejoin="round" strokeLinecap="round" />
+      </svg>
+      <span className="sx-spark-meta" style={{ color }}>
+        {chg >= 0 ? '+' : ''}{chg.toFixed(1)}% · {spark.count}d price
+      </span>
+    </div>
+  )
+}
+
+export function WFOGatePill({ gate, watchlist, modelEval }) {
+  const state = gate?.state || 'INSUFFICIENT_DATA'
+  const cfg = {
+    INSUFFICIENT_DATA: { cls: 'sx-wfo-insuff', icon: '🔬', label: 'ACCUMULATING' },
+    AMBER: { cls: 'sx-wfo-amber', icon: '🟡', label: 'AMBER' },
+    GREEN: { cls: 'sx-wfo-green', icon: '🟢', label: 'CONFIRMED EDGE' },
+    RED: { cls: 'sx-wfo-red', icon: '🔴', label: 'NO EDGE' },
+    RED_MANUAL_REVIEW: { cls: 'sx-wfo-red', icon: '🛑', label: 'MANUAL REVIEW' },
+  }[state] || { cls: 'sx-wfo-insuff', icon: '🔬', label: state }
+  const deployable = gate?.deployableCount || watchlist?.length || 0
+  const remaining = gate?.frozen_signals_remaining
+  const firstResult = gate?.first_result_calendar
+  const evalRate = modelEval?.hit_rate
+  const evalCount = modelEval?.evaluated
+  return (
+    <div className={`sx-wfo-gate ${cfg.cls}`}>
+      <div className="sx-wfo-main">
+        <span className="sx-wfo-icon">{cfg.icon}</span>
+        <b>MODEL EDGE: {cfg.label}</b>
+        {state === 'INSUFFICIENT_DATA' && remaining != null && (
+          <span className="sx-wfo-countdown">
+            {remaining > 0
+              ? `~${remaining} trading days to first result${firstResult ? ` (est. ${firstResult})` : ''}`
+              : 'First result imminent'}
+          </span>
+        )}
+        {state === 'GREEN' && <span className="sx-wfo-countdown">Full deployment authorized</span>}
+        {state === 'AMBER' && <span className="sx-wfo-countdown">Max {gate?.max_new_positions || 6} positions</span>}
+      </div>
+      <div className="sx-wfo-stats">
+        <div className="sx-wfo-stat">
+          <b>{deployable}</b>
+          <span>DEPLOYABLE NOW</span>
+        </div>
+        {evalCount > 0 && (
+          <div className="sx-wfo-stat">
+            <b>{evalRate}%</b>
+            <span>LIVE HIT RATE ({evalCount})</span>
+          </div>
+        )}
+        <div className="sx-wfo-stat">
+          <b>{state === 'INSUFFICIENT_DATA' ? 'PAPER' : state === 'GREEN' ? 'LIVE' : 'PAUSED'}</b>
+          <span>CAPITAL STATUS</span>
+        </div>
+      </div>
+      {watchlist && watchlist.length > 0 && (
+        <div className="sx-watchlist">
+          <div className="sx-watchlist-title">TOP PICKS WATCHLIST</div>
+          <div className="sx-watchlist-row">
+            {watchlist.map((w, i) => (
+              <div key={i} className={`sx-watch-item sx-watch-${w.tier || 'watch'}`}>
+                <span className="sx-watch-sym">{w.symbol}</span>
+                <span className="sx-watch-score">{w.score != null ? (w.score * 100).toFixed(1) : '—'}</span>
+                <span className="sx-watch-tier">{w.tier === '10pct' ? '★★★' : w.tier === '8pct' ? '★★' : '★'}</span>
+                {w.ev_est_pct != null && <span className={`sx-watch-ev ${w.ev_est_pct >= 0 ? 'sx-gain' : 'sx-loss'}`}>{w.ev_est_pct > 0 ? '+' : ''}{(w.ev_est_pct * 100).toFixed(1)}% EV</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function StockCard({ c, spark, onAI, aiOpen }) {
   const pct = c.institutional_pct
   return (
     <div className="sx-card">
@@ -93,6 +220,9 @@ export function StockCard({ c, onAI, aiOpen }) {
           <div className="sx-price">{c.target_price ? `$${c.target_price.toFixed(2)}` : '—'}</div>
           {c.reachable_63d && <div className="sx-reach">≤63D ✓</div>}
         </div>
+      </div>
+      <div className="sx-spark-wrap">
+        <PriceSpark spark={spark} />
       </div>
       <div className="sx-stats">
         <div className="sx-stat"><div className="sx-meta">EXPECTED VALUE<br />PER TRADE</div><div className="sx-stat-val">{c.ev_est_pct != null ? `${c.ev_est_pct > 0 ? '+' : ''}${c.ev_est_pct.toFixed(2)}%` : '—'}</div></div>
@@ -145,10 +275,10 @@ export function SatelliteClock({ pos }) {
       </div>
       <div className="sx-bar"><div className={`sx-bar-fill ${cls}`} style={{ width: `${pct}%` }} /></div>
       <div className="sx-clock-body">
-        Entered {fmtMoney(pos.entry_price)} · Now {fmtMoney(pos.current_price)} ·{' '}
+        Entered {fmtPrice(pos.entry_price)} · Now {fmtPrice(pos.current_price)} ·{' '}
         <b className={pos.pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{pos.pnl_pct > 0 ? '+' : ''}{pos.pnl_pct}%</b>
       </div>
-      {pos.target_price && <div className="sx-meta">Target: {fmtMoney(pos.target_price)} (+{pos.target_pct ?? 8}%) · Stop: {pos.catastrophe_stop_price != null ? fmtMoney(pos.catastrophe_stop_price) : '—'} (−20%)</div>}
+      {pos.target_price && <div className="sx-meta">Target: {fmtPrice(pos.target_price)} (+{pos.target_pct ?? 8}%) · Stop: {pos.catastrophe_stop_price != null ? fmtPrice(pos.catastrophe_stop_price) : '—'} (−20%)</div>}
       {pos.time_stop_date && <div className="sx-meta">Exit window closes: {pos.time_stop_date}</div>}
       <div className={status.cls}>{status.text}</div>
     </div>
@@ -196,6 +326,63 @@ export function GGateProgress({ gates, paperClosed }) {
         </div>
       ))}
       <div className="sx-meta">Estimated date to start investing real money: NOVEMBER 2026 — and only if the paper results hold up.</div>
+    </div>
+  )
+}
+
+// Live Validation panel — surfaces the honest "when will we know" + WFO truth.
+// Backend-only JSON until now; this renders the frozen-model countdown, the
+// epoch segregation (legacy excluded), and the WFO metrics table.
+export function LiveValidationPanel({ health, wfo }) {
+  const lv = health?.live_validation || {}
+  const frozen = lv.frozen_model_first_result_calendar
+  const rows = [
+    { h: 'h30d', m: wfo?.latest_30d },
+    { h: 'h63d', m: wfo?.latest_63d },
+    { h: 'h90d', m: wfo?.latest_90d },
+  ].filter(r => r.m)
+  return (
+    <div className="sx-chart">
+      <div className="sx-section-title">🔬 LIVE VALIDATION — WHEN DO WE REALLY KNOW?</div>
+      {frozen ? (
+        <div className="sx-lv-hero">
+          <b>Frozen-model first result: {frozen}</b>
+          <div className="sx-meta">
+            {lv.days_until_frozen_model_wfo_30d} trading days to go · model FROZEN
+            (MODEL_LOCK_IN) — the 60.5% top-decile gets tested on unseen forward data.
+          </div>
+        </div>
+      ) : (
+        <div className="sx-meta">Validating… no decision-relevant WFO result yet.</div>
+      )}
+      {lv.legacy_is_mixed && (
+        <div className="sx-action sx-action-amber">
+          ⚠️ Legacy signals (pre 12-Aug) use the old tier convention and are EXCLUDED
+          from the decision metric — they can't fool the result.
+        </div>
+      )}
+      {rows.length > 0 ? (
+        <div className="sx-lv-table">
+          {rows.map((r, i) => {
+            const m = r.m
+            const insuff = (m.notes || '').toLowerCase().startsWith('insufficient')
+            const hit = m.total_signals > 0 && !insuff ? `${m.hit_rate_pct}%` : '—'
+            const sharpe = !insuff && m.oos_sharpe != null ? `Sharpe ${m.oos_sharpe}` : '—'
+            const ci = !insuff && m.oos_sharpe_ci_lower != null ? `CI [${m.oos_sharpe_ci_lower}, ${m.oos_sharpe_ci_upper}]` : ''
+            return (
+              <div key={i} className="sx-lv-row">
+                <span className="sx-meta">{r.h}</span>
+                <span>{hit}</span>
+                <span>{sharpe}</span>
+                <span className="sx-meta">{ci || (insuff ? 'accumulating signals…' : '')}</span>
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="sx-meta">No WFO metrics yet — accumulating signals toward the 20-sample threshold.</div>
+      )}
+      <div className="sx-meta">{lv.note || 'Waiting for the frozen model to prove itself on live forward data.'}</div>
     </div>
   )
 }
@@ -331,6 +518,7 @@ export function DashboardScreen({ token, onRunScan }) {
             : 'The market is closed right now — the next scan runs before open.'}
       </div>
       <CircuitBreakerBanner level={d.circuit_breaker?.level} drawdown_pct={d.circuit_breaker?.drawdown_pct} vix={d.regime?.vix} xjo={d.regime?.xjo_vs_sma200_pct} />
+      <WFOGatePill gate={d.wfo_gate} watchlist={d.watchlist} modelEval={d.model_eval} />
       <div className="sx-regime">
         ● MARKET OUTLOOK: <b>{d.regime?.label || 'UNKNOWN'}</b>
         {d.regime?.vix != null && <> — volatility (VIX {d.regime.vix}) is {d.regime.vix < 15 ? 'very calm' : d.regime.vix < 20 ? 'calm' : d.regime.vix < 25 ? 'elevated' : 'high'}</>}
@@ -393,7 +581,7 @@ export function DashboardScreen({ token, onRunScan }) {
 }
 
 export function ScreenerScreen({ token, onRunScan }) {
-  const { data, loading } = useApi('/screener/scan', token)
+  const { data, loading } = useApiCached('/screener/scan', token)
   const [filter, setFilter] = useState('all')
   const [aiOpen, setAiOpen] = useState(null)
   const [runState, setRunState] = useState('idle')
@@ -404,6 +592,19 @@ export function ScreenerScreen({ token, onRunScan }) {
     filter === 'reachable' ? c.reachable_63d :
     filter === 'high' ? c.tier === '10pct' :
     filter === 'satellite' ? c.tier !== 'watch' : true)
+
+  // Batch-fetch price sparklines for all visible candidates in one cheap call.
+  const symbols = useMemo(() => (cands || []).map(c => c.symbol).join(','), [cands.length])
+  const [spark, setSpark] = useState({})
+  useEffect(() => {
+    if (!symbols || !token) return
+    let alive = true
+    axios.get(`${API_BASE}/screener/sparklines?symbols=${encodeURIComponent(symbols)}`, authH(token))
+      .then(r => { if (alive) setSpark(r.data?.sparklines || {}) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [symbols, token])
+
   const runScan = () => {
     setRunState('running')
     axios.post(`${API_BASE}/broad-scan/run`, {}, authH(token)).catch(() => {})
@@ -426,14 +627,19 @@ export function ScreenerScreen({ token, onRunScan }) {
         ) : null}
         Last scan: {d.last_scan || 'never'} · Honest numbers from the live model.
       </div>
+      <div className="sx-wfo-screener-status">
+        <span><b>{d.high_conviction ?? 0}</b> deployable now (10pct + 8pct tier)</span>
+        <span className="sx-meta">First WFO result: ~Sep 11 · model FROZEN until then</span>
+      </div>
       <div className="sx-chips">
         {[['all', '● ALL PICKS'], ['ai_approved', '✅ AI APPROVED'], ['reachable', '≤63 DAYS — hits target soon'], ['high', 'HIGH CONFIDENCE — model very sure'], ['satellite', 'SATELLITE — AI picks']].map(([k, label]) => (
           <button key={k} className={`sx-chip ${filter === k ? 'sx-chip-on' : ''}`} onClick={() => setFilter(k)}>{label}</button>
         ))}
       </div>
+      {!loading && (d.candidates?.length > 0) && null}
       {loading && <div className="sx-meta">Loading latest scan…</div>}
       {cands.map(c => (
-        <StockCard key={c.symbol} c={c} aiOpen={aiOpen === c.symbol} onAI={(s) => setAiOpen(aiOpen === s ? null : s)} />
+        <StockCard key={c.symbol} c={c} spark={spark[c.symbol]} aiOpen={aiOpen === c.symbol} onAI={(s) => setAiOpen(aiOpen === s ? null : s)} />
       ))}
       {!loading && cands.length === 0 && <div className="sx-meta">No scan results yet — run a scan.</div>}
     </Screen>
@@ -461,10 +667,10 @@ export function PortfolioScreen({ token }) {
           <div className="sx-bar-fill sx-split-core" style={{ width: `${d.core_pct || 0}%` }} />
           <div className="sx-bar-fill sx-split-sat" style={{ width: `${d.satellite_pct || 0}%` }} />
         </div>
-        <div className="sx-meta">CORE HOLDINGS {d.core_pct || 0}% · AI PICKS {d.satellite_pct || 0}%</div>
+        <div className="sx-meta">CORE HOLDINGS {d.core_pct || 0}% · AI/SATELLITE PICKS {d.satellite_pct || 0}%</div>
         <div className="sx-model-plain">
           Your core holdings (buy-and-hold blue chips) make up {d.core_pct || 0}% of your SMSF;
-          the AI picks {d.satellite_pct || 0}% — {d.satellite_pct != null && d.satellite_pct <= 40 ? 'within your 30–40% safety target. ✅' : 'above the 40% safety target — new AI entries are paused until it comes back down. ⚠️'}
+          the AI/satellite picks {d.satellite_pct || 0}% — {d.satellite_pct != null && d.satellite_pct <= 40 ? 'within your 30–40% safety target. ✅' : 'above the 40% safety target — new satellite entries are paused until it comes back down. ⚠️'}
         </div>
       </div>
 
@@ -472,7 +678,7 @@ export function PortfolioScreen({ token }) {
       {(d.core_positions || []).map(p => <CoreSleeveRow key={p.id} pos={p} />)}
       {(!d.core_positions || d.core_positions.length === 0) && <div className="sx-meta">No core positions yet (CBA/BHP/WOW/ETFs per strategy).</div>}
 
-      <div className="sx-section-title">AI PICKS — THE 63-DAY CLOCK</div>
+      <div className="sx-section-title">AI/SATELLITE PICKS — THE 63-DAY CLOCK</div>
       {(d.satellite_positions || []).map(p => <SatelliteClock key={p.id} pos={p} />)}
 
       {(d.cgt_alerts || []).map((a, i) => (
@@ -500,9 +706,11 @@ export function WealthScreen({ token }) {
   const [capital, setCapital] = useState(200000)
   const { data, loading } = useApi(`/wealth/projection?capital=${capital}`, token, [capital])
   const health = useApi('/model/health-summary', token)
+  const wfo = useApi('/walk-forward/oos', token)
   return (
     <Screen title="Wealth Projector" subtitle="$200K → $1M by 2035 — scenario planner">
       {!loading && data && <WealthProjector data={data} capital={capital} setCapital={setCapital} />}
+      <LiveValidationPanel health={health.data} wfo={wfo.data} />
       <div className="sx-section-title">G-GATE VALIDATION PROGRESS</div>
       <GGateProgress gates={health.data?.gates} paperClosed={data?.ggate?.paper_trades_closed} />
       {data?.ggate?.self_learning?.win_rate_pct != null && (

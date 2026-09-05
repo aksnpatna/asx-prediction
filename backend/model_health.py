@@ -44,7 +44,7 @@ def evaluate_signal_outcomes(conn) -> Dict:
             continue
         pnl_pct = (cp - entry) / entry * 100
         evaluated += 1
-        if pnl_pct > 0 and (score is not None and score > 50):
+        if pnl_pct >= 8.0:
             wins += 1
 
     if evaluated == 0:

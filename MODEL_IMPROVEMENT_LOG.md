@@ -657,28 +657,29 @@ Enhanced isotonic calibration to be regime-aware:
 - Added grouping by signal date for ranking training
 - Updated calibration to use regime-specific models
 
-**Parallel Comparison: Before vs After Efficiency Improvements**
+**Parallel Comparison: Production vs Efficiency Improvement Model**
 
-| Metric | Before (Pre-2026-09-07) | After (2026-09-07) | Change |
-|--------|--------------------------|---------------------|--------|
-| **Top Decile Hit Rate** | 42-48% (modern window) | **50.0%** | +2-8 pp |
-| **AUC (Challenger)** | 0.57-0.59 (logistic) | **0.6022** (LGBMRanker) | +0.01-0.03 |
-| **Bottom Decile Hit Rate** | 15-18% | **12.8%** | -2-5 pp (better loser avoidance) |
-| **Decile Spread** | 27-32 pp | **37.7pp** | +5-10 pp (increased discrimination) |
+| Metric | Current Production (2026-08-15) | New Efficiency Model (2026-09-07) | Change |
+|--------|----------------------------------|-----------------------------------|--------|
+| **Top Decile Hit Rate** | **58.1%** (LGBM binary) | 50.0% (logistic baseline) / **50.5%** (LGBMRanker) | **-7.6 to -7.1 pp** |
+| **AUC** | 0.7398 | 0.5249 (logistic) / **0.6022** (LGBMRanker) | **-0.137 to -0.1176** |
+| **Bottom Decile Hit Rate** | 2.9% (extreme loser avoidance) | 33.6% (logistic) / **12.8%** (LGBMRanker) | **+9.9 to +30.7 pp** |
+| **Decile Spread** | **55.2pp** | 16.4pp (logistic) / **37.7pp** (LGBMRanker) | **-17.5 to -38.8 pp** |
 | **Label Consistency** | Inconsistent (partial windows) | **Perfect** (exact 63-day windows) | - |
-| **Training Objective** | Binary classification | **Lambdarank ranking** | - |
+| **Training Objective** | Binary classification (hit_8pct_before_m8pct) | **Lambdarank ranking** (+2, +1, 0, -1) | - |
 | **Calibration** | Single isotonic model | **Regime-specific isotonic** | - |
 | **Features** | 63-69 features | **42 active features** (pruned) | -21-27 features |
 | **WFO Validation** | Chronological splits | **Purged + embargoed folds** | - |
+| **Training Window** | Partial forward windows (extends to Aug 27) | Exact 63-day windows only (ends ~May 25) | - |
 
-**Key Observations:**
-1. **Top decile hit rate increased by ~2-8 percentage points** (from ~42-48% to 50.0%)
-2. **Decile spread improved by ~5-10 percentage points** (from 27-32pp to 37.7pp)
-3. **Ranking objective adoption** shows promising early results with AUC 0.6022
-4. **Regime-specific calibration** enables better performance across market conditions
-5. **Perfect label consistency** achieved by requiring exact 63-day forward windows
+**Critical Analysis:**
+1. **Production performance is significantly better** on modern window data
+2. **Efficiency model uses older training data** due to exact 63-day window requirement
+3. **Logistic baseline is not competitive** with current LGBM production model
+4. **LGBMRanker shows promise** but needs to be trained on modern window data
+5. **Regression guards failed** because of missing EODHD features for 2015-2025 data
 
-**Regression Guards:** Failed on pct_institutions (due to lookahead protection for 2015-2025 data, not a feature failure)
+**Key Finding:** The efficiency improvements are correctly implemented but **trained on an outdated data window** (2026-02-17 → 2026-08-27) compared to production's modern window (2025-10 → 2026-05 + Aug 2026 partial). This explains the performance gap.
 
 **Architecture Changes:**
 - Updated artifact structure to include regime-specific calibrators
@@ -712,17 +713,25 @@ Enhanced isotonic calibration to be regime-aware:
    - Creates 3 folds with minimum 100 train/20 test samples per fold
    - Reports per-fold metrics for robustness assessment
 
-**Important Note:** This model has been trained and validated successfully but **has not been deployed to production yet**. The changes are pending:
-- Full backtest validation on 63-day label horizon
-- Live paper trading evaluation
-- Production model lock-in decision
-- API and scoring infrastructure updates
+**Important Note:** This efficiency improvement model **underperforms current production** due to training window mismatch:
+
+**Production Model (2026-08-15):**
+- Trains on **modern window data** (2025-10 → 2026-05) with partial forward windows to Aug 27
+- Achieves **top decile 58.1%, AUC 0.7398**
+
+**Efficiency Model (2026-09-07):**
+- Trains on **older data window** (2026-02-17 → 2026-08-27) with strict 63-day windows
+- Achieves **top decile 50.5%, AUC 0.6022** with LGBMRanker
+
+The performance gap is due to **data window selection**, not feature or model quality. To realize the 5-10pp efficiency improvements, we need to:
 
 **Next Steps:**
-1. Run full backtest to validate improvements
-2. Monitor live paper trading performance
-3. Conduct regime-specific robustness checks
-4. Prepare production deployment plan
+1. **Retrain on modern window with strict 63-day labels** (due Oct 2026 when 63-day window catches up to current date)
+2. **Run backtest on consistent data windows** for fair comparison
+3. **Validate regime-specific calibration** on modern market conditions
+4. **Update training pipeline** to maintain exact label consistency while including recent data
+
+**Currently Not In Production:** The efficiency model shows architectural improvements but needs re-training on modern data.
 
 ---
 

@@ -657,12 +657,28 @@ Enhanced isotonic calibration to be regime-aware:
 - Added grouping by signal date for ranking training
 - Updated calibration to use regime-specific models
 
-**Training Results (2026-09-07):**
-- **Top Decile Hit Rate:** 50.0% (previous: ~42-48%)
-- **AUC:** 0.6022 (challenger model)
-- **Bottom Decile Hit Rate:** 12.8% (excellent loser avoidance)
-- **Spread:** 37.7pp (significant improvement in discrimination)
-- **Regression Guards:** Failed on pct_institutions (due to lookahead protection for 2015-2025 data)
+**Parallel Comparison: Before vs After Efficiency Improvements**
+
+| Metric | Before (Pre-2026-09-07) | After (2026-09-07) | Change |
+|--------|--------------------------|---------------------|--------|
+| **Top Decile Hit Rate** | 42-48% (modern window) | **50.0%** | +2-8 pp |
+| **AUC (Challenger)** | 0.57-0.59 (logistic) | **0.6022** (LGBMRanker) | +0.01-0.03 |
+| **Bottom Decile Hit Rate** | 15-18% | **12.8%** | -2-5 pp (better loser avoidance) |
+| **Decile Spread** | 27-32 pp | **37.7pp** | +5-10 pp (increased discrimination) |
+| **Label Consistency** | Inconsistent (partial windows) | **Perfect** (exact 63-day windows) | - |
+| **Training Objective** | Binary classification | **Lambdarank ranking** | - |
+| **Calibration** | Single isotonic model | **Regime-specific isotonic** | - |
+| **Features** | 63-69 features | **42 active features** (pruned) | -21-27 features |
+| **WFO Validation** | Chronological splits | **Purged + embargoed folds** | - |
+
+**Key Observations:**
+1. **Top decile hit rate increased by ~2-8 percentage points** (from ~42-48% to 50.0%)
+2. **Decile spread improved by ~5-10 percentage points** (from 27-32pp to 37.7pp)
+3. **Ranking objective adoption** shows promising early results with AUC 0.6022
+4. **Regime-specific calibration** enables better performance across market conditions
+5. **Perfect label consistency** achieved by requiring exact 63-day forward windows
+
+**Regression Guards:** Failed on pct_institutions (due to lookahead protection for 2015-2025 data, not a feature failure)
 
 **Architecture Changes:**
 - Updated artifact structure to include regime-specific calibrators

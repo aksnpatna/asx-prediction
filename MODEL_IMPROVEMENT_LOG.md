@@ -685,11 +685,44 @@ Enhanced isotonic calibration to be regime-aware:
 - Enhanced scoring path in `_enrich_candidates_with_tiers` to use regime-aware calibration
 - Added regime classification logic to `main.py` scoring
 
-**Implementation Status:**
-- Model is now running with new features and ranking objective
-- Regime-specific calibration active
-- Purged WFO analysis ready for deployment
-- Next steps: Run full backtest to validate improvements
+**Training Optimization Details:**
+
+1. **Label Construction Optimization:**
+   - Changed from partial forward window (min 5 days) to exact 63-day window requirement
+   - Eliminates label bias in recent training samples
+   - Requires complete 63-day outcome data for all training examples
+
+2. **Ranking Objective Adoption:**
+   - Replaced binary classification with LightGBM Lambdarank
+   - Creates 4-level ranking labels: +2 (strong buy), +1 (buy), 0 (hold), -1 (sell)
+   - Groups by signal date for effective ranking training
+
+3. **Regime-Specific Calibration:**
+   - Trains separate isotonic regression models for bull/neutral/bear regimes
+   - Determines regime from features at prediction time
+   - Applies appropriate calibration based on current market conditions
+
+4. **Feature Selection:**
+   - Pruned from 69 down to 42 active features
+   - Removes low-importance and redundant features
+   - Focuses on high-impact signals (copper/gold ratio, gap detection, RSI/volatility adjusted)
+
+5. **Validation Methodology:**
+   - Implemented purged walk-forward validation with 5-day embargo period
+   - Creates 3 folds with minimum 100 train/20 test samples per fold
+   - Reports per-fold metrics for robustness assessment
+
+**Important Note:** This model has been trained and validated successfully but **has not been deployed to production yet**. The changes are pending:
+- Full backtest validation on 63-day label horizon
+- Live paper trading evaluation
+- Production model lock-in decision
+- API and scoring infrastructure updates
+
+**Next Steps:**
+1. Run full backtest to validate improvements
+2. Monitor live paper trading performance
+3. Conduct regime-specific robustness checks
+4. Prepare production deployment plan
 
 ---
 

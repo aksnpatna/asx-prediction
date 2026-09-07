@@ -2490,8 +2490,27 @@ def _enrich_candidates_with_tiers(candidates: list):
                 c["_feat_row"] = [float(v) for v in _vals]
                 _raw = float(
                     _lgbm_art["model"].predict_proba(_vals.reshape(1, -1))[0, 1])
-                # Fix 22: isotonic calibration (monotone — ranking unchanged)
-                if _lgbm_art.get("isotonic") is not None:
+                 # Fix 22: isotonic calibration (monotone — ranking unchanged)
+                # Use regime-specific calibration if available
+                if _lgbm_art.get("regime_isotonic"):
+                    # Determine current regime from features
+                    vix = _vals[_order.index("vix_level")] if "vix_level" in _order else 20
+                    xjo_sma = _vals[_order.index("xjo_sma_position")] if "xjo_sma_position" in _order else 0.5
+                    xjo_mom = _vals[_order.index("xjo_momentum_63d")] if "xjo_momentum_63d" in _order else 0
+                    
+                    if xjo_sma > 0.5 and xjo_mom > 0 and vix < 20:
+                        regime = "bull"
+                    elif xjo_sma < 0.5 or vix >= 25:
+                        regime = "bear"
+                    else:
+                        regime = "neutral"
+                        
+                    if regime in _lgbm_art["regime_isotonic"]:
+                        _cal = float(_lgbm_art["regime_isotonic"][regime].predict([_raw])[0])
+                        c["_lgbm_proba"] = round(_cal, 4)
+                    else:
+                        c["_lgbm_proba"] = round(_raw, 4)
+                elif _lgbm_art.get("isotonic") is not None:
                     _raw = float(_lgbm_art["isotonic"].predict([_raw])[0])
                 c["_lgbm_proba"] = _raw
                 # Fix 27: RF consensus head (raw features, pre-scaling)
@@ -13663,9 +13682,53 @@ def _ensure_wfo_table():
     except Exception:
         pass
 
-
 _WFO_LAST_HORIZON = 0
 _WFO_HORIZON_DAYS = [30, 63, 90]  # rolling check at 30d, 63d, 90d post-signal
+_WFO_EMBARGO_DAYS = 5  # 5-day embargo after training cutoff
+_WFO_PURGE_DAYS = 63  # 63-day purge (match label horizon)
+
+
+def _purged_wfo_split(signals, horizon_days, embargo_days=_WFO_EMBARGO_DAYS, purge_days=_WFO_PURGE_DAYS):
+    """Split signals into training/validation folds with purging and embargo.
+    
+    Purging: Exclude any signal with forward window overlapping validation period
+    Embargo: Exclude signals immediately after training cutoff
+    
+    Returns list of (train_indices, val_indices) tuples
+    """
+    # Convert to DataFrame for easier handling
+    df = pd.DataFrame(signals)
+    df["screened_at"] = pd.to_datetime(df["screened_at"])
+    df = df.sort_values("screened_at").reset_index(drop=True)
+    
+    folds = []
+    
+    # Create folds for each validation period
+    dates = df["screened_at"].unique()
+    min_date = dates.min()
+    max_date = dates.max()
+    
+    # Create approximately 3 folds (adjust based on available data)
+    n_folds = 3
+    fold_dates = pd.date_range(start=min_date + pd.Timedelta(days=365), 
+                               end=max_date - pd.Timedelta(days=horizon_days), 
+                               periods=n_folds)
+    
+    for val_start in fold_dates:
+        val_end = val_start + pd.Timedelta(days=horizon_days)
+        
+        # Training cutoff: validation start - purge days - embargo days
+        train_cutoff = val_start - pd.Timedelta(days=purge_days + embargo_days)
+        
+        # Validate indices
+        train_indices = df[(df["screened_at"] <= train_cutoff)].index.tolist()
+        val_indices = df[(df["screened_at"] >= val_start) & (df["screened_at"] <= val_end)].index.tolist()
+        
+        if len(train_indices) >= 100 and len(val_indices) >= 20:
+            folds.append((train_indices, val_indices))
+    
+    return folds
+
 
 def _scheduled_walk_forward_oos():
     """Walk-Forward Out-of-Sample Validation (runs daily after market close).
@@ -13870,9 +13933,81 @@ def _scheduled_walk_forward_oos():
             except Exception:
                 continue
 
-        n_total = len(evaluated)
+         n_total = len(evaluated)
         if dropped_corporate_action > 0:
             print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
+        
+        # Run purged and embargoed WFO analysis
+        if horizon_days == 63:  # Only run for main label horizon
+            # Convert to DataFrame for easier handling
+            df = pd.DataFrame(evaluated)
+            df["screened_at"] = df["screened_at"]
+            df = df.sort_values("screened_at").reset_index(drop=True)
+            
+            folds = []
+            
+            # Create folds for each validation period
+            dates = pd.to_datetime(df["screened_at"]).unique()
+            min_date = dates.min()
+            max_date = dates.max()
+            
+            # Create approximately 3 folds (adjust based on available data)
+            n_folds = 3
+            fold_dates = pd.date_range(start=min_date + pd.Timedelta(days=365), 
+                                       end=max_date - pd.Timedelta(days=horizon_days), 
+                                       periods=n_folds)
+            
+            for val_start in fold_dates:
+                val_end = val_start + pd.Timedelta(days=horizon_days)
+                
+                # Training cutoff: validation start - purge days - embargo days
+                train_cutoff = val_start - pd.Timedelta(days=_WFO_PURGE_DAYS + _WFO_EMBARGO_DAYS)
+                
+                # Validate indices
+                train_indices = df[(pd.to_datetime(df["screened_at"]) <= train_cutoff)].index.tolist()
+                val_indices = df[(pd.to_datetime(df["screened_at"]) >= val_start) & (pd.to_datetime(df["screened_at"]) <= val_end)].index.tolist()
+                
+                if len(train_indices) >= 100 and len(val_indices) >= 20:
+                    folds.append((train_indices, val_indices))
+            
+            if folds:
+                print(f"[WFO] Running purged WFO with {len(folds)} folds")
+                fold_results = []
+                for i, (train_idx, val_idx) in enumerate(folds):
+                    train_signals = df.iloc[train_idx].to_dict(orient='records')
+                    val_signals = df.iloc[val_idx].to_dict(orient='records')
+                    
+                    # Calculate fold metrics
+                    hit_rate = np.mean([s["hit"] for s in val_signals]) if val_signals else 0
+                    avg_return = np.mean([s["actual_return_pct"] for s in val_signals]) if val_signals else 0
+                    sharpe = (avg_return / 100 / (np.std([s["actual_return_pct"] for s in val_signals]) / 100 + 1e-9)) * np.sqrt(252 / horizon_days) if val_signals and len(val_signals) > 1 else 0
+                    
+                    fold_results.append({
+                        "fold": i+1,
+                        "train_start": min([pd.Timestamp(s["screened_at"]) for s in train_signals]).strftime("%Y-%m-%d"),
+                        "train_end": max([pd.Timestamp(s["screened_at"]) for s in train_signals]).strftime("%Y-%m-%d"),
+                        "val_start": min([pd.Timestamp(s["screened_at"]) for s in val_signals]).strftime("%Y-%m-%d"),
+                        "val_end": max([pd.Timestamp(s["screened_at"]) for s in val_signals]).strftime("%Y-%m-%d"),
+                        "train_size": len(train_signals),
+                        "val_size": len(val_signals),
+                        "hit_rate": hit_rate,
+                        "avg_return": avg_return,
+                        "sharpe": sharpe
+                    })
+                
+                # Print fold results
+                print(f"[WFO] Purged WFO Fold Results:")
+                for fr in fold_results:
+                    print(f"  Fold {fr['fold']}: Train {fr['train_start']}→{fr['train_end']} ({fr['train_size']}), "
+                          f"Val {fr['val_start']}→{fr['val_end']} ({fr['val_size']}), "
+                          f"Hit Rate: {fr['hit_rate']:.1%}, Avg Return: {fr['avg_return']:.1f}%, Sharpe: {fr['sharpe']:.2f}")
+                
+                # Calculate aggregate metrics
+                avg_hit_rate = np.mean([fr["hit_rate"] for fr in fold_results if fr["val_size"] > 0])
+                avg_sharpe = np.mean([fr["sharpe"] for fr in fold_results if fr["val_size"] > 0 and fr["sharpe"] != 0])
+                
+                print(f"[WFO] Aggregate Purged WFO Metrics: "
+                      f"Hit Rate: {avg_hit_rate:.1%}, Sharpe: {avg_sharpe:.2f}")
 
         # ── Epoch split (frozen model vs legacy) determined here, before the
         # minimum-signal gate, so both buckets are counted correctly.

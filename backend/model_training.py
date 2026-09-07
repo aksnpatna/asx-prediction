@@ -49,6 +49,7 @@ FEATURE_COLS = [
     "esg_governance", "esg_controversy", "payout_ratio",
     # Market regime features
     "regime_sma_alignment", "vwap_position", "gap_detection",
+    "regime_bull", "regime_neutral", "regime_bear",
     # Volatility structure features
     "vol_regime_ratio", "garman_klass_vol", "parkinson_vol",
     # Time-series structure features
@@ -280,6 +281,9 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["regime_sma_alignment"] = fm["regime_sma_alignment"].fillna(0.5)
     fm["vwap_position"] = fm["vwap_position"].fillna(1.0)
     fm["gap_detection"] = fm["gap_detection"].fillna(0)
+    fm["regime_bull"] = fm["regime_bull"].fillna(0.0)
+    fm["regime_neutral"] = fm["regime_neutral"].fillna(1.0)
+    fm["regime_bear"] = fm["regime_bear"].fillna(0.0)
     fm["vol_regime_ratio"] = fm["vol_regime_ratio"].fillna(1.0)
     fm["garman_klass_vol"] = fm["garman_klass_vol"].fillna(0)
     fm["parkinson_vol"] = fm["parkinson_vol"].fillna(0)
@@ -391,6 +395,7 @@ def _add_macro_features(fm: pd.DataFrame, symbol_df: pd.DataFrame) -> pd.DataFra
         "xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d",
         "relative_strength_vs_xjo",
         "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
+        "regime_bull", "regime_neutral", "regime_bear",
     ]
     
     xjo = _get_xjo_data()
@@ -414,6 +419,40 @@ def _add_macro_features(fm: pd.DataFrame, symbol_df: pd.DataFrame) -> pd.DataFra
         sym_close = symbol_df["Close"].astype(float)
         sym_mom = sym_close.pct_change(63).fillna(0) * 100
         fm["relative_strength_vs_xjo"] = (sym_mom - xjo_mom).fillna(0).astype(float)
+        
+        # ── Market regime classification features ─────────────────────────────
+        # Bull regime: XJO above SMA200, 63d return positive, VIX < 20
+        # Neutral regime: XJO near SMA200, VIX 20-25
+        # Bear regime: XJO below SMA200, VIX >= 25
+        xjo_63d_ret = xjo_aligned.pct_change(63).fillna(0)
+        if "vix" in macro:
+            vix_aligned = macro["vix"].reindex(fm_dates, method="ffill")
+            vix_aligned = vix_aligned.fillna(method="bfill").fillna(20).values
+            fm["vix_level"] = vix_aligned.astype(float)
+            
+            # Bull regime
+            fm["regime_bull"] = (
+                (xjo_aligned > xjo_sma_aligned) & 
+                (xjo_63d_ret > 0) & 
+                (vix_aligned < 20)
+            ).astype(float)
+            
+            # Neutral regime
+            fm["regime_neutral"] = (
+                ((xjo_aligned > xjo_sma_aligned * 0.98) & (xjo_aligned < xjo_sma_aligned * 1.02)) |
+                ((vix_aligned >= 20) & (vix_aligned < 25))
+            ).astype(float)
+            
+            # Bear regime
+            fm["regime_bear"] = (
+                (xjo_aligned < xjo_sma_aligned) | 
+                (vix_aligned >= 25)
+            ).astype(float)
+        else:
+            # Default to neutral regime if no VIX data
+            fm["regime_bull"] = 0.0
+            fm["regime_neutral"] = 1.0
+            fm["regime_bear"] = 0.0
     else:
         fm["xjo_momentum_63d"] = 0.0
         fm["xjo_sma_position"] = 0.0
@@ -600,22 +639,20 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
             close = df["Close"].astype(float)
 
             rows_to_insert = []
-            # Allow partial forward windows (minimum 5 future days) so the training
-            # set extends closer to the present. Full 63-day labels exist up to
-            # (len(fm) - 64); beyond that, labels use whatever future data is
-            # available. The model query filters on forward_peak_return_63d IS NOT NULL
-            # so these partial rows are included but with shorter-horizon labels.
-            max_date_idx = len(fm) - 5
+            # ONLY include complete forward windows to ensure label consistency
+            # All training samples must have exactly FORWARD_WINDOW_DAYS of future data
+            # This fixes the label inconsistency caused by partial forward windows
+            max_date_idx = len(fm) - FORWARD_WINDOW_DAYS - 1
             warmup = 50
 
             cutoff_date = None
             if incremental and symbol in max_dates:
                 # Re-process the last 65 days of known signals to update forward-looking
-                # labels (63d returns change as new data arrives). New dates beyond
-                # max_dates[symbol] are appended with whatever forward window is available.
+                # labels (63d returns change as new data arrives). Only include complete
+                # forward windows in the training set.
                 cutoff_date = max_dates[symbol] - timedelta(days=65)
 
-            for idx in range(warmup, min(max_date_idx, len(fm) - 5)):
+            for idx in range(warmup, max_date_idx + 1):
                 signal_date = fm.index[idx].date()
                 if cutoff_date and signal_date < cutoff_date:
                     continue
@@ -634,9 +671,11 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                     else:
                         feat_row[col] = round(float(v), 8)
 
-                max_i = min(idx + FORWARD_WINDOW_DAYS + 1, len(close))
+                # Get EXACTLY FORWARD_WINDOW_DAYS of future data
+                max_i = idx + FORWARD_WINDOW_DAYS + 1
                 future = close.iloc[idx + 1 : max_i]
-                if len(future) < 5:
+                # Verify we have complete future data
+                if len(future) != FORWARD_WINDOW_DAYS:
                     continue
 
                 fwd_close_63d = float(close.iloc[max_i - 1]) if max_i - 1 < len(close) else float(close.iloc[-1])

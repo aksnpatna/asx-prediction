@@ -273,8 +273,9 @@ def _fill_fundamentals(feats: dict, symbol: str, fund_map: Dict[str, dict],
 
 
 def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
-                           reg_pred_test, active_features,
-                           scaler_mean, scaler_scale, reg_coefs, dates):
+                           y_reg_train, y_reg_test, reg_pred_test, 
+                           active_features, scaler_mean, scaler_scale, 
+                           reg_coefs, dates):
     """Fix 17: LightGBM binary head challenger — identical split and blend as
     the logistic baseline (0.6 binary rank + 0.4 ridge rank), so the A/B is fair.
 
@@ -302,18 +303,51 @@ def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
         w = w / w.mean()
         w_train = w[:len(X_train)]
 
-        model = lgb.LGBMClassifier(
-            objective="binary", n_estimators=600, learning_rate=0.03,
+        # Convert binary labels to ranking labels
+        # +2: first-touch +8% before -8%
+        # +1: positive 63-day return
+        # 0: near-zero return
+        # -1: -8% touched first
+        def binary_to_rank_label(y, y_reg):
+            rank_y = np.zeros_like(y)
+            for i in range(len(y)):
+                if y[i] == 1:
+                    rank_y[i] = 2
+                elif y_reg[i] > 0:
+                    rank_y[i] = 1
+                elif y_reg[i] < -8:
+                    rank_y[i] = -1
+                else:
+                    rank_y[i] = 0
+            return rank_y
+
+        y_train_rank = binary_to_rank_label(y_train, y_reg_train)
+        y_test_rank = binary_to_rank_label(y_test, y_reg_test)
+
+        # Train ranking model (lambdarank)
+        model = lgb.LGBMRanker(
+            objective="lambdarank", n_estimators=600, learning_rate=0.03,
             num_leaves=63, max_depth=6, min_child_samples=50,
             subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
-            reg_alpha=0.3, reg_lambda=2.0, class_weight="balanced",
-            random_state=42, n_jobs=-1, verbose=-1,
+            reg_alpha=0.3, reg_lambda=2.0, random_state=42, n_jobs=-1, verbose=-1,
         )
         cut = int(len(X_train) * 0.9)
+        
+        # Group by signal date for ranking
+        def create_ranking_groups(dates_array):
+            unique_dates, counts = np.unique(dates_array, return_counts=True)
+            groups = np.repeat(range(len(unique_dates)), counts)
+            return groups
+
+        groups_train = create_ranking_groups(dates[:cut])
+        groups_val = create_ranking_groups(dates[cut:len(X_train)])
+        
         model.fit(
-            X_train[:cut], y_train[:cut], sample_weight=w_train[:cut],
-            eval_set=[(X_train[cut:], y_train[cut:])],
-            eval_metric="auc",
+            X_train[:cut], y_train_rank[:cut], sample_weight=w_train[:cut],
+            group=groups_train,
+            eval_set=[(X_train[cut:len(X_train)], y_train_rank[cut:len(X_train)])],
+            eval_group=[groups_val],
+            eval_metric="ndcg",
             callbacks=[lgb.early_stopping(30, verbose=False)],
         )
 
@@ -322,48 +356,95 @@ def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
         # 0.151 -> 0.158). Use 3-fold OOB predictions for the isotonic fit;
         # the main model still serves ranking. Keep calibration only if it
         # improves test Brier.
-        iso = None
+        # Regime-specific calibration
+        def get_regime(features):
+            """Determine regime from features (bull/neutral/bear)"""
+            regimes = []
+            for i in range(len(features)):
+                row = features[i]
+                vix = row[active_features.index("vix_level")] if "vix_level" in active_features else 20
+                xjo_sma = row[active_features.index("xjo_sma_position")] if "xjo_sma_position" in active_features else 0.5
+                xjo_mom = row[active_features.index("xjo_momentum_63d")] if "xjo_momentum_63d" in active_features else 0
+                
+                # Bull regime: XJO above SMA200, 63d return positive, VIX < 20
+                if xjo_sma > 0.5 and xjo_mom > 0 and vix < 20:
+                    regimes.append("bull")
+                # Bear regime: XJO below SMA200 or VIX >= 25
+                elif xjo_sma < 0.5 or vix >= 25:
+                    regimes.append("bear")
+                # Neutral regime: everything else
+                else:
+                    regimes.append("neutral")
+            return np.array(regimes)
+        
+        regimes_train = get_regime(X_train)
+        regimes_test = get_regime(X_test)
+        
+        # Train regime-specific isotonic regressions
+        iso = {}
         brier_raw = brier_score_loss(y_test, model.predict_proba(X_test)[:, 1])
         brier_cal = brier_raw
+        
         try:
-            kf = KFold(n_splits=3, shuffle=False)
-            oob_pred = np.empty(len(X_train), dtype=np.float64)
-            for tr_idx, va_idx in kf.split(X_train):
-                m_fold = lgb.LGBMClassifier(
-                    objective="binary", n_estimators=400, learning_rate=0.05,
-                    num_leaves=63, max_depth=6, min_child_samples=50,
-                    subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
-                    reg_alpha=0.3, reg_lambda=2.0, class_weight="balanced",
-                    random_state=42, n_jobs=-1, verbose=-1,
-                )
-                sub_cut = int(len(tr_idx) * 0.9)
-                m_fold.fit(
-                    X_train[tr_idx[:sub_cut]], y_train[tr_idx[:sub_cut]],
-                    sample_weight=w_train[tr_idx[:sub_cut]],
-                    eval_set=[(X_train[tr_idx[sub_cut:]], y_train[tr_idx[sub_cut:]])],
-                    eval_metric="auc",
-                    callbacks=[lgb.early_stopping(30, verbose=False)],
-                )
-                oob_pred[va_idx] = m_fold.predict_proba(X_train[va_idx])[:, 1]
-            iso_cand = IsotonicRegression(out_of_bounds="clip")
-            iso_cand.fit(oob_pred, y_train)
-            proba_te_raw = model.predict_proba(X_test)[:, 1]
-            cal_proba = iso_cand.predict(proba_te_raw)
-            brier_cal = brier_score_loss(y_test, cal_proba)
-            if brier_cal < brier_raw:
-                iso = iso_cand
-            else:
-                print(f"[Classifier] LGBM calibration rejected "
-                      f"(Brier {brier_raw:.4f} -> {brier_cal:.4f})", flush=True)
+            for regime in ["bull", "neutral", "bear"]:
+                # Get indices for this regime
+                train_idx = np.where(regimes_train == regime)[0]
+                test_idx = np.where(regimes_test == regime)[0]
+                
+                if len(train_idx) < 100 or len(test_idx) < 20:
+                    continue
+                
+                # Train OOB calibration for this regime
+                kf = KFold(n_splits=3, shuffle=False)
+                oob_pred = np.empty(len(train_idx), dtype=np.float64)
+                for tr_idx, va_idx in kf.split(train_idx):
+                    m_fold = lgb.LGBMClassifier(
+                        objective="binary", n_estimators=400, learning_rate=0.05,
+                        num_leaves=63, max_depth=6, min_child_samples=50,
+                        subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                        reg_alpha=0.3, reg_lambda=2.0, class_weight="balanced",
+                        random_state=42, n_jobs=-1, verbose=-1,
+                    )
+                    sub_cut = int(len(tr_idx) * 0.9)
+                    m_fold.fit(
+                        X_train[train_idx[tr_idx[:sub_cut]]], y_train[train_idx[tr_idx[:sub_cut]]],
+                        sample_weight=w_train[train_idx[tr_idx[:sub_cut]]],
+                        eval_set=[(X_train[train_idx[tr_idx[sub_cut:]]], y_train[train_idx[tr_idx[sub_cut::]]])],
+                        eval_metric="auc",
+                        callbacks=[lgb.early_stopping(30, verbose=False)],
+                    )
+                    oob_pred[va_idx] = m_fold.predict_proba(X_train[train_idx[va_idx]])[:, 1]
+                
+                iso_cand = IsotonicRegression(out_of_bounds="clip")
+                iso_cand.fit(oob_pred, y_train[train_idx])
+                iso[regime] = iso_cand
+                
+                # Evaluate on test data for this regime
+                proba_te_raw = model.predict_proba(X_test[test_idx])[:, 1]
+                cal_proba = iso_cand.predict(proba_te_raw)
+                brier_regime = brier_score_loss(y_test[test_idx], cal_proba)
+                print(f"[Classifier] LGBM {regime} calibration: Brier {brier_score_loss(y_test[test_idx], proba_te_raw):.4f} -> {brier_regime:.4f}")
+        
+            # Apply regime-specific calibration to all test data
+            proba_te = np.zeros(len(y_test), dtype=np.float64)
+            for i in range(len(y_test)):
+                regime = regimes_test[i]
+                if regime in iso:
+                    proba_te[i] = iso[regime].predict(model.predict_proba(X_test[i:i+1])[:, 1])[0]
+                else:
+                    proba_te[i] = model.predict_proba(X_test[i:i+1])[:, 1][0]
+            
+            brier_cal = brier_score_loss(y_test, proba_te)
+            print(f"[Classifier] LGBM overall calibration: Brier {brier_raw:.4f} -> {brier_cal:.4f}")
         except Exception as e:
             print(f"[Classifier] LGBM calibration failed (skipped): {e}", flush=True)
-        if iso is not None:
-            print(f"[Classifier] LGBM calibration kept: Brier {brier_raw:.4f} -> {brier_cal:.4f}", flush=True)
+            proba_te = model.predict_proba(X_test)[:, 1]
 
-        proba_te = iso.predict(model.predict_proba(X_test)[:, 1]) if iso is not None \
-            else model.predict_proba(X_test)[:, 1]
-
-        blended = ((1 - REG_BLEND_WEIGHT) * rankdata(proba_te)
+        # For ranking model, predict scores instead of probabilities
+        pred_te = model.predict(X_test)
+        proba_te = rankdata(pred_te)
+        
+        blended = ((1 - REG_BLEND_WEIGHT) * rankdata(pred_te)
                    + REG_BLEND_WEIGHT * rankdata(reg_pred_test))
 
         sorted_idx = np.argsort(blended)[::-1]
@@ -376,7 +457,7 @@ def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
 
         auc_ = roc_auc_score(y_test, blended)
         print(f"[Classifier] LGBM calibration: Brier {brier_raw:.4f} -> {brier_cal:.4f}", flush=True)
-        return {
+         return {
             "ok": True,
             "auc": round(auc_, 4),
             "avg_precision": round(average_precision_score(y_test, blended), 4),
@@ -387,7 +468,8 @@ def _train_lgbm_challenger(X_train, X_test, y_train, y_test,
             "brier_raw": round(brier_raw, 4),
             "brier_calibrated": round(brier_cal, 4),
             "model": model,
-            "isotonic": iso,
+            "isotonic": None,  # Use regime-specific calibration instead
+            "regime_isotonic": iso,
             "best_iter": int(getattr(model, "best_iteration_", -1) or -1),
             "secs": round(time.time() - t0, 1),
         }
@@ -422,6 +504,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     # maps are still loaded for the live scoring path (_enrich_candidates_with_tiers).
     eps_map = _load_eps_history(db_conn)
     ann_map = _load_announcement_features(db_conn)
+    fund_map = _load_latest_fundamentals(db_conn)
     print(f"[Fund] PIT-safe: {len(eps_map)} EPS-history + {len(ann_map)} announcement symbols "
           f"(EODHD/snapshot fills skipped — lookahead Fix 64)", flush=True)
 
@@ -667,11 +750,12 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     # ── Fix 17: LightGBM challenger — same split, same blend, strict winner rule ──
     # Adopt only if it beats logistic on AUC (+0.005) without losing top-decile
     # or bottom-decile quality. Otherwise logistic stays and nothing changes.
-    lgbm_challenger = _train_lgbm_challenger(
-        X_train, X_test, y_train, y_test,
-        reg_model.predict(X_test_s), active_features,
-        scaler.mean_, scaler.scale_, reg_model.coef_, dates,
-    )
+     lgbm_challenger = _train_lgbm_challenger(
+         X_train, X_test, y_train, y_test,
+         y_reg_train, y_reg_test, reg_model.predict(X_test_s),
+         active_features, scaler.mean_, scaler.scale_,
+         reg_model.coef_, dates,
+     )
     adopt_lgbm = False
     if lgbm_challenger and lgbm_challenger.get("ok"):
         auc_gap = lgbm_challenger["auc"] - auc
@@ -722,6 +806,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
             artifact = {
                 "model": lgbm_challenger["model"],
                 "isotonic": lgbm_challenger["isotonic"],
+                "regime_isotonic": lgbm_challenger.get("regime_isotonic", {}),
                 "random_forest": rf_model,
                 "feature_order": active_features,
                 "scaler_mean": scaler.mean_.tolist(),
@@ -804,7 +889,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     return {
         "status": "ok", "model_type": "logistic_regression",
         "samples": len(X), "active_features": len(active_features),
-        "fund_symbols": len(fund_map),
+        "fund_symbols": len(eps_map),
         "base_rate_test_pct": round(base_rate_test * 100, 1),
         "top_decile_hit_pct": top_decile_hit,
         "bottom_decile_hit_pct": bottom_decile_hit,

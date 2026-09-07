@@ -36,6 +36,11 @@ def _api_key() -> str:
 def extract_features(fundamentals: dict, insider_txns: list = None) -> dict:
     """Extract 9 candidate features from a fundamentals JSON + insider txns."""
     f = {}
+    
+    # Sector and industry classification
+    general = fundamentals.get("General", {})
+    f["sector"] = general.get("Sector", "")
+    f["industry"] = general.get("Industry", "")
 
     # EPS surprise (latest quarter actual vs estimate)
     hist = fundamentals.get("Earnings", {}).get("History", {})
@@ -144,11 +149,33 @@ def fetch_feature_map(symbols: list, db_conn=None) -> dict:
 
     # Save to file for reuse
     ok_map = {k: v for k, v in result.items() if v is not None}
-    with open("/app/data/eodhd_features.json", "w") as f:
+    # Save sector and industry information as well
+    sector_map = {}
+    for symbol, features in ok_map.items():
+        sector_map[symbol] = {
+            "sector": features.get("sector", ""),
+            "industry": features.get("industry", "")
+        }
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    with open(os.path.join(data_dir, "sector_map.json"), "w") as f:
+        json.dump(sector_map, f, indent=2)
+    print(f"[EODHD-Features] Saved sector map for {len(sector_map)} symbols to data/sector_map.json", flush=True)
+    
+    with open(os.path.join(data_dir, "eodhd_features.json"), "w") as f:
         json.dump(ok_map, f, indent=2)
     print(f"[EODHD-Features] Saved {len(ok_map)} feature maps to data/eodhd_features.json", flush=True)
 
     return result
+
+
+def load_sector_map() -> dict:
+    """Load sector and industry map from file."""
+    try:
+        with open("/app/data/sector_map.json") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 if __name__ == "__main__":

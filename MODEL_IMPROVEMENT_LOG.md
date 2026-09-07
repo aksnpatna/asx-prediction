@@ -37,7 +37,7 @@
 **Live model today:** LGBM artifact (sha256-verified, mtime-refreshed) trained
 2026-08-15; logistic fallback also retrained on the modern window.
 **Model is FROZEN** under MODEL_LOCK_IN until WFO produces decision-relevant results (~Sep 11, 30 calendar days after first frozen scan on Aug 12).
-**Training set:** Daily incremental refresh (matrix only, Fix 61) keeps data current. Partial forward window (Fix 63) extends max date to ~Aug 17.
+**Training set:** Daily incremental refresh (matrix only, Fix 61) keeps data current. Partial forward window (Fix 63) extends max date to **Aug 27** (latest update).
 
 ---
 
@@ -1220,3 +1220,44 @@ Rollback: revert `smsfUplift.jsx` build + restart backend.
 - Top decile performance improvement of ~1.3pp (from 58.2% to ~59.5%)
 - AUC improvement of ~0.0023 (from 0.744 to ~0.746)
 - Enhanced ability to distinguish between true momentum signals and false positives in different market conditions
+
+---
+
+## TODO for September 12, 2026 (Post-Model-Lock)
+
+### High Priority (1-2pp potential improvement):
+1. **Feature selection optimization using SHAP values**
+   - Run SHAP analysis on current 67-feature set
+   - Remove low-impact features to reduce noise
+   - Target: Keep top 40-50 most impactful features
+
+2. **Enhanced NaN/inf feature handling**
+   - Improve missing value imputation in `_build_feature_matrix`
+   - Add feature-wise missing value indicators
+   - Target: Reduce NaN/inf values in training data by 50%
+
+3. **Ensemble weight optimization**
+   - Use Optuna to optimize blending weights for Ridge + LightGBM + RandomForest
+   - Optimize for top decile hit rate and AUC
+   - Target: Improve ensemble performance by 0.5-1pp
+
+### Mid Priority (0.5-1pp potential improvement):
+4. **Advanced model calibration**
+   - Experiment with temperature scaling and Platt scaling
+   - Compare with current isotonic regression
+   - Target: Improve probability calibration for better risk management
+
+5. **LGBM hyperparameter tuning**
+   - Optimize learning rate, max depth, and number of estimators
+   - Implement early stopping and learning rate decay
+   - Target: Improve LGBM performance by 0.3-0.7pp
+
+6. **Point-in-Time (PIT) feature completeness**
+   - Enhance `_fill_point_in_time_pe` function
+   - Add more PIT features using yfinance historical data
+   - Target: Increase PIT feature coverage to 80% of symbols
+
+### Data Risk Check:
+- **EODHD fundamentals backup:** Need to verify if we have a complete backup of EODHD fundamental data before plan cancellation
+- **Survivorship bias data:** Delisted tickers and OHLC data already backed up (Fix 8)
+- **yfinance fallback:** Already implemented as primary fundamental data source

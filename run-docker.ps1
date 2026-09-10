@@ -1,7 +1,7 @@
-# Run Docker Compose for ASX App and Broker
-# Starts all containers: db, backend, broker-backend, broker-frontend
+# Run Docker Compose for ASX App
+# Starts all containers: db, backend, frontend, n8n
 
-Write-Host "Starting Docker containers for ASX App and Broker..." -ForegroundColor Green
+Write-Host "Starting Docker containers for ASX App..." -ForegroundColor Green
 Write-Host ""
 
 # Get the script directory
@@ -17,8 +17,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host ""
     Write-Host "Services running:" -ForegroundColor Cyan
     Write-Host "  • asx-backend:     http://localhost:8000" -ForegroundColor Yellow
-    Write-Host "  • broker-backend:  http://localhost:8001" -ForegroundColor Yellow
-    Write-Host "  • broker-frontend: http://localhost" -ForegroundColor Yellow
+    Write-Host "  • asx-frontend:    http://localhost:8081" -ForegroundColor Yellow
+    Write-Host "  • n8n:             http://localhost:5678" -ForegroundColor Yellow
     Write-Host "  • Database:        localhost:5432" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "To view logs, run: wsl -u root -- docker logs <container_name> --tail 50" -ForegroundColor Gray

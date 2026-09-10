@@ -845,3 +845,21 @@ body {
 
 /* Screener WFO status line */
 .sx-wfo-screener-status { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #F0F4FF; border-radius: 8px; margin-bottom: 14px; font-size: 13px; border: 1px solid #8B9DC3; }
+
+/* Model Health panel — backtest vs live */
+.sx-health-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 10px 0; }
+.sx-health-cell { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 12px 10px; text-align: center; }
+.sx-health-num { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.sx-health-live { margin: 4px 0 8px; font-size: 14px; font-weight: 600; }
+.sx-health-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--ink-muted); margin: 6px 0; }
+.sx-health-meta b { color: #374151; }
+.sx-health-good { background: #F0F9F4; border-color: #1A6B3C; }
+.sx-health-warn { background: #FFFBEB; border-color: #D97706; }
+.sx-health-bad { background: #FEF2F2; border-color: #DC2626; }
+
+/* Paper trades ledger table */
+.sx-pt-head { font-weight: 700; color: #374151; background: #F9FAFB; }
+.sx-pt-head > span { min-width: 0; }
+@media (max-width: 720px) {
+  .sx-health-grid { grid-template-columns: repeat(2, 1fr); }
+}

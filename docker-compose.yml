@@ -92,71 +92,7 @@ services:
       retries: 5
       start_period: 60s
 
-  broker-backend:
-    build:
-      context: ./broker
-      dockerfile: Dockerfile
-    container_name: broker-backend
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 2048M
-        reservations:
-          memory: 512M
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-asx_user}:${POSTGRES_PASSWORD:-asx_password}@db:5432/${POSTGRES_DB:-asx}
-      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
-      WHATSAPP_BUSINESS_PHONE: ${WHATSAPP_BUSINESS_PHONE:-}
-      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-my_verify_token}
-      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://ollama:11434/v1}
-      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:7b}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_FROM: ${SMTP_FROM:-}
-      N8N_URL: ${N8N_URL:-http://broker-n8n:5678}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:-}
-      TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL:-}
-      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
-      TELEGRAM_ACTION_INGEST_SECRET: ${TELEGRAM_ACTION_INGEST_SECRET:-}
-      ASX_BACKEND_URL: ${ASX_BACKEND_URL:-http://backend:8000}
-    ports:
-      - "8001:8001"
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8001/health\")' 2>/dev/null || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
 
-  broker-frontend:
-    build:
-      context: ./broker-frontend
-      dockerfile: Dockerfile
-    container_name: broker-frontend
-    restart: unless-stopped
-    depends_on:
-      broker-backend:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 128M
-    ports:
-      - "8080:80"
-    environment:
-      - REACT_APP_API_URL=http://localhost:8001
 
   frontend:
     build:
@@ -204,11 +140,11 @@ services:
       start_period: 15s
 
   # ─────────────────────────────────────────────
-  # n8n workflow automation (WhatsApp integration)
+  # n8n workflow automation
   # ─────────────────────────────────────────────
   n8n:
     image: docker.n8n.io/n8nio/n8n:latest
-    container_name: broker-n8n
+    container_name: asx-n8n
     restart: unless-stopped
     depends_on:
       db:
@@ -240,7 +176,7 @@ services:
       - N8N_LOG_LEVEL=info
       - GENERIC_TIMEZONE=Australia/Sydney
       # Pass broker API URL into n8n so workflows can reference it
-      - BROKER_API_URL=http://broker-backend:8001
+
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
     volumes:

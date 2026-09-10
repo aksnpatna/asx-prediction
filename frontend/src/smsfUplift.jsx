@@ -387,6 +387,117 @@ export function LiveValidationPanel({ health, wfo }) {
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Model Health panel — separates IN-SAMPLE (backtest) from LIVE (paper-trade)
+// performance. The single "58% top decile" number is a backtest figure; the
+// live hit rate (real paper trades hitting +8%) is what actually validates the
+// frozen model. Surfacing both side-by-side keeps the dashboard honest.
+// ─────────────────────────────────────────────────────────────────────────────
+export function ModelHealthPanel({ health, model, modelEval, wfoGate }) {
+  const auc = health?.auc ?? model?.auc
+  const topDecile = health?.top_decile ?? model?.top_decile
+  const spread = health?.spread
+  const window = health?.window
+  const sample = health?.sample_size
+  const calibrated = health?.calibrated
+  const le = health?.live_evaluation || modelEval
+  const leStatus = le?.status
+  const leHit = le?.hit_rate
+  const leEval = le?.evaluated
+  const leFreeze = le?.freeze
+  const leWarn = le?.warning
+  const wfoState = wfoGate?.state || health?.wfo_state || 'INSUFFICIENT_DATA'
+
+  const liveLabel = leStatus === 'freeze' ? '🔴 LIVE: FREEZE — new entries paused'
+    : leStatus === 'warning' ? '🟡 LIVE: WARNING — halve satellite size'
+    : leStatus === 'healthy' ? '🟢 LIVE: HEALTHY'
+    : '🔬 LIVE: ACCUMULATING — too few closed trades to judge yet'
+
+  return (
+    <div className="sx-chart">
+      <div className="sx-section-title">MODEL HEALTH — BACKTEST vs LIVE</div>
+      <div className="sx-health-grid">
+        <div className="sx-health-cell">
+          <div className="sx-meta">AUC (backtest)</div>
+          <div className="sx-health-num">{auc != null ? Number(auc).toFixed(3) : '—'}</div>
+        </div>
+        <div className="sx-health-cell">
+          <div className="sx-meta">TOP DECILE (backtest)</div>
+          <div className="sx-health-num">{topDecile != null ? `${topDecile}%` : '—'}</div>
+        </div>
+        <div className="sx-health-cell">
+          <div className="sx-meta">TOP↔BOTTOM SPREAD</div>
+          <div className="sx-health-num">{spread != null ? `${spread}pp` : '—'}</div>
+        </div>
+        <div className={`sx-health-cell ${leStatus === 'freeze' ? 'sx-health-bad' : leStatus === 'warning' ? 'sx-health-warn' : leStatus === 'healthy' ? 'sx-health-good' : ''}`}>
+          <div className="sx-meta">LIVE HIT RATE (paper)</div>
+          <div className="sx-health-num">{leEval > 0 ? `${leHit}%` : '—'}</div>
+        </div>
+      </div>
+      <div className="sx-health-live">{liveLabel}
+        {leEval > 0 && <span className="sx-meta"> — {leHit}% of {leEval} closed paper trades hit +8% (need ≥20 to count)</span>}
+        {leEval === 0 && <span className="sx-meta"> — closed paper trades are being logged toward the 60-trade gate</span>}
+      </div>
+      <div className="sx-health-meta">
+        {window && <span>Training window: <b>{window}</b></span>}
+        {sample != null && <span>{Number(sample).toLocaleString()} training samples</span>}
+        {calibrated != null && <span>{calibrated ? '✅ probability calibrated' : '⚪ uncalibrated'}</span>}
+        <span>WFO state: <b>{wfoState}</b></span>
+      </div>
+      <div className="sx-meta">
+        The backtest numbers are <b>in-sample</b> (trained + tested on history). The
+        live hit rate is the honest out-of-sample test — it's the number that decides
+        when real money is deployed (G-gate).
+      </div>
+    </div>
+  )
+}
+
+// Paper-trades ledger — makes the 60-trade validation gate concrete.
+export function PaperTradesPanel({ token, limit = 6 }) {
+  const { data, loading } = useApi('/paper-trades', token)
+  const trades = Array.isArray(data) ? data : []
+  const open = trades.filter(t => t.status === 'open')
+  const closed = trades.filter(t => t.status === 'closed')
+  const closedWithPnl = closed.filter(t => t.unrealized_pnl_pct != null)
+  const wins = closedWithPnl.filter(t => (t.unrealized_pnl_pct || 0) >= 8).length
+  const hitRate = closedWithPnl.length > 0 ? Math.round(wins / closedWithPnl.length * 100) : null
+  const recent = trades.slice(0, limit)
+  return (
+    <div className="sx-chart">
+      <div className="sx-section-title">PAPER TRADES — MODEL VALIDATION LEDGER</div>
+      <div className="sx-health-grid">
+        <div className="sx-health-cell"><div className="sx-meta">OPEN</div><div className="sx-health-num">{open.length}</div></div>
+        <div className="sx-health-cell"><div className="sx-meta">CLOSED</div><div className="sx-health-num">{closed.length}</div></div>
+        <div className="sx-health-cell"><div className="sx-meta">HIT +8%</div><div className="sx-health-num">{wins}</div></div>
+        <div className="sx-health-cell"><div className="sx-meta">LIVE HIT RATE</div><div className="sx-health-num">{hitRate != null ? `${hitRate}%` : '—'}</div></div>
+      </div>
+      <div className="sx-meta">
+        Gate G3 needs 60 closed v2-model trades. {closed.length}/60 closed so far
+        {hitRate != null && <> · live hit rate {hitRate}% vs 58% backtest</>}.
+      </div>
+      {loading && <div className="sx-meta">Loading paper trades…</div>}
+      {!loading && recent.length > 0 && (
+        <div className="sx-lv-table">
+          <div className="sx-lv-row sx-pt-head">
+            <span>SYMBOL</span><span>ENTRY</span><span>NOW</span><span>P&L</span><span>STATUS</span>
+          </div>
+          {recent.map((t, i) => (
+            <div key={i} className="sx-lv-row">
+              <span className="sx-sym">{t.symbol}</span>
+              <span>{fmtPrice(t.entry_price)}</span>
+              <span>{fmtPrice(t.current_price)}</span>
+              <span className={t.unrealized_pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{t.unrealized_pnl_pct != null ? `${t.unrealized_pnl_pct > 0 ? '+' : ''}${t.unrealized_pnl_pct}%` : '—'}</span>
+              <span className="sx-meta">{t.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {!loading && recent.length === 0 && <div className="sx-meta">No paper trades logged yet.</div>}
+    </div>
+  )
+}
+
 export function CalendarBar() {
   const CAL = [
     { m: 'Jan', stars: 2, note: '' },
@@ -485,6 +596,7 @@ function Screen({ children, title, subtitle, right }) {
 
 export function DashboardScreen({ token, onRunScan }) {
   const { data } = useApi('/dashboard/morning-brief', token)
+  const health = useApi('/model/health-summary', token)
   const [runState, setRunState] = useState('idle')
   const d = data || {}
   const hour = new Date().getHours()
@@ -492,7 +604,6 @@ export function DashboardScreen({ token, onRunScan }) {
   const openCount = d.satellite_summary?.length || 0
   const now = new Date()
   const marketOpen = now.getDay() >= 1 && now.getDay() <= 5 && hour >= 10 && hour < 16
-  const edge = d.model?.top_decile ? (d.model.top_decile / 21.3).toFixed(1) : null
   const posStatus = (p) => {
     if (p.flag === 'target_reached') return { text: 'Target +8% reached — consider selling to lock in the gain.', cls: 'sx-gain' }
     const days = p.days || 0
@@ -565,14 +676,7 @@ export function DashboardScreen({ token, onRunScan }) {
         </div>
       ))}
 
-      <div className="sx-section-title">MODEL HEALTH {d.model?.top_decile != null && d.model.top_decile >= 45 ? '✅ STRONG' : '🟡 WATCH'}</div>
-      <div className="sx-model-plain">
-        {d.model?.top_decile != null ? (
-          <>The AI correctly picked winners in <b>{d.model.top_decile}%</b> of its top-ranked stocks
-            — vs about <b>21%</b> if you picked at random.{edge != null && <> That's <b>{edge}× better than chance</b>.</>}{' '}
-            It learns from the last 10 months of ASX data and re-trains every morning.</>
-        ) : 'Model health data is being prepared — check back after the morning training run.'}
-      </div>
+      <ModelHealthPanel health={health.data} model={d.model} modelEval={d.model_eval} wfoGate={d.wfo_gate} />
       <button className="sx-run-btn" onClick={runScan} disabled={runState === 'running'}>
         {runState === 'running' ? '⏳ SCANNING…' : '🔍 RUN TODAY\'S SCAN'}
       </button>
@@ -698,6 +802,8 @@ export function PortfolioScreen({ token }) {
           <span className="sx-meta">{s.pct}% / {s.cap}% cap</span>
         </div>
       ))}
+
+      <PaperTradesPanel token={token} />
     </Screen>
   )
 }

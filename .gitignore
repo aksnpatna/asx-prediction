@@ -59,3 +59,10 @@ fix_ui_discover.py
 scratch.py
 test.json
 latest_scan*.json
+
+# Local backups (DB dumps, model artifacts, secrets) — never commit
+backups/
+
+# Regenerated data files (backed up separately in backups/)
+backend/data/*.json
+backend/data/eodhd_features.json

@@ -9,10 +9,6 @@ ingress:
     service: http://frontend:80
   - hostname: api.akstest.win
     service: http://backend:8000
-  - hostname: broker.akstest.win
-    service: http://broker-frontend:80
-  - hostname: broker-api.akstest.win
-    service: http://broker-backend:8001
   - hostname: n8n.akstest.win
     service: http://n8n:5678
   - hostname: edu.akstest.win

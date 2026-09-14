@@ -9,6 +9,8 @@ from typing import Dict, Optional
 import requests
 import time
 
+from sqlalchemy import text
+
 
 SANITY_THRESHOLD_PCT = 2.0
 CHECK_TIMEOUT = 10
@@ -30,8 +32,8 @@ def get_asx_close_via_yahoo(symbol: str) -> Optional[float]:
 def get_eodhd_close(conn, symbol: str) -> Optional[float]:
     try:
         row = conn.execute(
-            "SELECT close FROM eod_ohl_history WHERE symbol = :sym "
-            "ORDER BY trade_date DESC LIMIT 1",
+            text("SELECT close FROM eod_ohl_history WHERE symbol = :sym "
+                 "ORDER BY trade_date DESC LIMIT 1"),
             {"sym": symbol.upper()}
         ).fetchone()
         if row:
@@ -67,11 +69,11 @@ def check_data_sanity(conn, symbol: str) -> Dict:
 
 
 def log_sanity_check(conn, result: Dict):
-    conn.execute("""
+    conn.execute(text("""
         INSERT INTO data_sanity_log (checked_at, symbol, sane, gap_pct, eodhd_close,
                                      asx_close, reason, is_stale)
         VALUES (NOW(), :sym, :sane, :gap, :eodhd, :asx, :reason, :stale)
-    """, {
+    """), {
         "sym": result.get("symbol", ""),
         "sane": result["sane"],
         "gap": result["gap_pct"],

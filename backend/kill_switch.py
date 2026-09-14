@@ -13,6 +13,8 @@ Guardrail #16 from the v2 consolidated guardrails.
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
+from sqlalchemy import text
+
 
 KILL_SWITCH_CONDITIONS = ["breaker_l2", "model_freeze", "data_quality_flag"]
 
@@ -42,11 +44,11 @@ def compute_kill_state(breaker_level: str = "NORMAL",
 
 
 def persist_kill_state(conn, state: Dict):
-    conn.execute("""
+    conn.execute(text("""
         INSERT INTO kill_switch_state (recorded_at, halt_all, active_conditions, breaker_level,
                                        model_freeze, data_quality_flag, description)
         VALUES (NOW(), :halt, :conditions, :breaker, :freeze, :dq, :desc)
-    """, {
+    """), {
         "halt": state["halt_all"],
         "conditions": ",".join(state["conditions_active"]),
         "breaker": state["breaker_level"],
@@ -58,11 +60,11 @@ def persist_kill_state(conn, state: Dict):
 
 
 def get_latest_kill_state(conn) -> Optional[Dict]:
-    row = conn.execute(
+    row = conn.execute(text(
         "SELECT halt_all, active_conditions, breaker_level, model_freeze, "
         "data_quality_flag, recorded_at FROM kill_switch_state "
         "ORDER BY recorded_at DESC LIMIT 1"
-    ).fetchone()
+    )).fetchone()
     if not row:
         return {"halt_all": False, "conditions_active": [], "active_count": 0,
                 "breaker_level": "NORMAL", "model_freeze": False, "data_quality_flag": False}

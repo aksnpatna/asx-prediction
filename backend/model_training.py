@@ -211,13 +211,6 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     squeeze_dur = in_squeeze_s * (in_squeeze_s.groupby(in_squeeze_s.diff().ne(0).cumsum()).cumsum())
     fm["squeeze_duration"] = squeeze_dur.fillna(0)
     fm["rsi_during_squeeze"] = (fm["rsi"].fillna(50) * in_squeeze_s).rolling(10, min_periods=1).mean().fillna(50)
-    
-    # ── Interaction features (macro × technical) ───────────────────────────────
-    fm["ix_vix_mom20"] = fm["vix_level"] * fm["momentum_20d"]
-    fm["ix_cg_macd"] = fm["copper_gold_ratio"] * fm["macd_hist"]
-    fm["ix_vix_atr"] = fm["vix_level"] * fm["atr_pct"]
-    fm["ix_yc_mom63"] = fm["yield_curve_slope"] * fm["momentum_63d"]
-
 
     # ── Market regime features ────────────────────────────────────────────────
     sma_alignment = np.where(close > sma20, 0.33, 0) + np.where(sma20 > sma50, 0.33, 0) + np.where(sma50 > sma200, 0.34, 0)
@@ -281,9 +274,6 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     fm["regime_sma_alignment"] = fm["regime_sma_alignment"].fillna(0.5)
     fm["vwap_position"] = fm["vwap_position"].fillna(1.0)
     fm["gap_detection"] = fm["gap_detection"].fillna(0)
-    fm["regime_bull"] = fm["regime_bull"].fillna(0.0)
-    fm["regime_neutral"] = fm["regime_neutral"].fillna(1.0)
-    fm["regime_bear"] = fm["regime_bear"].fillna(0.0)
     fm["vol_regime_ratio"] = fm["vol_regime_ratio"].fillna(1.0)
     fm["garman_klass_vol"] = fm["garman_klass_vol"].fillna(0)
     fm["parkinson_vol"] = fm["parkinson_vol"].fillna(0)

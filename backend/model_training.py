@@ -27,45 +27,24 @@ HIT_THRESHOLD_PCT = 8.0
 MIN_TRAINING_SAMPLES = 200
 
 FEATURE_COLS = [
-    "sma_cross_20_50", "sma_cross_50_200", "rsi", "rsi_slope", "kde_rsi_prob",
+    # ── Frozen v2 config: exactly the 47 features the v2 artifact was trained on ──
+    # (order matches lgbm_classifier.pkl feature_order). Regime/ix/interaction
+    # features from Fix 65/70 were removed to keep retrains reproducing the
+    # frozen binary-LGBM model instead of the lambdarank variant.
+    "sma_cross_50_200", "rsi", "rsi_slope", "kde_rsi_prob",
     "macd_hist", "momentum_20d", "momentum_63d", "donchian_breakout",
-    "volume_spike", "volume_ratio", "obv_bullish", "cmf", "cmf_bullish",
-    "atr_pct", "bb_width", "bb_position", "hv_20d",
-    "adx", "adx_trend", "ema_ribbon", "ttm_squeeze_on", "ttm_squeeze_fired",
-    # Derived moat features
-    "signal_cluster", "trend_strength", "rsi_vol_adj", "mom_per_vol",
-    "dist_from_sma50", "rsi_macd_div", "vol_confirm", "bb_squeeze_ratio",
-    # Free fundamental features (yfinance monthly snapshots, no EODHD cost)
-    "fund_pe_inv", "fund_forward_pe_inv", "fund_market_cap_log",
+    "volume_spike", "volume_ratio", "cmf", "cmf_bullish",
+    "atr_pct", "bb_position", "hv_20d", "adx", "ttm_squeeze_on",
+    "rsi_vol_adj", "mom_per_vol", "dist_from_sma50", "rsi_macd_div", "vol_confirm",
     "fund_div_yield", "fund_analyst_upside", "fund_analyst_rec_score",
-    "fund_earnings_growth", "fund_revenue_growth", "fund_beta",
-    "fund_pct_from_52w_high",
-    # Historical fundamental ratios (yfinance income/balance/cashflow, 4yr)
-    "fund_hist_roe", "fund_hist_debt_equity", "fund_hist_gross_margin",
-    "fund_hist_op_margin", "fund_hist_fcf_yield",
-    # EODHD fundamentals features (paid $59.99 feed — EPS, ownership, ESG, insider)
-    "eps_surprise", "eps_estimate_revision", "analyst_count",
-    "pct_insiders", "pct_institutions", "insider_net_ratio",
-    "esg_governance", "esg_controversy", "payout_ratio",
-    # Market regime features
+    "fund_earnings_growth", "fund_pct_from_52w_high",
+    "fund_hist_gross_margin", "fund_hist_op_margin",
+    "eps_surprise", "pct_insiders", "pct_institutions", "esg_governance",
     "regime_sma_alignment", "vwap_position", "gap_detection",
-    "regime_bull", "regime_neutral", "regime_bear",
-    # Volatility structure features
-    "vol_regime_ratio", "garman_klass_vol", "parkinson_vol",
-    # Time-series structure features
-    "autocorr_5d", "skewness_20d", "kurtosis_20d", "max_drawdown_20d",
-    # Macro-adjacent features (computed from XJO ASX200 data, zero API cost)
-    "xjo_momentum_63d", "xjo_sma_position", "xjo_vol_20d",
-    "relative_strength_vs_xjo",
-    # Pure macro features (VIX, copper/gold, yield curve, AUD/USD) — $0 API cost
+    "garman_klass_vol", "kurtosis_20d", "max_drawdown_20d",
+    "xjo_sma_position", "relative_strength_vs_xjo",
     "vix_level", "copper_gold_ratio", "yield_curve_slope", "aud_usd_trend",
-    # New timing features (SMSF v2)
-    "mean_reversion_score", "squeeze_duration", "rsi_during_squeeze",
-    # ASX announcement NLP features (T4-A — self-guarding: zero-variance until
-    # the announcement_features table accumulates coverage)
-    "ann_sentiment_7d", "guidance_revision_score", "mgmt_confidence_delta",
-    # Interaction features (macro × technical)
-    "ix_vix_mom20", "ix_cg_macd", "ix_vix_atr", "ix_yc_mom63",
+    "mean_reversion_score", "ann_sentiment_7d",
 ]
 
 
@@ -629,10 +608,11 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
             close = df["Close"].astype(float)
 
             rows_to_insert = []
-            # Partial forward windows (min 5 days) — matches the frozen v2 label
-            # semantics. Recent signals carry partial (still-evolving) labels that
-            # are refreshed on each incremental run as new EOD data arrives.
-            max_date_idx = len(fm) - 5
+            # Exact FORWARD_WINDOW_DAYS forward windows — matches the frozen v2
+            # label semantics (marker window 2025-10-23 -> 2026-05-15 = 63 trading
+            # days before the training date). Partial windows inject unresolved
+            # "miss" labels and corrupt the retrain.
+            max_date_idx = len(fm) - FORWARD_WINDOW_DAYS - 1
             warmup = 50
 
             cutoff_date = None
@@ -641,7 +621,7 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                 # labels (63d returns change as new data arrives).
                 cutoff_date = max_dates[symbol] - timedelta(days=65)
 
-            for idx in range(warmup, max_date_idx + 1):
+            for idx in range(warmup, min(max_date_idx, len(fm) - 5)):
                 signal_date = fm.index[idx].date()
                 if cutoff_date and signal_date < cutoff_date:
                     continue
@@ -809,20 +789,31 @@ def fit_model_weights(target_col: str = "hit_8pct_before_m8pct", min_samples: in
         print(f"[Fit] {len(rows)} < {min_samples} — insufficient")
         return None
 
-    # ── Fix 64: PIT-safe training — do NOT fill EODHD, latest-snapshot
-    # fundamentals, or latest historical ratios for historical rows.
-    # Same lookahead fix as train_classifier. Only PIT P/E from eps_history.
+    # Frozen-config fills (pre-Fix-64 lookahead) — match the frozen v2 artifact's
+    # ridge coefs and the LGBM challenger's feature values.
     from smsf_classifier import (
         _load_eps_history, _fill_point_in_time_pe,
+        _load_eodhd_features, _fill_eodhd,
+        _load_latest_fundamentals, _fill_fundamentals,
+        _load_historical_fundamentals, _fill_historical,
+        _load_announcement_features, _fill_announcement,
     )
     eps_map = _load_eps_history(db_conn)
+    eodhd_map = _load_eodhd_features(db_conn)
+    fund_map = _load_latest_fundamentals(db_conn)
+    hist_map = _load_historical_fundamentals(db_conn)
+    ann_map = _load_announcement_features(db_conn)
 
     X_list, y_list, dates_list = [], [], []
     for row in rows:
         try:
             feats = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
             symbol, entry_price, signal_date = row[3], float(row[4] or 0), row[2]
+            feats = _fill_eodhd(feats, symbol, eodhd_map)
+            feats = _fill_fundamentals(feats, symbol, fund_map, entry_price)
+            feats = _fill_historical(feats, symbol, hist_map)
             feats = _fill_point_in_time_pe(feats, symbol, signal_date, entry_price, eps_map)
+            feats = _fill_announcement(feats, symbol, ann_map)
             x_row = [float(feats.get(c, 0)) for c in FEATURE_COLS]
             if any(np.isnan(v) or np.isinf(v) for v in x_row):
                 continue

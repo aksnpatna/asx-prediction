@@ -629,17 +629,16 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
             close = df["Close"].astype(float)
 
             rows_to_insert = []
-            # ONLY include complete forward windows to ensure label consistency
-            # All training samples must have exactly FORWARD_WINDOW_DAYS of future data
-            # This fixes the label inconsistency caused by partial forward windows
-            max_date_idx = len(fm) - FORWARD_WINDOW_DAYS - 1
+            # Partial forward windows (min 5 days) — matches the frozen v2 label
+            # semantics. Recent signals carry partial (still-evolving) labels that
+            # are refreshed on each incremental run as new EOD data arrives.
+            max_date_idx = len(fm) - 5
             warmup = 50
 
             cutoff_date = None
             if incremental and symbol in max_dates:
                 # Re-process the last 65 days of known signals to update forward-looking
-                # labels (63d returns change as new data arrives). Only include complete
-                # forward windows in the training set.
+                # labels (63d returns change as new data arrives).
                 cutoff_date = max_dates[symbol] - timedelta(days=65)
 
             for idx in range(warmup, max_date_idx + 1):
@@ -661,11 +660,10 @@ def build_training_matrix(market: str = "AU", lookback_days: int = 2268, increme
                     else:
                         feat_row[col] = round(float(v), 8)
 
-                # Get EXACTLY FORWARD_WINDOW_DAYS of future data
-                max_i = idx + FORWARD_WINDOW_DAYS + 1
+                # Get up to FORWARD_WINDOW_DAYS of future data (partial allowed)
+                max_i = min(idx + FORWARD_WINDOW_DAYS + 1, len(close))
                 future = close.iloc[idx + 1 : max_i]
-                # Verify we have complete future data
-                if len(future) != FORWARD_WINDOW_DAYS:
+                if len(future) < 5:
                     continue
 
                 fwd_close_63d = float(close.iloc[max_i - 1]) if max_i - 1 < len(close) else float(close.iloc[-1])

@@ -99,6 +99,19 @@ the real validation is the WFO paper-trade evidence, not further in-sample tunin
 - **Groq** (`bef23ddd-…`) — returns **401 Invalid API Key**. Present in the order but will not
   authenticate; the key needs to be re-issued (`gsk_…` format expected).
 
+### Later fixes (2026-09-14)
+
+- **Kill switch silent failure** — `backend/kill_switch.py` and `backend/data_sanity.py` called
+  `conn.execute("raw SQL")` without `text()`, raising `Not an executable object` under SQLAlchemy 2.x
+  and silently breaking kill-switch persistence (Guardrail #16). Wrapped in `text()`, verified
+  persist+read, copied into the running container, committed (`22241b9`).
+- **Telegram restored** — `TELEGRAM_BOT_TOKEN` was missing (wiped during the prior agent's Sep 8–9
+  `.env` edits; last successful send was 2026-09-08 07:39). Added bot `@Aksnpatbot`
+  (ID `8661453447`) token to `.env`, corrected the recipient chat_id to `8761969021` (the user's
+  `8661453447` is the BOT id, not the chat id — `sendMessage` to it returns "can't send messages to
+  the bot"), recreated the backend, and verified an end-to-end send (`sent=True`, `success_count=1`).
+  Bot webhook remains active at `https://api.akstest.win/api/telegram/bot-webhook`.
+
 ---
 
 ## 6. UI uplift (frontend)

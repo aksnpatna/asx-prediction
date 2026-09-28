@@ -130,7 +130,7 @@ function PriceSpark({ spark }) {
   )
 }
 
-export function WFOGatePill({ gate, watchlist, modelEval }) {
+export function WFOGatePill({ gate, watchlist, model }) {
   const state = gate?.state || 'INSUFFICIENT_DATA'
   const cfg = {
     INSUFFICIENT_DATA: { cls: 'sx-wfo-insuff', icon: '🔬', label: 'ACCUMULATING' },
@@ -142,8 +142,7 @@ export function WFOGatePill({ gate, watchlist, modelEval }) {
   const deployable = gate?.deployableCount || watchlist?.length || 0
   const remaining = gate?.frozen_signals_remaining
   const firstResult = gate?.first_result_calendar
-  const evalRate = modelEval?.hit_rate
-  const evalCount = modelEval?.evaluated
+  const topDecile = model?.top_decile
   return (
     <div className={`sx-wfo-gate ${cfg.cls}`}>
       <div className="sx-wfo-main">
@@ -164,10 +163,10 @@ export function WFOGatePill({ gate, watchlist, modelEval }) {
           <b>{deployable}</b>
           <span>DEPLOYABLE NOW</span>
         </div>
-        {evalCount > 0 && (
+        {topDecile != null && (
           <div className="sx-wfo-stat">
-            <b>{evalRate}%</b>
-            <span>LIVE HIT RATE ({evalCount})</span>
+            <b>{topDecile}%</b>
+            <span>TOP-DECILE (TRAIN)</span>
           </div>
         )}
         <div className="sx-wfo-stat">
@@ -388,112 +387,54 @@ export function LiveValidationPanel({ health, wfo }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Model Health panel — separates IN-SAMPLE (backtest) from LIVE (paper-trade)
-// performance. The single "58% top decile" number is a backtest figure; the
-// live hit rate (real paper trades hitting +8%) is what actually validates the
-// frozen model. Surfacing both side-by-side keeps the dashboard honest.
+// Model Training panel — the honest, IN-SAMPLE (backtest) metrics of the locked
+// model, plus its WFO gate state. Paper-trade P&L is intentionally NOT shown
+// here: the frozen model has not yet produced matured trades, so a "live hit
+// rate" would be misleading. Out-of-sample truth lives in Live Validation.
 // ─────────────────────────────────────────────────────────────────────────────
-export function ModelHealthPanel({ health, model, modelEval, wfoGate }) {
+export function ModelHealthPanel({ health, model, wfoGate }) {
   const auc = health?.auc ?? model?.auc
   const topDecile = health?.top_decile ?? model?.top_decile
   const spread = health?.spread
   const window = health?.window
   const sample = health?.sample_size
   const calibrated = health?.calibrated
-  const le = health?.live_evaluation || modelEval
-  const leStatus = le?.status
-  const leHit = le?.hit_rate
-  const leEval = le?.evaluated
-  const leFreeze = le?.freeze
-  const leWarn = le?.warning
+  const brier = health?.brier_calibrated
   const wfoState = wfoGate?.state || health?.wfo_state || 'INSUFFICIENT_DATA'
-
-  const liveLabel = leStatus === 'freeze' ? '🔴 LIVE: FREEZE — new entries paused'
-    : leStatus === 'warning' ? '🟡 LIVE: WARNING — halve satellite size'
-    : leStatus === 'healthy' ? '🟢 LIVE: HEALTHY'
-    : '🔬 LIVE: ACCUMULATING — too few closed trades to judge yet'
 
   return (
     <div className="sx-chart">
-      <div className="sx-section-title">MODEL HEALTH — BACKTEST vs LIVE</div>
+      <div className="sx-section-title">MODEL TRAINING — VALIDATION DATA</div>
       <div className="sx-health-grid">
         <div className="sx-health-cell">
-          <div className="sx-meta">AUC (backtest)</div>
+          <div className="sx-meta">AUC (in-sample)</div>
           <div className="sx-health-num">{auc != null ? Number(auc).toFixed(3) : '—'}</div>
         </div>
         <div className="sx-health-cell">
-          <div className="sx-meta">TOP DECILE (backtest)</div>
+          <div className="sx-meta">TOP DECILE HIT (in-sample)</div>
           <div className="sx-health-num">{topDecile != null ? `${topDecile}%` : '—'}</div>
         </div>
         <div className="sx-health-cell">
           <div className="sx-meta">TOP↔BOTTOM SPREAD</div>
           <div className="sx-health-num">{spread != null ? `${spread}pp` : '—'}</div>
         </div>
-        <div className={`sx-health-cell ${leStatus === 'freeze' ? 'sx-health-bad' : leStatus === 'warning' ? 'sx-health-warn' : leStatus === 'healthy' ? 'sx-health-good' : ''}`}>
-          <div className="sx-meta">LIVE HIT RATE (paper)</div>
-          <div className="sx-health-num">{leEval > 0 ? `${leHit}%` : '—'}</div>
+        <div className="sx-health-cell">
+          <div className="sx-meta">TRAINING SAMPLES</div>
+          <div className="sx-health-num">{sample != null ? Number(sample).toLocaleString() : '—'}</div>
         </div>
-      </div>
-      <div className="sx-health-live">{liveLabel}
-        {leEval > 0 && <span className="sx-meta"> — {leHit}% of {leEval} closed paper trades hit +8% (need ≥20 to count)</span>}
-        {leEval === 0 && <span className="sx-meta"> — closed paper trades are being logged toward the 60-trade gate</span>}
       </div>
       <div className="sx-health-meta">
         {window && <span>Training window: <b>{window}</b></span>}
-        {sample != null && <span>{Number(sample).toLocaleString()} training samples</span>}
         {calibrated != null && <span>{calibrated ? '✅ probability calibrated' : '⚪ uncalibrated'}</span>}
+        {brier != null && <span>Brier (calibrated): <b>{Number(brier).toFixed(4)}</b></span>}
         <span>WFO state: <b>{wfoState}</b></span>
       </div>
       <div className="sx-meta">
-        The backtest numbers are <b>in-sample</b> (trained + tested on history). The
-        live hit rate is the honest out-of-sample test — it's the number that decides
-        when real money is deployed (G-gate).
+        These are the locked model's <b>training / backtest</b> metrics. Real-world
+        performance is validated <b>out-of-sample</b> via walk-forward (WFO) — see
+        <b> Live Validation</b> on the Wealth tab for the honest numbers that decide
+        when real money is deployed.
       </div>
-    </div>
-  )
-}
-
-// Paper-trades ledger — makes the 60-trade validation gate concrete.
-export function PaperTradesPanel({ token, limit = 6 }) {
-  const { data, loading } = useApi('/paper-trades', token)
-  const trades = Array.isArray(data) ? data : []
-  const open = trades.filter(t => t.status === 'open')
-  const closed = trades.filter(t => t.status === 'closed')
-  const closedWithPnl = closed.filter(t => t.unrealized_pnl_pct != null)
-  const wins = closedWithPnl.filter(t => (t.unrealized_pnl_pct || 0) >= 8).length
-  const hitRate = closedWithPnl.length > 0 ? Math.round(wins / closedWithPnl.length * 100) : null
-  const recent = trades.slice(0, limit)
-  return (
-    <div className="sx-chart">
-      <div className="sx-section-title">PAPER TRADES — MODEL VALIDATION LEDGER</div>
-      <div className="sx-health-grid">
-        <div className="sx-health-cell"><div className="sx-meta">OPEN</div><div className="sx-health-num">{open.length}</div></div>
-        <div className="sx-health-cell"><div className="sx-meta">CLOSED</div><div className="sx-health-num">{closed.length}</div></div>
-        <div className="sx-health-cell"><div className="sx-meta">HIT +8%</div><div className="sx-health-num">{wins}</div></div>
-        <div className="sx-health-cell"><div className="sx-meta">LIVE HIT RATE</div><div className="sx-health-num">{hitRate != null ? `${hitRate}%` : '—'}</div></div>
-      </div>
-      <div className="sx-meta">
-        Gate G3 needs 60 closed v2-model trades. {closed.length}/60 closed so far
-        {hitRate != null && <> · live hit rate {hitRate}% vs 58% backtest</>}.
-      </div>
-      {loading && <div className="sx-meta">Loading paper trades…</div>}
-      {!loading && recent.length > 0 && (
-        <div className="sx-lv-table">
-          <div className="sx-lv-row sx-pt-head">
-            <span>SYMBOL</span><span>ENTRY</span><span>NOW</span><span>P&L</span><span>STATUS</span>
-          </div>
-          {recent.map((t, i) => (
-            <div key={i} className="sx-lv-row">
-              <span className="sx-sym">{t.symbol}</span>
-              <span>{fmtPrice(t.entry_price)}</span>
-              <span>{fmtPrice(t.current_price)}</span>
-              <span className={t.unrealized_pnl_pct >= 0 ? 'sx-gain' : 'sx-loss'}>{t.unrealized_pnl_pct != null ? `${t.unrealized_pnl_pct > 0 ? '+' : ''}${t.unrealized_pnl_pct}%` : '—'}</span>
-              <span className="sx-meta">{t.status}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {!loading && recent.length === 0 && <div className="sx-meta">No paper trades logged yet.</div>}
     </div>
   )
 }
@@ -629,7 +570,7 @@ export function DashboardScreen({ token, onRunScan }) {
             : 'The market is closed right now — the next scan runs before open.'}
       </div>
       <CircuitBreakerBanner level={d.circuit_breaker?.level} drawdown_pct={d.circuit_breaker?.drawdown_pct} vix={d.regime?.vix} xjo={d.regime?.xjo_vs_sma200_pct} />
-      <WFOGatePill gate={d.wfo_gate} watchlist={d.watchlist} modelEval={d.model_eval} />
+      <WFOGatePill gate={d.wfo_gate} watchlist={d.watchlist} model={d.model} />
       <div className="sx-regime">
         ● MARKET OUTLOOK: <b>{d.regime?.label || 'UNKNOWN'}</b>
         {d.regime?.vix != null && <> — volatility (VIX {d.regime.vix}) is {d.regime.vix < 15 ? 'very calm' : d.regime.vix < 20 ? 'calm' : d.regime.vix < 25 ? 'elevated' : 'high'}</>}
@@ -676,7 +617,7 @@ export function DashboardScreen({ token, onRunScan }) {
         </div>
       ))}
 
-      <ModelHealthPanel health={health.data} model={d.model} modelEval={d.model_eval} wfoGate={d.wfo_gate} />
+      <ModelHealthPanel health={health.data} model={d.model} wfoGate={d.wfo_gate} />
       <button className="sx-run-btn" onClick={runScan} disabled={runState === 'running'}>
         {runState === 'running' ? '⏳ SCANNING…' : '🔍 RUN TODAY\'S SCAN'}
       </button>
@@ -753,6 +694,7 @@ export function ScreenerScreen({ token, onRunScan }) {
 export function PortfolioScreen({ token }) {
   const { data } = useApi('/portfolio/nav-breakdown', token)
   const breaker = useApi('/smsf/dashboard', token)
+  const health = useApi('/model/health-summary', token)
   const d = data || {}
   const cb = breaker.data?.circuit_breaker || {}
   return (
@@ -803,7 +745,7 @@ export function PortfolioScreen({ token }) {
         </div>
       ))}
 
-      <PaperTradesPanel token={token} />
+      <ModelHealthPanel health={health.data} />
     </Screen>
   )
 }

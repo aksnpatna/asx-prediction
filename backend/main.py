@@ -13933,7 +13933,7 @@ def _scheduled_walk_forward_oos():
             except Exception:
                 continue
 
-         n_total = len(evaluated)
+        n_total = len(evaluated)
         if dropped_corporate_action > 0:
             print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
         

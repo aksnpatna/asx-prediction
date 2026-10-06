@@ -47,8 +47,8 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
-      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://ollama:11434/v1}
-      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:7b}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://host.docker.internal:8002/v1}
+      LOCAL_LLM_MODEL: ${LOCAL_LLM_MODEL:-deepseek-r1:14b}
       LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-deepseek,nvidia,groq,local,openai}
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
       NVIDIA_MODEL: ${NVIDIA_MODEL:-meta/llama-3.3-70b-instruct}
@@ -112,82 +112,12 @@ services:
     ports:
       - "8081:80"
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: asx-ollama
-    profiles: ["local-llm"]
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 6144M
-        reservations:
-          memory: 2048M
-    environment:
-      - OLLAMA_HOST=0.0.0.0
-      - OLLAMA_NUM_PARALLEL=1
-      - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_KEEP_ALIVE=24h
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-
-  # ─────────────────────────────────────────────
-  # n8n workflow automation
-  # ─────────────────────────────────────────────
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
-    container_name: asx-n8n
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_HOST=${N8N_HOST:-n8n.akstest.win}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=${N8N_PROTOCOL:-https}
-      - WEBHOOK_URL=https://${N8N_HOST:-n8n.akstest.win}/
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme_n8n}
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:-change-this-32-char-encryption-key}
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=db
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB:-asx}
-      - DB_POSTGRESDB_USER=${POSTGRES_USER:-asx_user}
-      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD:-asx_password}
-      - DB_POSTGRESDB_SCHEMA=n8n
-      - N8N_LOG_LEVEL=info
-      - GENERIC_TIMEZONE=Australia/Sydney
-      # Pass broker API URL into n8n so workflows can reference it
-
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-    volumes:
-      - n8n_data:/home/node/.n8n
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-
+  # NOTE: the local `ollama` service was removed. All local LLM inference now
+  # routes through the central guardrail gateway in
+  # /home/aksai/projects/local_llm_server (llama-swap + gateway.py on host
+  # port 8002). A local ollama container would grab an exclusive GPU lock and
+  # starve the shared gateway and other apps. asx-backend reaches the gateway
+  # via LOCAL_LLM_URL (see .env).
   cloudflared:
     build:
       context: .
@@ -198,8 +128,6 @@ services:
       frontend:
         condition: service_started
       backend:
-        condition: service_healthy
-      n8n:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -230,5 +158,3 @@ networks:
 volumes:
   postgres_data:
   backend_data:
-  ollama_data:
-  n8n_data:

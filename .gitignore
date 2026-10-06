@@ -66,3 +66,4 @@ backups/
 # Regenerated data files (backed up separately in backups/)
 backend/data/*.json
 backend/data/eodhd_features.json
+weekly.log

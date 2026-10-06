@@ -11887,14 +11887,19 @@ def _scheduled_uat_health_report():
     except Exception:
         lines.append(f"⚠️ EODHD API: CONNECTION FAILED")
 
-    # 3. Signal accumulation toward WFO Day 30
+    # 3. Signal accumulation toward WFO Day 30 (FROZEN model signals only —
+    # the `10pct`/`8pct` tier picks in wealth_scan_history, matching what the
+    # WFO engine actually evaluates; the legacy wealth_builder_evaluations table
+    # is NOT the frozen model).
     try:
         with db_conn() as conn:
             for horizon_days in [30, 63, 90]:
                 cutoff = today - timedelta(days=horizon_days)
                 cache_count = conn.execute(text("""
-                    SELECT COUNT(DISTINCT DATE(screened_at)) FROM wealth_builder_evaluations
-                    WHERE screened_at <= :cutoff
+                    SELECT COUNT(DISTINCT DATE(generated_at)) FROM wealth_scan_history
+                    WHERE scan_mode = 'broad'
+                      AND picks::text LIKE '%10pct%'
+                      AND generated_at <= :cutoff
                 """), {"cutoff": cutoff.isoformat()}).fetchone()
                 wfo_row = conn.execute(text("""
                     SELECT notes FROM wfo_metrics
@@ -11904,7 +11909,8 @@ def _scheduled_uat_health_report():
                 status = wfo_row[0][:60] if wfo_row and wfo_row[0] else "not yet checked"
 
                 earliest_scan = conn.execute(text("""
-                    SELECT MIN(screened_at) FROM wealth_builder_evaluations
+                    SELECT MIN(generated_at) FROM wealth_scan_history
+                    WHERE scan_mode = 'broad' AND picks::text LIKE '%10pct%'
                 """)).fetchone()
 
                 if earliest_scan and earliest_scan[0]:
@@ -12083,7 +12089,7 @@ def _scheduled_uat_health_report():
     except Exception as e:
         print(f"[UATHealth] Broadcast failed: {e}")
 
-    print(f"[UATHealth] Report sent. {days_accumulated if 'days_accumulated' in dir() else 0}/30 days to WFO Day 30.")
+    print(f"[UATHealth] Report sent. Frozen-model signal accumulation checked (see horizon lines above).")
     # ── Expanded universe via EODHD (falls back to hardcoded if key not set) ──
     # BROAD_SCAN_CAP caps the number of tickers per run so a mini-PC (6800H)
     # finishes in a reasonable time (~500 stocks × 0.3s = ~2.5 minutes).
@@ -13158,6 +13164,23 @@ def _scheduled_v2_daily_scan():
     market = "AU"
     today_key = datetime.utcnow().date().isoformat()
 
+    # ── Per-day idempotency guard ─────────────────────────────────────────
+    # The scan is triggered by BOTH the 8am cron and the startup catch-up
+    # engine. Claim today's run_date atomically so a restart later in the day
+    # never re-runs the whole heavy pipeline (universe scoring + AI deep-dive).
+    try:
+        with db_conn() as conn:
+            claimed = conn.execute(text(
+                "INSERT INTO daily_ai_runs (run_date) VALUES (:today) "
+                "ON CONFLICT (run_date) DO NOTHING RETURNING id"
+            ), {"today": today_key}).fetchone()
+            conn.commit()
+            if not claimed:
+                print(f"[V2DailyScan] Already ran today ({today_key}) — skipping.")
+                return
+    except Exception as e:
+        print(f"[V2DailyScan] run-date guard unavailable (continuing): {e}")
+
     try:
         from config.universe import get_universe_symbols
         # Fetch 500 liquid symbols (core + broad)
@@ -13920,6 +13943,7 @@ def _scheduled_walk_forward_oos():
 
                 evaluated.append({
                     "symbol": sig["symbol"],
+                    "screened_at": sig["screened_at"],
                     "predicted_change_pct": sig["predicted_change_pct"],
                     "actual_return_pct": round(actual_return, 2),
                     "direction_correct": direction_correct,
@@ -13938,10 +13962,10 @@ def _scheduled_walk_forward_oos():
             print(f"[WFO] h{horizon_days}d: dropped {dropped_corporate_action} signals with corporate actions / extreme gaps.")
         
         # Run purged and embargoed WFO analysis
-        if horizon_days == 63:  # Only run for main label horizon
+        if horizon_days == 63 and evaluated:  # Only run for main label horizon, and only with data
             # Convert to DataFrame for easier handling
             df = pd.DataFrame(evaluated)
-            df["screened_at"] = df["screened_at"]
+            df["screened_at"] = pd.to_datetime(df["screened_at"])
             df = df.sort_values("screened_at").reset_index(drop=True)
             
             folds = []

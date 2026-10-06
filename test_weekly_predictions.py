@@ -4,26 +4,28 @@
 import requests
 import json
 
-# Get token (use the test login)
+# Try login directly since user is probably already registered
 login_response = requests.post(
-    "http://localhost:8000/api/auth/register",
-    json={
-        "full_name": "Test User",
-        "email": "test-weekly@example.com",
-        "password": "TestPassword123!"
-    }
+    "http://localhost:8000/api/auth/login",
+    json={"email": "test-weekly@example.com", "password": "TestPassword123!"}
 )
+token = login_response.json().get("access_token")
 
-# Get existing user token
-try:
-    token = login_response.json().get("token")
-except:
-    # Try login if already registered
+if not token:
+    # Try register if login failed
+    login_response = requests.post(
+        "http://localhost:8000/api/auth/register",
+        json={
+            "full_name": "Test User",
+            "email": "test-weekly@example.com",
+            "password": "TestPassword123!"
+        }
+    )
     login_response = requests.post(
         "http://localhost:8000/api/auth/login",
         json={"email": "test-weekly@example.com", "password": "TestPassword123!"}
     )
-    token = login_response.json().get("token", "")
+    token = login_response.json().get("access_token", "")
 
 if token:
     # Test ANZ analysis with new weekly_data

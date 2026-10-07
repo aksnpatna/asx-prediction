@@ -13162,7 +13162,10 @@ def _scheduled_v2_daily_scan():
 
     print("[V2DailyScan] Starting V2 daily scan pipeline...")
     market = "AU"
-    today_key = datetime.utcnow().date().isoformat()
+    # Use the scheduler (local) date, not UTC — the 8am cron runs at 21:00 UTC
+    # the *previous* day, so a UTC date key would collide with yesterday's run
+    # and skip the whole local day.
+    today_key = _daily_digest_cache_key()
 
     # ── Per-day idempotency guard ─────────────────────────────────────────
     # The scan is triggered by BOTH the 8am cron and the startup catch-up

@@ -12132,7 +12132,7 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
     try:
         now = datetime.utcnow()
         min_interval_minutes = max(1, int(os.getenv("PAPER_MONITOR_MIN_INTERVAL_MIN", "10")))
-        configured_max = max(10, int(os.getenv("PAPER_MONITOR_MAX_TRADES", "250")))
+        configured_max = max(10, int(os.getenv("PAPER_MONITOR_MAX_TRADES", "500")))
         if max_trades_override is not None:
             max_trades_per_cycle = max(10, min(int(max_trades_override), configured_max))
         else:
@@ -12141,6 +12141,7 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
         price_cache: dict[tuple[str, str], float] = {}
         recipients_cache: dict[str, list[dict]] = {}
         valuation_cache: dict[str, dict] = {}
+        ind_cache: dict[str, dict] = {}
 
         with db_conn() as conn:
             trades = conn.execute(text("""
@@ -12154,130 +12155,132 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                 LIMIT :max_trades
             """), {"check_before": check_before, "max_trades": max_trades_per_cycle}).fetchall()
 
-            if not trades:
-                return
-            
-            for t in trades:
-                (trade_id, user_id, symbol, market, side, qty, entry, last_cp, target,
-                 peak, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
-                 last_alert_at, last_checked_at, created_at, notes) = t
+        if not trades:
+            return
 
-                cache_key = (symbol, market or "AU")
-                if cache_key in price_cache:
-                    cp = price_cache[cache_key]
-                else:
-                    stock_data = get_stock_data(symbol, market)
-                    cp = float(stock_data.get("current_price") or last_cp or 0)
-                    price_cache[cache_key] = cp
+        for t in trades:
+            (trade_id, user_id, symbol, market, side, qty, entry, last_cp, target,
+             peak, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
+             last_alert_at, last_checked_at, created_at, notes) = t
 
-                recipients = recipients_cache.get(user_id)
-                if recipients is None:
-                    recipients = get_user_telegram_recipients(user_id)
-                    recipients_cache[user_id] = recipients
-                
-                if cp <= 0:
+            cache_key = (symbol, market or "AU")
+            if cache_key in price_cache:
+                cp = price_cache[cache_key]
+            else:
+                stock_data = get_stock_data(symbol, market)
+                cp = float(stock_data.get("current_price") or last_cp or 0)
+                price_cache[cache_key] = cp
+
+            recipients = recipients_cache.get(user_id)
+            if recipients is None:
+                recipients = get_user_telegram_recipients(user_id)
+                recipients_cache[user_id] = recipients
+
+            if cp <= 0:
+                with db_conn() as conn:
                     conn.execute(text("UPDATE paper_trades SET last_checked_at = :now WHERE id = :tid"), {"now": now, "tid": trade_id})
-                    continue
+                continue
 
-                in_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=6))
-                stage_update = None
-                alert = None
+            in_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=6))
+            stage_update = None
+            alert = None
 
-                # ── P&L context helpers ────────────────────────────────────────
-                direction = -1.0 if (side or "LONG") == "SHORT" else 1.0
-                entry_f = float(entry or 0)
-                qty_f = float(qty or 1)
-                gross_pnl = (cp - entry_f) * qty_f * direction
-                pnl_pct = ((cp - entry_f) / entry_f * 100 * direction) if entry_f > 0 else 0
-                pnl_emoji = "🟢" if gross_pnl >= 0 else "🔴"
-                days_held = (now - created_at).days if created_at else 0
+            # ── P&L context helpers ────────────────────────────────────────
+            direction = -1.0 if (side or "LONG") == "SHORT" else 1.0
+            entry_f = float(entry or 0)
+            qty_f = float(qty or 1)
+            gross_pnl = (cp - entry_f) * qty_f * direction
+            pnl_pct = ((cp - entry_f) / entry_f * 100 * direction) if entry_f > 0 else 0
+            pnl_emoji = "🟢" if gross_pnl >= 0 else "🔴"
+            days_held = (now - created_at).days if created_at else 0
 
-                # ── Valuation / analyst target context ────────────────────────
-                val = valuation_cache.get(symbol)
-                if val is None:
-                    try:
-                        val = get_valuation_metrics(symbol)
-                        valuation_cache[symbol] = val
-                    except Exception:
-                        val = {}
+            # ── Valuation / analyst target context ────────────────────────
+            val = valuation_cache.get(symbol)
+            if val is None:
+                try:
+                    val = get_valuation_metrics(symbol)
+                    valuation_cache[symbol] = val
+                except Exception:
+                    val = {}
 
-                target_mean_str = f"${val.get('analyst_target_mean'):.2f}" if val.get('analyst_target_mean') else "N/A"
-                upside_str = f"{val.get('analyst_upside_pct'):+.1f}%" if val.get('analyst_upside_pct') is not None else "N/A"
-                days_to_e = val.get('days_to_earnings')
+            # ── Technical indicators cache per symbol ─────────────────────
+            ind = ind_cache.get(symbol)
+            if ind is None:
+                try:
+                    hist = get_historical_data(symbol, period="3mo", market=market or "AU")
+                    if hist is not None and len(hist) >= 20:
+                        ind = calculate_technical_indicators(hist) or {}
+                    else:
+                        ind = {}
+                except Exception:
+                    ind = {}
+                ind_cache[symbol] = ind
 
-                def _rich_alert(headline: str, action_hint: str) -> str:
-                    """Build a detailed Telegram HTML alert string."""
-                    return (
-                        f"<b>{headline}</b>\n\n"
-                        f"📌 <b>{symbol}</b> ({market or 'AU'}) | {side or 'LONG'}\n"
-                        f"  Entry: <b>${entry_f:.2f}</b> → Now: <b>${cp:.2f}</b>\n"
-                        f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n"
-                        f"  Analyst target: {target_mean_str} | Upside: {upside_str}\n"
-                        + (f"  📅 Earnings in: {days_to_e}d\n" if days_to_e is not None and days_to_e >= 0 else "")
-                        + f"\n💡 <b>Action hint:</b> {action_hint}"
+            target_mean_str = f"${val.get('analyst_target_mean'):.2f}" if val.get('analyst_target_mean') else "N/A"
+            upside_str = f"{val.get('analyst_upside_pct'):+.1f}%" if val.get('analyst_upside_pct') is not None else "N/A"
+            days_to_e = val.get('days_to_earnings')
+
+            def _rich_alert(headline: str, action_hint: str) -> str:
+                """Build a detailed Telegram HTML alert string."""
+                return (
+                    f"<b>{headline}</b>\n\n"
+                    f"📌 <b>{symbol}</b> ({market or 'AU'}) | {side or 'LONG'}\n"
+                    f"  Entry: <b>${entry_f:.2f}</b> → Now: <b>${cp:.2f}</b>\n"
+                    f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n"
+                    f"  Analyst target: {target_mean_str} | Upside: {upside_str}\n"
+                    + (f"  📅 Earnings in: {days_to_e}d\n" if days_to_e is not None and days_to_e >= 0 else "")
+                    + f"\n💡 <b>Action hint:</b> {action_hint}"
+                )
+
+            if side == 'LONG':
+                new_peak = max(peak or entry, cp)
+
+                if take_profit_price and cp >= float(take_profit_price):
+                    if position_stage != 'trim_signal':
+                        stage_update = 'trim_signal'
+                        alert = _rich_alert(
+                            "🎯 TAKE PROFIT TRIGGER",
+                            f"Price {cp:.2f} ≥ target {float(take_profit_price):.2f}. "
+                            f"Consider trimming 50% and raising trailing stop to lock gains."
+                        )
+                    else:
+                        _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_take_profit")
+                        stage_update = 'closed'
+                        alert = _rich_alert(
+                            "🎯 AUTO-CLOSED: Target Hit",
+                            f"Take-profit target met for 2 cycles. Auto-closed at {cp:.2f} to lock gains."
+                        )
+                elif stop_loss_price and cp <= float(stop_loss_price):
+                    if position_stage != 'exit_signal':
+                        stage_update = 'exit_signal'
+                        alert = _rich_alert(
+                            "🛑 STOP LOSS TRIGGER",
+                            f"Price {cp:.2f} ≤ stop {float(stop_loss_price):.2f}. "
+                            f"Thesis may be broken. Review for exit to protect capital."
+                        )
+                    else:
+                        _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_catastrophe_stop")
+                        stage_update = 'closed'
+                        alert = _rich_alert(
+                            "🛑 AUTO-STOPPED: Stop Hit",
+                            f"Stop-loss triggered for 2 cycles. Auto-closed at {cp:.2f} to protect capital."
+                        )
+                elif days_held >= 30 and abs(pnl_pct) < 2.0 and position_stage not in ('exit_signal', 'trim_signal'):
+                    stage_update = 'review'
+                    alert = _rich_alert(
+                        "⏱️ TIME STOP — 30-DAY REVIEW",
+                        f"Position is flat after {days_held}d ({pnl_pct:+.1f}%). "
+                        f"Signal may have failed. Consider freeing capital for higher-conviction ideas."
                     )
 
-                if side == 'LONG':
-                    new_peak = max(peak or entry, cp)
-
-                    if take_profit_price and cp >= float(take_profit_price):
-                        if position_stage != 'trim_signal':
-                            stage_update = 'trim_signal'
-                            alert = _rich_alert(
-                                "🎯 TAKE PROFIT TRIGGER",
-                                f"Price {cp:.2f} ≥ target {float(take_profit_price):.2f}. "
-                                f"Consider trimming 50% and raising trailing stop to lock gains."
-                            )
-                        else:
-                            _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_take_profit")
-                            stage_update = 'closed'
-                            alert = _rich_alert(
-                                "🎯 AUTO-CLOSED: Target Hit",
-                                f"Take-profit target met for 2 cycles. Auto-closed at {cp:.2f} to lock gains."
-                            )
-                    elif stop_loss_price and cp <= float(stop_loss_price):
-                        if position_stage != 'exit_signal':
-                            stage_update = 'exit_signal'
-                            alert = _rich_alert(
-                                "🛑 STOP LOSS TRIGGER",
-                                f"Price {cp:.2f} ≤ stop {float(stop_loss_price):.2f}. "
-                                f"Thesis may be broken. Review for exit to protect capital."
-                            )
-                        else:
-                            _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_catastrophe_stop")
-                            stage_update = 'closed'
-                            alert = _rich_alert(
-                                "🛑 AUTO-STOPPED: Stop Hit",
-                                f"Stop-loss triggered for 2 cycles. Auto-closed at {cp:.2f} to protect capital."
-                            )
-                    # NOTE: the old tight trailing-stop (3% drop from peak) was removed
-                    # per v2 Part 7 — it fires on normal intra-quarter noise (−9% to
-                    # −15% is typical) and converts a positive-EV strategy into a
-                    # stop-harvesting machine. Position-level risk now flows through
-                    # the catastrophe stop in the Exit Engine block below.
-                    elif days_held >= 30 and abs(pnl_pct) < 2.0 and position_stage not in ('exit_signal', 'trim_signal'):
-                        stage_update = 'review'
-                        alert = _rich_alert(
-                            "⏱️ TIME STOP — 30-DAY REVIEW",
-                            f"Position is flat after {days_held}d ({pnl_pct:+.1f}%). "
-                            f"Signal may have failed. Consider freeing capital for higher-conviction ideas."
-                        )
-
-                    # ── Exit Engine (v2: catastrophe-stop / time-stop / CGT deferral) ──
-                    if stage_update is None:
-                        try:
-                            from exit_engine import compute_exit_plan
-                            atr_pct = 0.03
-                            try:
-                                hist = get_historical_data(symbol, period="3mo")
-                                if hist is not None and len(hist) >= 20:
-                                    ind = calculate_technical_indicators(hist)
-                                    atr_pct = (ind.get("atr_pct") or 3.0) / 100.0
-                            except Exception:
-                                atr_pct = 0.03
-                            entry_date_val = created_at.date() if created_at else date.today()
-                            sentinel = position_stage if position_stage in ("INTACT", "WEAKENED", "BROKEN") else "INTACT"
-                            exit_plan = compute_exit_plan(
+                # ── Exit Engine (v2: catastrophe-stop / time-stop / CGT deferral) ──
+                if stage_update is None:
+                    try:
+                        from exit_engine import compute_exit_plan
+                        atr_pct = (ind.get("atr_pct") or 3.0) / 100.0
+                        entry_date_val = created_at.date() if created_at else date.today()
+                        sentinel = position_stage if position_stage in ("INTACT", "WEAKENED", "BROKEN") else "INTACT"
+                        exit_plan = compute_exit_plan(
                             symbol=symbol,
                             entry_date=entry_date_val,
                             entry_price=entry_f,
@@ -12286,43 +12289,38 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                             days_to_earnings=days_to_e,
                             sentinel_verdict=sentinel,
                             portfolio_breaker_level=breaker_level if 'breaker_level' in dir() else "NORMAL",
+                        )
+                        es = exit_plan.get("exit_signal", "HOLD")
+                        if es == "FORCE_EXIT" or es == "EXIT":
+                            stage_update = "exit_signal"
+                            alert = _rich_alert(
+                                f"🚪 EXIT ENGINE: {exit_plan.get('exit_reason', 'EXIT')}",
+                                f"Day {days_held}/63. "
+                                f"Gain {pnl_pct:+.1f}%. Stop at ${exit_plan.get('cat_stop_price', 0):.2f}."
                             )
-                            es = exit_plan.get("exit_signal", "HOLD")
-                            if es == "FORCE_EXIT" or es == "EXIT":
-                                stage_update = "exit_signal"
-                                alert = _rich_alert(
-                                    f"🚪 EXIT ENGINE: {exit_plan.get('exit_reason', 'EXIT')}",
-                                    f"Day {days_held}/63. "
-                                    f"Gain {pnl_pct:+.1f}%. Stop at ${exit_plan.get('cat_stop_price', 0):.2f}."
-                                )
-                            elif es == "HOLD_EXTEND":
-                                print(f"[PaperMonitor] {symbol}: CGT deferral — holding for discount")
-                        except Exception as e:
-                            pass  # exit engine non-blocking
+                        elif es == "HOLD_EXTEND":
+                            print(f"[PaperMonitor] {symbol}: CGT deferral — holding for discount")
+                    except Exception:
+                        pass  # exit engine non-blocking
 
-                    # ── Trend-degradation signal (silent fall — no news needed) ──
-                    # Detects continuous decline even without a new announcement:
-                    # price below 50-day MA AND below entry by a material-but-non-
-                    # catastrophic margin. Builds cadence of trust on the dashboard.
-                    if stage_update is None and side == 'LONG':
-                        try:
-                            hist = get_historical_data(symbol, period="3mo")
-                            if hist is not None and len(hist) >= 50:
-                                ind = calculate_technical_indicators(hist)
-                                sma50 = ind.get("sma_50")
-                                below_ma50 = sma50 is not None and cp < sma50
-                                fell_from_peak = peak and cp < float(peak) * 0.95
-                                if below_ma50 and fell_from_peak and pnl_pct < -3.0:
-                                    stage_update = 'review'
-                                    alert = _rich_alert(
-                                        "📉 TREND DEGRADATION — CONTINUOUS FALL",
-                                        f"Price {cp:.2f} below 50-day MA {sma50:.2f} and down "
-                                        f"{pnl_pct:+.1f}% from entry, drifting with no recovery. "
-                                        f"Review whether this trade is failing silently."
-                                    )
-                        except Exception:
-                            pass
+                # ── Trend-degradation signal (silent fall — no news needed) ──
+                if stage_update is None and side == 'LONG':
+                    try:
+                        sma50 = ind.get("sma_50")
+                        below_ma50 = sma50 is not None and cp < sma50
+                        fell_from_peak = peak and cp < float(peak) * 0.95
+                        if below_ma50 and fell_from_peak and pnl_pct < -3.0:
+                            stage_update = 'review'
+                            alert = _rich_alert(
+                                "📉 TREND DEGRADATION — CONTINUOUS FALL",
+                                f"Price {cp:.2f} below 50-day MA {sma50:.2f} and down "
+                                f"{pnl_pct:+.1f}% from entry, drifting with no recovery. "
+                                f"Review whether this trade is failing silently."
+                            )
+                    except Exception:
+                        pass
 
+                with db_conn() as conn:
                     conn.execute(text("""
                         UPDATE paper_trades
                         SET current_price = :cp,
@@ -12334,25 +12332,24 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                         WHERE id = :tid
                     """), {"cp": cp, "np": new_peak, "stage_update": stage_update, "now": now, "tid": trade_id})
 
-                elif side == 'SHORT':
-                    new_trough = min(peak or entry, cp)
+            elif side == 'SHORT':
+                new_trough = min(peak or entry, cp)
 
-                    if take_profit_price and cp <= float(take_profit_price) and position_stage != 'trim_signal':
-                        stage_update = 'trim_signal'
-                        alert = _rich_alert(
-                            "🎯 SHORT TAKE PROFIT TRIGGER",
-                            f"Price {cp:.2f} ≤ short target {float(take_profit_price):.2f}. "
-                            f"Consider covering 50% and tightening buy-stop."
-                        )
-                    elif stop_loss_price and cp >= float(stop_loss_price) and position_stage != 'exit_signal':
-                        stage_update = 'exit_signal'
-                        alert = _rich_alert(
-                            "🛑 SHORT STOP LOSS TRIGGER",
-                            f"Price {cp:.2f} ≥ stop {float(stop_loss_price):.2f}. "
-                            f"Cover position to limit further loss."
-                        )
-                    # NOTE: tight trailing-stop removed per v2 Part 7; shorts follow
-                    # the same catastrophe-stop discipline via the Exit Engine.
+                if take_profit_price and cp <= float(take_profit_price) and position_stage != 'trim_signal':
+                    stage_update = 'trim_signal'
+                    alert = _rich_alert(
+                        "🎯 SHORT TAKE PROFIT TRIGGER",
+                        f"Price {cp:.2f} ≤ short target {float(take_profit_price):.2f}. "
+                        f"Consider covering 50% and tightening buy-stop."
+                    )
+                elif stop_loss_price and cp >= float(stop_loss_price) and position_stage != 'exit_signal':
+                    stage_update = 'exit_signal'
+                    alert = _rich_alert(
+                        "🛑 SHORT STOP LOSS TRIGGER",
+                        f"Price {cp:.2f} ≥ stop {float(stop_loss_price):.2f}. "
+                        f"Cover position to limit further loss."
+                    )
+                with db_conn() as conn:
                     conn.execute(text("""
                         UPDATE paper_trades
                         SET current_price = :cp,
@@ -12364,55 +12361,56 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                         WHERE id = :tid
                     """), {"cp": cp, "nt": new_trough, "stage_update": stage_update, "now": now, "tid": trade_id})
 
-                # ── Earnings proximity alert for open positions (daily max) ──
-                if (not alert and recipients and not in_cooldown
-                        and days_to_e is not None and 0 <= days_to_e <= 7):
-                    earnings_alert = (
-                        f"<b>📅 EARNINGS IN {days_to_e} DAYS — {symbol}</b>\n\n"
-                        f"📌 <b>{symbol}</b> | {side or 'LONG'} | Entry ${entry_f:.2f}\n"
-                        f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n\n"
-                        f"<b>Pre-earnings checklist:</b>\n"
-                        f"  • Confirm stop-loss is set (current: "
-                        + (f"${float(stop_loss_price):.2f}" if stop_loss_price else "<b>⚠️ NOT SET</b>")
-                        + f")\n"
-                        f"  • Consider reducing to half position to manage binary event risk\n"
-                        f"  • Analyst consensus: {(val.get('analyst_recommendation') or 'N/A').upper()} | Target: {target_mean_str}\n"
-                    )
-                    _send_telegram_payload(
-                        earnings_alert,
-                        recipients,
-                        user_id=user_id,
-                        message_type="earnings_proximity",
-                        market=market,
-                        delivery_mode="auto",
-                        source="position_monitor",
-                    )
+            # ── Earnings proximity alert for open positions (daily max) ──
+            if (not alert and recipients and not in_cooldown
+                    and days_to_e is not None and 0 <= days_to_e <= 7):
+                earnings_alert = (
+                    f"<b>📅 EARNINGS IN {days_to_e} DAYS — {symbol}</b>\n\n"
+                    f"📌 <b>{symbol}</b> | {side or 'LONG'} | Entry ${entry_f:.2f}\n"
+                    f"  {pnl_emoji} P&amp;L: <b>{'%+.2f' % gross_pnl} ({pnl_pct:+.1f}%)</b> | Held: {days_held}d\n\n"
+                    f"<b>Pre-earnings checklist:</b>\n"
+                    f"  • Confirm stop-loss is set (current: "
+                    + (f"${float(stop_loss_price):.2f}" if stop_loss_price else "<b>⚠️ NOT SET</b>")
+                    + f")\n"
+                    f"  • Consider reducing to half position to manage binary event risk\n"
+                    f"  • Analyst consensus: {(val.get('analyst_recommendation') or 'N/A').upper()} | Target: {target_mean_str}\n"
+                )
+                _send_telegram_payload(
+                    earnings_alert,
+                    recipients,
+                    user_id=user_id,
+                    message_type="earnings_proximity",
+                    market=market,
+                    delivery_mode="auto",
+                    source="position_monitor",
+                )
+                with db_conn() as conn:
                     conn.execute(text(
                         "UPDATE paper_trades SET last_alert_at = :now, last_checked_at = :now WHERE id = :tid"
                     ), {"now": now, "tid": trade_id})
-                    log_position_event(trade_id, user_id, "earnings_alert",
-                                       f"Earnings proximity alert sent for {symbol} ({days_to_e}d away)",
-                                       {"days_to_earnings": days_to_e})
-                    continue
+                log_position_event(trade_id, user_id, "earnings_alert",
+                                   f"Earnings proximity alert sent for {symbol} ({days_to_e}d away)",
+                                   {"days_to_earnings": days_to_e})
+                continue
 
-                if alert and recipients and not in_cooldown:
-                    _send_telegram_payload(
-                        alert,
-                        recipients,
-                        user_id=user_id,
-                        message_type="position_trigger",
-                        market=market,
-                        delivery_mode="auto",
-                        source="position_monitor",
-                    )
-                    log_position_event(trade_id, user_id, "trigger",
-                                       alert.replace("<b>", "").replace("</b>", "").replace("<br/>", " | ")[:300], {
-                                           "symbol": symbol,
-                                           "market": market,
-                                           "current_price": cp,
-                                           "pnl_pct": round(pnl_pct, 2),
-                                           "position_stage": stage_update,
-                                       })
+            if alert and recipients and not in_cooldown:
+                _send_telegram_payload(
+                    alert,
+                    recipients,
+                    user_id=user_id,
+                    message_type="position_trigger",
+                    market=market,
+                    delivery_mode="auto",
+                    source="position_monitor",
+                )
+                log_position_event(trade_id, user_id, "trigger",
+                                   alert.replace("<b>", "").replace("</b>", "").replace("<br/>", " | ")[:300], {
+                                       "symbol": symbol,
+                                       "market": market,
+                                       "current_price": cp,
+                                       "pnl_pct": round(pnl_pct, 2),
+                                       "position_stage": stage_update,
+                                   })
 
     except Exception as e:
         import traceback
@@ -16700,10 +16698,122 @@ def _scheduled_smsf_eod_checks():
 def _get_all_telegram_users():
     try:
         with db_conn() as conn:
-            rows = conn.execute(text("SELECT DISTINCT user_id as id FROM user_telegram_recipients")).fetchall()
-            return [{"id": r[0]} for r in rows] if rows else [{"id": "default"}]
+            rows = conn.execute(text("""
+                SELECT DISTINCT user_id AS id FROM user_telegram_recipients
+                UNION
+                SELECT DISTINCT user_id AS id FROM paper_trades WHERE status = 'open'
+            """)).fetchall()
+            return [{"id": r[0]} for r in rows if r[0]] if rows else [{"id": "default"}]
     except Exception:
         return [{"id": "default"}]
+
+
+def _auto_sync_all_users_portfolios():
+    """Ensure all active users have their 60% Core Sleeve + Top-Decile Satellite positions open and tracked."""
+    try:
+        with db_conn() as conn:
+            row = conn.execute(text(
+                "SELECT picks FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+            )).fetchone()
+            picks = (json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])) if row and row[0] else []
+            top_picks = [p for p in picks if p.get("_target_tier") in ("10pct", "8pct")]
+            users = conn.execute(text(
+                "SELECT id, COALESCE(total_investment_budget, 100000) FROM users"
+            )).fetchall()
+
+        core_blueprint = [
+            ("VAS",  "ETF", 0.12, "ASX200 Index ETF",   "Core ASX300 Franked Index (~80% franked)"),
+            ("VGS",  "ETF", 0.10, "Global Index ETF",   "Core MSCI World Ex-AU Diversification"),
+            ("QUAL", "ETF", 0.07, "Global Quality ETF", "Core Global Quality Factor ETF"),
+            ("GOLD", "ETF", 0.06, "Commodities ETF",    "Core Physical Gold Inflation/Tail Hedge"),
+            ("BHP",  "AU",  0.07, "Materials",          "Core ASX Blue Chip — 100% Franked Dividend"),
+            ("CBA",  "AU",  0.06, "Financials",         "Core ASX Blue Chip — 100% Franked Dividend"),
+            ("WES",  "AU",  0.06, "Consumer",           "Core ASX Blue Chip — 100% Franked Dividend"),
+            ("TLS",  "AU",  0.06, "Telecom",            "Core ASX Blue Chip — 100% Franked Defensive Yield"),
+        ]
+        price_lookup = {}
+        with db_conn() as conn:
+            for sym, _, _, _, _ in core_blueprint:
+                r = conn.execute(text(
+                    "SELECT close FROM eod_ohl_history WHERE symbol=:s AND close > 0 ORDER BY trade_date DESC LIMIT 1"
+                ), {"s": sym}).fetchone()
+                if r and r[0]:
+                    price_lookup[sym] = float(r[0])
+
+        now = datetime.utcnow()
+        with db_conn() as conn:
+            for uid, budget_raw in users:
+                budget = max(float(budget_raw or 100000.0), 100000.0)
+                open_syms = {
+                    r[0] for r in conn.execute(text(
+                        "SELECT symbol FROM paper_trades WHERE user_id=:u AND status='open'"
+                    ), {"u": uid}).fetchall()
+                }
+                for sym, mkt, pct_nav, sec, notes_str in core_blueprint:
+                    if sym in open_syms:
+                        continue
+                    price = price_lookup.get(sym, 0.0)
+                    if price <= 0:
+                        continue
+                    qty = max(1, int((budget * pct_nav) // price))
+                    conn.execute(text("""
+                        INSERT INTO paper_trades
+                            (id, user_id, symbol, market, side, quantity, entry_price, current_price,
+                             target_price, status, signal_score, signal_trend, notes, peak_price,
+                             stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
+                             position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed,
+                             catastrophe_stop_price, time_stop_date, sleeve, sector)
+                        VALUES
+                            (:id, :u, :s, :m, 'LONG', :q, :p, :p, :tp, 'open', 75.0, 'BULLISH', :nt, :p,
+                             :sl, :tp, 3.0, :rev, 'entered', 'BUY', 'core_sleeve_auto', :now, :ed,
+                             :sl, :ts, 'core', :sec)
+                    """), {
+                        "id": str(uuid4()), "u": uid, "s": sym, "m": mkt, "q": qty, "p": price,
+                        "tp": round(price * 1.15, 3), "sl": round(price * 0.75, 3), "nt": notes_str,
+                        "rev": now + timedelta(days=14), "now": now, "ed": now.date(),
+                        "ts": (now + timedelta(days=365)).date(), "sec": sec,
+                    })
+                    open_syms.add(sym)
+
+                sat_count = conn.execute(text(
+                    "SELECT COUNT(*) FROM paper_trades WHERE user_id=:u AND status='open' AND COALESCE(sleeve,'satellite') != 'core'"
+                ), {"u": uid}).scalar() or 0
+                for p in top_picks:
+                    if sat_count >= 5:
+                        break
+                    sym = p.get("symbol")
+                    if not sym or sym in open_syms:
+                        continue
+                    price = float(p.get("current_price") or p.get("entry_price") or 0)
+                    if price <= 0:
+                        continue
+                    qty = max(1, int((budget * 0.055) // price))
+                    proba_pct = round((p.get("_lgbm_proba") or 0.22) * 100, 1)
+                    tier = p.get("_target_tier", "8pct")
+                    sec = (p.get("valuation_metrics") or {}).get("sector") or "ASX Equities"
+                    conn.execute(text("""
+                        INSERT INTO paper_trades
+                            (id, user_id, symbol, market, side, quantity, entry_price, current_price,
+                             target_price, status, signal_score, signal_trend, notes, peak_price,
+                             stop_loss_price, take_profit_price, trailing_stop_pct, review_date,
+                             position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed,
+                             catastrophe_stop_price, time_stop_date, sleeve, sector)
+                        VALUES
+                            (:id, :u, :s, 'AU', 'LONG', :q, :p, :p, :tp, 'open', :sc, 'BULLISH', :nt, :p,
+                             :sl, :tp, 3.0, :rev, 'entered', 'BUY', 'v2_daily_scan', :now, :ed,
+                             :sl, :ts, 'satellite', :sec)
+                    """), {
+                        "id": str(uuid4()), "u": uid, "s": sym, "q": qty, "p": price,
+                        "tp": round(price * 1.08, 3), "sc": proba_pct,
+                        "nt": f"Auto-executed top-decile ({tier}, score={proba_pct}%)",
+                        "sl": round(price * 0.80, 3), "rev": now + timedelta(days=14),
+                        "now": now, "ed": now.date(), "ts": (now + timedelta(days=63)).date(), "sec": sec,
+                    })
+                    open_syms.add(sym)
+                    sat_count += 1
+        print("[AutoPortfolioSync] Verified Core + Top-Decile Satellite positions for all users.", flush=True)
+    except Exception as e:
+        print(f"[AutoPortfolioSync] Non-blocking error: {e}", flush=True)
 
 
 def _estimate_cash(user_id: str) -> float:
@@ -16831,10 +16941,6 @@ if SCHEDULER_AVAILABLE:
         )
 
         # ── Essential Data Pipeline ──────────────────────────────────────
-        # Fix 51: model is FROZEN under MODEL_LOCK_IN, so a daily 2.5h retrain is
-        # wasted. The job now short-circuits (matrix refresh only) when locked, and
-        # the heavyweight challenger fit only runs when explicitly unlocked. Kept
-        # on a weekly cadence so the training matrix stays current for WFO evidence.
         scheduler.add_job(
             _scheduled_model_training, "cron",
             minute=0, hour=7, day_of_week="sun",
@@ -16876,26 +16982,19 @@ if SCHEDULER_AVAILABLE:
         scheduler.start()
 
         # ── Startup Catch-Up Engine ───────────────────────────────────────────
-        # This system runs on a mini-PC that is powered off overnight and may
-        # restart any time (7AM, 8AM, or after a full day offline).  APScheduler
-        # cron jobs only fire at their scheduled wall-clock time — if the machine
-        # was off at 5AM, the broad scan never ran.  The catch-up engine below
-        # detects missed jobs using DB timestamps and re-runs them once on startup,
-        # staggered so the CPU/network is not hammered all at once.
         def _startup_catchup():
             import time as _st
             tz = _get_scheduler_timezone()
             now_local = datetime.now(tz)
             now_utc   = datetime.utcnow()
             weekday   = now_local.weekday()   # 0=Mon … 6=Sun
-            hour_local = now_local.hour
             tasks_run = []
 
             print(f"[StartupCatchup] Checking for missed jobs at {now_local.strftime('%a %H:%M %Z')} …", flush=True)
 
             # ── 1. Paper trade monitor — always run immediately on startup ────
             try:
-                startup_max_trades = max(10, int(os.getenv("PAPER_MONITOR_STARTUP_MAX_TRADES", "75")))
+                startup_max_trades = max(10, int(os.getenv("PAPER_MONITOR_STARTUP_MAX_TRADES", "500")))
                 startup_catchup_enabled = os.getenv("PAPER_MONITOR_STARTUP_CATCHUP", "true").strip().lower() not in {"0", "false", "no"}
                 if startup_catchup_enabled:
                     _scheduled_paper_trade_monitor(max_trades_override=startup_max_trades)
@@ -16903,7 +17002,7 @@ if SCHEDULER_AVAILABLE:
             except Exception as _e:
                 print(f"[StartupCatchup] paper_trade_monitor failed: {_e}")
 
-            _st.sleep(5)  # Brief pause before heavy work
+            _st.sleep(2)
 
             # ── 1.5 Incremental EODHD update — run if stale (>18 hours no update) ──
             try:
@@ -16913,9 +17012,8 @@ if SCHEDULER_AVAILABLE:
                     )).fetchone()
                 inc_stale = True
                 if _row and _row[0]:
-                    _gen = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    inc_age_h = (now_utc - _gen.replace(tzinfo=None)).total_seconds() / 3600
-                    inc_stale = inc_age_h > 18
+                    _gen_dt = _row[0] if isinstance(_row[0], date) and not isinstance(_row[0], datetime) else date.fromisoformat(str(_row[0])[:10])
+                    inc_stale = (now_local.date() - _gen_dt).days > (3 if weekday == 0 else 1)
                 if inc_stale:
                     print(f"[StartupCatchup] OHLC data may be stale — running incremental update …")
                     _scheduled_inc_update()
@@ -16925,7 +17023,24 @@ if SCHEDULER_AVAILABLE:
             except Exception as _e:
                 print(f"[StartupCatchup] inc_update failed: {_e}")
 
-            _st.sleep(5)
+            _st.sleep(2)
+
+            # ── 1.6 ETF Momentum Regime Signal — run if missing for today ──
+            try:
+                with db_conn() as _conn:
+                    _etf_row = _conn.execute(text(
+                        "SELECT MAX(run_date) FROM etf_signals"
+                    )).fetchone()
+                etf_stale = True
+                if _etf_row and _etf_row[0]:
+                    _etf_dt = _etf_row[0] if isinstance(_etf_row[0], date) and not isinstance(_etf_row[0], datetime) else date.fromisoformat(str(_etf_row[0])[:10])
+                    etf_stale = (now_local.date() - _etf_dt).days >= 1
+                if etf_stale:
+                    print("[StartupCatchup] ETF regime signal stale — computing now …")
+                    _scheduled_etf_signal()
+                    tasks_run.append("etf_signal")
+            except Exception as _e:
+                print(f"[StartupCatchup] etf_signal check failed: {_e}")
 
             # ── 2. Broad wealth scan — re-run if cache is stale (>20 hours) ──
             try:
@@ -16946,58 +17061,70 @@ if SCHEDULER_AVAILABLE:
             except Exception as _e:
                 print(f"[StartupCatchup] broad_scan check failed: {_e}")
 
-            _st.sleep(5)
+            _st.sleep(2)
 
-            # ── 3. V2 daily scan — run if scan cache is from before today (missed 8AM weekday scan) ──
+            # ── 3. V2 daily scan — run if not yet executed today ──
             try:
                 with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(generated_at) FROM wealth_scan_history WHERE scan_mode='broad'"
-                    )).fetchone()
-                v2_scan_stale = True
-                if _row and _row[0]:
-                    _gen = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
-                    v2_scan_stale = _gen.date() < now_local.date()
-                if v2_scan_stale:
-                    print(f"[StartupCatchup] V2 scan stale (last: {_gen if _row and _row[0] else 'none'}) — running now …")
+                    _scanned = _conn.execute(text(
+                        "SELECT COUNT(*) FROM daily_ai_runs WHERE run_date = :today"
+                    ), {"today": now_local.date()}).fetchone()
+                already_scanned = _scanned and _scanned[0] > 0
+                if not already_scanned and now_local.hour >= 8:
+                    print("[StartupCatchup] V2 daily scan missed today — running now …")
                     _scheduled_v2_daily_scan()
                     tasks_run.append("v2_scan")
                 else:
-                    print(f"[StartupCatchup] V2 scan fresh (today's scan exists) — skipping.")
+                    print("[StartupCatchup] V2 scan fresh (today's scan exists) — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] v2_scan check failed: {_e}")
 
-            _st.sleep(10)
-
-            # ── 3. (Deprecated daily_digest — replaced by 6AM AI pipeline) ───────
-            # Old daily_digest catch-up removed. The AI pipeline handles this now.
-
-            # ── 4. Walk-forward OOS — always run on startup (idempotent, skipped if already computed today) ──
+            # ── 3.5 Auto-Sync All Users' Core + Satellite Portfolios & Sentinel ──
             try:
-                print(f"[StartupCatchup] Running walk-forward OOS validation …")
-                _scheduled_walk_forward_oos()
-                tasks_run.append("walk_forward_oos")
+                _auto_sync_all_users_portfolios()
+                tasks_run.append("auto_portfolio_sync")
+            except Exception as _e:
+                print(f"[StartupCatchup] auto_portfolio_sync failed: {_e}")
+
+            try:
+                with db_conn() as _conn:
+                    _sent_ran = _conn.execute(text(
+                        "SELECT COUNT(*) FROM job_runs WHERE job_name='smsf_pipeline' AND started_at >= CURRENT_DATE"
+                    )).scalar()
+                if not _sent_ran and weekday < 5:
+                    print("[StartupCatchup] Running 7AM SMSF Position Sentinel catch-up …")
+                    _scheduled_smsf_pipeline()
+                    tasks_run.append("smsf_pipeline")
+            except Exception as _e:
+                print(f"[StartupCatchup] smsf_pipeline check failed: {_e}")
+
+            _st.sleep(2)
+
+            # ── 4. Walk-forward OOS — run if not computed today ──
+            try:
+                with db_conn() as _conn:
+                    _wfo_ran = _conn.execute(text(
+                        "SELECT COUNT(*) FROM wfo_metrics WHERE run_at >= CURRENT_DATE"
+                    )).scalar()
+                if not _wfo_ran:
+                    print("[StartupCatchup] Running walk-forward OOS validation …")
+                    _scheduled_walk_forward_oos()
+                    tasks_run.append("walk_forward_oos")
             except Exception as _e:
                 print(f"[StartupCatchup] WFO failed: {_e}")
 
             # ── 5. UAT health report — runs after WFO on boot ──────────────────
             try:
-                print(f"[StartupCatchup] Generating UAT health report …")
                 _scheduled_uat_health_report()
                 tasks_run.append("uat_health_report")
             except Exception as _e:
                 print(f"[StartupCatchup] UAT health report failed: {_e}")
 
-            _st.sleep(10)
-
-            # ── 4. Weekly generation — re-run if this week's picks are missing ─
-            # Only on weekdays, and only if weekly picks table is stale.
+            # ── 6. Weekly generation — re-run if this week's picks are missing ─
             try:
-                if weekday < 5:  # Mon–Fri only
+                if weekday < 5:
                     with db_conn() as _conn:
-                        _week_row = _conn.execute(text("""
-                            SELECT MAX(generated_at) FROM weekly_digests
-                        """)).fetchone()
+                        _week_row = _conn.execute(text("SELECT MAX(generated_at) FROM weekly_digests")).fetchone()
                     weekly_age_days = 999
                     if _week_row and _week_row[0]:
                         _wgen = _week_row[0] if isinstance(_week_row[0], datetime) else datetime.fromisoformat(str(_week_row[0]))
@@ -17006,135 +17133,60 @@ if SCHEDULER_AVAILABLE:
                         print(f"[StartupCatchup] Weekly picks stale ({weekly_age_days:.1f}d old) — running …")
                         _scheduled_weekly_generation()
                         tasks_run.append("weekly_generation")
-                    else:
-                        print(f"[StartupCatchup] Weekly picks fresh ({weekly_age_days:.1f}d old) — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] weekly_generation check failed: {_e}")
 
-            _st.sleep(10)
-
-            # ── 5. Positions monitor — run if we're in market hours ───────────
-            try:
-                from datetime import time as _dt_time
-                market_open  = _dt_time(10, 0)
-                market_close = _dt_time(16, 0)
-                is_weekday   = weekday < 5
-                is_market_hours = market_open <= now_local.time() <= market_close
-                if is_weekday and is_market_hours:
-                    print("[StartupCatchup] In market hours — running positions monitor …")
-                    _scheduled_positions_monitor()
-                    tasks_run.append("positions_monitor")
-                else:
-                    print(f"[StartupCatchup] Outside market hours or weekend — skipping positions monitor.")
-            except Exception as _e:
-                print(f"[StartupCatchup] positions_monitor failed: {_e}")
-
-            _st.sleep(10)
-
-            # ── 6. Self Learning Loop ─────────────────────────────────────────
-            # Runs at the very end of startup catchup since it's lower priority
+            # ── 7. Self Learning Loop ─────────────────────────────────────────
             try:
                 with db_conn() as _conn:
                     _row = _conn.execute(text(
                         "SELECT evaluated_at FROM ai_self_learning_metrics ORDER BY evaluated_at DESC LIMIT 1"
                     )).fetchone()
-                
                 learning_age_hours = 999
                 if _row and _row[0]:
                     _eval_ts = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
                     learning_age_hours = (now_utc - _eval_ts.replace(tzinfo=None)).total_seconds() / 3600
-                
-                # If hasn't run in over 6 days (144 hours), run it now to catch up
                 if learning_age_hours > 144:
-                    print(f"[StartupCatchup] Self-learning loop stale ({learning_age_hours:.1f}h old) — running now (lowest priority) ...")
                     _scheduled_self_learning_loop()
                     tasks_run.append("self_learning")
-                else:
-                    print(f"[StartupCatchup] Self-learning fresh ({learning_age_hours:.1f}h old) — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] self_learning_loop check failed: {_e}")
-
-            _st.sleep(5)
-
-            # ── 7. Incremental OHLC update — run if stale (>24 hours) ───────────
-            try:
-                with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(trade_date) FROM eod_ohl_history"
-                    )).fetchone()
-                ohlc_age_hours = 999
-                if _row and _row[0]:
-                    _max_dt = _row[0] if isinstance(_row[0], datetime) else datetime.strptime(str(_row[0]), "%Y-%m-%d")
-                    ohlc_age_hours = (now_utc - _max_dt.replace(tzinfo=None)).total_seconds() / 3600 if hasattr(_max_dt, 'replace') else 999
-                if ohlc_age_hours > 24:
-                    print(f"[StartupCatchup] OHLC stale ({ohlc_age_hours:.1f}h) — running inc update …")
-                    _scheduled_inc_update()
-                    tasks_run.append("inc_update")
-                else:
-                    print(f"[StartupCatchup] OHLC fresh — skipping inc update.")
-            except Exception as _e:
-                print(f"[StartupCatchup] inc_update failed: {_e}")
-
-            _st.sleep(5)
 
             # ── 8. Model training — run if not trained today ────────────────────
             try:
                 with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(trained_at) FROM model_weights_by_date"
-                    )).fetchone()
+                    _row = _conn.execute(text("SELECT MAX(trained_at) FROM model_weights_by_date")).fetchone()
                 train_today = False
                 if _row and _row[0]:
                     _td = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
                     _td_local = _td.replace(tzinfo=timezone.utc).astimezone(tz) if _td.tzinfo is None else _td.astimezone(tz)
                     train_today = _td_local.date() == now_local.date()
                 if not train_today:
-                    print(f"[StartupCatchup] Model not trained today — running training pipeline …")
                     _scheduled_model_training()
                     tasks_run.append("model_training")
-                else:
-                    print(f"[StartupCatchup] Model already trained today — skipping.")
             except Exception as _e:
                 print(f"[StartupCatchup] model_training failed: {_e}")
-
-            _st.sleep(5)
-
-            # ── 8.5 V2 Daily Scan ────────────────────────────────────────────────
-            try:
-                if now_local.hour >= 8:
-                    with db_conn() as _conn:
-                        _scanned = _conn.execute(text(
-                            "SELECT COUNT(*) FROM daily_ai_runs WHERE run_date = :today"
-                        ), {"today": now_local.date()}).fetchone()
-                    already_scanned = _scanned and _scanned[0] > 0
-                    if already_scanned:
-                        print(f"[StartupCatchup] V2 daily scan already ran today — skipping.")
-                    else:
-                        print(f"[StartupCatchup] Running V2 daily scan...")
-                        _scheduled_v2_daily_scan()
-                        tasks_run.append("v2_daily_scan")
-            except Exception as _e:
-                print(f"[StartupCatchup] v2_daily_scan failed: {_e}")
 
             # ── 9. Channel calibration — run if not calibrated today ────────────
             try:
                 with db_conn() as _conn:
-                    _row = _conn.execute(text(
-                        "SELECT MAX(calibrated_at) FROM channel_hit_rates"
-                    )).fetchone()
+                    _row = _conn.execute(text("SELECT MAX(calibrated_at) FROM channel_hit_rates")).fetchone()
                 cal_today = False
                 if _row and _row[0]:
                     _cd = _row[0] if isinstance(_row[0], datetime) else datetime.fromisoformat(str(_row[0]))
                     _cd_local = _cd.replace(tzinfo=timezone.utc).astimezone(tz) if _cd.tzinfo is None else _cd.astimezone(tz)
                     cal_today = _cd_local.date() == now_local.date()
                 if not cal_today:
-                    print(f"[StartupCatchup] Channel calibration not run today — running …")
                     _scheduled_channel_calibration()
                     tasks_run.append("channel_calibration")
-                else:
-                    print(f"[StartupCatchup] Channel calibration already done today.")
             except Exception as _e:
                 print(f"[StartupCatchup] channel_calibration failed: {_e}")
+
+            # ── 10. Final Paper Trade Monitor pass so any newly synced positions are immediately priced ──
+            try:
+                _scheduled_paper_trade_monitor(max_trades_override=500)
+            except Exception as _e:
+                print(f"[StartupCatchup] final paper_trade_monitor failed: {_e}")
 
             print(f"[StartupCatchup] Done. Ran: {tasks_run or ['none needed']}", flush=True)
 

@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Fail the BUILD (not the running system) if the dependency set is broken —
+# e.g. an unpinned transitive dep pulling a numpy-incompatible pyarrow.
+RUN python -c "import sklearn.metrics, lightgbm, joblib, pyarrow, edgar, statsmodels, xgboost, apscheduler, sqlalchemy, psycopg2, fastapi, yfinance; print('dependency smoke test OK')"
+
 # Copy application code
 COPY . .
 

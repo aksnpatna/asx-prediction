@@ -2567,8 +2567,8 @@ def _enrich_candidates_with_tiers(candidates: list):
     # Use WFO gate to widen/narrow tiers
     try:
         wfo_state = get_current_wfo_state()
-        gate = wfo_state.get("capital_gate", {}).get("state", "INSUFFICIENT_DATA")
-        if gate == "RED":
+        gate = wfo_state.get("state", "INSUFFICIENT_DATA")
+        if gate in ("RED", "RED_MANUAL_REVIEW"):
             cutoff_10pct_idx = max(1, int(n * 0.05))
             cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.12))
         elif gate == "AMBER":
@@ -13609,21 +13609,15 @@ def get_current_wfo_state() -> dict:
                 """), {"hd": horizon_days}).fetchone()
             if row and row[0]:
                 notes = row[0]
-                if "RED_MANUAL_REVIEW" in notes:
-                    states.append("RED_MANUAL_REVIEW")
-                elif "RED" in notes and "MANUAL" not in notes:
-                    states.append("RED")
-                elif "AMBER" in notes:
-                    states.append("AMBER")
-                elif "GREEN" in notes:
-                    states.append("GREEN")
-                elif "INSUFFICIENT_DATA" in notes:
-                    states.append("INSUFFICIENT_DATA")
+                _m = re.match(r"\s*(RED_MANUAL_REVIEW|RED|AMBER|GREEN|INSUFFICIENT_DATA)", notes)
+                if _m:
+                    states.append(_m.group(1))
         except Exception:
             pass
 
-    # If any horizon is GREEN or AMBER, prefer active validated state over INSUFFICIENT_DATA on 90d
-    for candidate in ["GREEN", "AMBER", "RED", "RED_MANUAL_REVIEW", "INSUFFICIENT_DATA"]:
+    # Most restrictive VALIDATED state wins (a single GREEN horizon must not mask a RED one).
+    # INSUFFICIENT_DATA is only returned when no horizon has produced a validated verdict.
+    for candidate in ["RED_MANUAL_REVIEW", "RED", "AMBER", "GREEN", "INSUFFICIENT_DATA"]:
         if candidate in states:
             return {"state": candidate, "rules": _WFO_CAPITAL_RULES[candidate]}
 
@@ -14147,11 +14141,11 @@ def _scheduled_walk_forward_oos():
         # If >30% of evaluated signals are from a single sector, flag it —
         # bootstrap CI assumes independence which breaks under concentration.
         sector_counts = {}
-        for e in evaluated:
+        for e in active_eval:
             s = e.get("sector", "Unknown")
             sector_counts[s] = sector_counts.get(s, 0) + 1
         max_sector_name = max(sector_counts, key=sector_counts.get) if sector_counts else "Unknown"
-        max_sector_pct = round(sector_counts[max_sector_name] / n * 100, 1) if sector_counts else 0
+        max_sector_pct = round(sector_counts[max_sector_name] / max(1, len(active_eval)) * 100, 1) if sector_counts else 0
         concentration_warning = (
             f"⚠️ Sector concentration: {max_sector_name} = {max_sector_pct}% of signals. "
             f"Bootstrap CI assumes independence — >30% from one sector undermines this. "
@@ -15642,15 +15636,19 @@ async def model_health_summary(current_user: dict = Depends(get_current_user)):
             )).fetchone()
         wfo_n = int(wfo_row[0] or 0) if wfo_row else 0
         wfo_hit = float(wfo_row[1] or 0) if wfo_row and wfo_row[1] is not None else None
+        _wst = out["wfo_state"]
+        _bt_td = out.get("top_decile")
+        _live_bad = _wst in ("RED", "RED_MANUAL_REVIEW")
         out["gates"] = {
             "G1": {"status": "done", "label": "Survivorship de-biased (1,858 delisted)"},
-            "G2": {"status": "done" if (out.get("top_decile") and float(out["top_decile"]) >= 55) else "amber",
-                   "label": f"WFO top-decile 58.2% OOS (Live 30d: {wfo_hit if wfo_hit is not None else '?'}% on n={wfo_n})"},
+            "G2": {"status": "done" if (_bt_td and float(_bt_td) >= 55 and not _live_bad) else "amber",
+                   "label": (f"Backtest top-decile {_bt_td}% | Live forward 30d hit-rate: "
+                             f"{wfo_hit if wfo_hit is not None else '?'}% on n={wfo_n}")},
             "G3": {"status": "done", "label": "Auto-Mode Enabled (No Manual Paper Wait)",
                    "progress": f"{open_v2} active auto-positions | {closed} closed"},
-            "G4": {"status": "done", "label": "60% Core ETF/Blue-Chip + 30% Satellite Active"},
-            "G5": {"status": "amber" if out["wfo_state"] != "GREEN" else "done",
-                   "label": f"WFO Gate State: {out['wfo_state']} (Risk limits enforced)"},
+            "G4": {"status": "done", "label": "Core 60% ETF/Blue-Chip sleeve active; Satellite tracked in Auto Mode"},
+            "G5": {"status": "done" if _wst == "GREEN" else ("red" if _live_bad else "amber"),
+                   "label": f"WFO Gate State: {_wst} (Risk limits enforced)"},
         }
         try:
             with db_conn() as conn:
@@ -15661,15 +15659,31 @@ async def model_health_summary(current_user: dict = Depends(get_current_user)):
                     "SELECT MIN(generated_at) FROM wealth_scan_history "
                     "WHERE scan_mode='broad' AND picks::text LIKE '%10pct%'"
                 )).scalar()
+            _hit_s = f"{wfo_hit}%" if wfo_hit is not None else "computing"
+            if _wst == "GREEN":
+                _sat_ok, _sat_pct = True, 5.5
+                _note = (f"Auto Mode is ACTIVE. WFO is GREEN ({wfo_n} forward signals, 30d hit-rate {_hit_s}). "
+                         "Core 60% sleeve and Satellite are cleared for SMSF execution within the risk limits.")
+            elif _live_bad:
+                _sat_ok, _sat_pct = False, 2.75
+                _note = (f"Auto Mode is ACTIVE and tracking, but WFO is RED: {wfo_n} forward signals, 30d hit-rate {_hit_s} "
+                         "with negative Sharpe — no proven live edge yet. Core 60% ETF/Franked sleeve is cleared for SMSF "
+                         "execution (it does not depend on the model). Satellite is NOT cleared for real money: keep it on "
+                         "paper, or at most half size (≤2.75% NAV per position), until WFO leaves RED.")
+            else:
+                _sat_ok, _sat_pct = False, 2.75
+                _note = (f"Auto Mode is ACTIVE. WFO is {_wst} ({wfo_n} forward signals, 30d hit-rate {_hit_s}). "
+                         "Core 60% sleeve is cleared for SMSF execution. Satellite stays paper / half size until WFO is GREEN.")
             lv = {
                 "frozen_model_earliest_signal": str(frozen_min)[:10] if frozen_min else "2026-08-12",
                 "legacy_earliest_signal": str(legacy_min)[:10] if legacy_min else "2026-07-18",
                 "wfo_evaluated_signals_30d": wfo_n,
                 "wfo_live_hit_rate_30d": wfo_hit,
-                "note": (
-                    f"Auto Mode is ACTIVE. WFO has evaluated {wfo_n} historical signal cohorts (30d hit-rate: {wfo_hit if wfo_hit is not None else 'computing'}%). "
-                    "Core 60% ETF/Franked sleeve + Top-Decile Satellite positions are ready for immediate SMSF execution."
-                ),
+                "wfo_state": _wst,
+                "core_cleared": True,
+                "satellite_real_money_ok": _sat_ok,
+                "satellite_max_pct_nav_each": _sat_pct,
+                "note": _note,
             }
             out["live_validation"] = lv
         except Exception:

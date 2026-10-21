@@ -314,21 +314,27 @@ export function CoreSleeveRow({ pos }) {
 }
 
 export function GGateProgress({ gates, paperClosed }) {
-  const icons = { done: '✅', amber: '🟡', open: '🔲' }
+  const icons = { done: '✅', amber: '🟡', red: '🔴', open: '🔲' }
   const MEANING = {
     G1: 'No survivor bias — the model trained on 1,858 delisted ASX stocks alongside active ones.',
-    G2: 'Top-decile model achieves 58.2% hit rate (2.7× base rate) and is validated on rolling walk-forward cohorts.',
+    G2: 'Backtest top-decile hit rate vs the LIVE forward hit rate. Only the live number counts for real money — a large gap means the backtest is not holding up.',
     G3: 'Auto-Mode is active — top-decile picks and Core ETF/Blue-Chip holdings execute automatically without manual waiting.',
-    G4: '60% Core Sleeve (VAS/VGS/QUAL/GOLD + Franked Blue Chips) + 30% Satellite Sleeve active.',
-    G5: 'Hard risk guardrails active: 7% max single stock, 25% sector cap, −20% catastrophe stop, 63-day time stop.',
+    G4: '60% Core Sleeve (VAS/VGS/QUAL/GOLD + Franked Blue Chips) active; Satellite is tracked in Auto Mode.',
+    G5: 'Walk-forward gate. RED = no proven live edge: Satellite stays on paper or at half size. GREEN = edge confirmed.',
   }
   const list = gates && Object.keys(gates).length ? gates : {
     G1: { status: 'done', label: 'Survivorship de-biased (1,858 delisted added)' },
-    G2: { status: 'done', label: 'WFO top-decile 58.2% hit rate validated' },
+    G2: { status: 'amber', label: 'Backtest top-decile vs live forward hit rate — loading…' },
     G3: { status: 'done', label: 'Auto-Mode Active (No Manual Paper Wait)' },
-    G4: { status: 'done', label: '60% Core + 30% Satellite Sleeve Ready' },
-    G5: { status: 'done', label: 'Risk guardrails & drawdown breaker active' },
+    G4: { status: 'done', label: 'Core 60% sleeve active; Satellite tracked in Auto Mode' },
+    G5: { status: 'amber', label: 'WFO gate state — loading…' },
   }
+  const g5 = list.G5?.status
+  const statusLine = g5 === 'done'
+    ? 'Status: WFO GREEN — Core sleeve and Satellite are cleared within the risk limits.'
+    : g5 === 'red'
+      ? 'Status: WFO RED — Core 60% sleeve is cleared for SMSF execution. Satellite is NOT cleared for real money (paper, or max half size) until WFO leaves RED.'
+      : 'Status: WFO not yet GREEN — Core 60% sleeve is cleared; keep Satellite on paper or half size until validated.'
   return (
     <div className="sx-ggate">
       <div className="sx-ggate-icons">{Object.keys(list).map(k => <span key={k}>{icons[list[k].status] || '🔲'} {k}</span>)}</div>
@@ -337,7 +343,7 @@ export function GGateProgress({ gates, paperClosed }) {
           <div className="sx-meta">— {MEANING[k] || ''}</div>
         </div>
       ))}
-      <div className="sx-meta">Status: READY FOR DISCIPLINED SMSF DEPLOYMENT — 60% Core Sleeve immediately + 30% Top-Decile Satellite in Auto Mode.</div>
+      <div className="sx-meta">{statusLine}</div>
     </div>
   )
 }
@@ -365,7 +371,17 @@ export function LiveValidationPanel({ health, wfo }) {
           </div>
         </div>
       ) : (
-        <div className="sx-meta">Validating… no decision-relevant WFO result yet.</div>
+        <div className="sx-meta">
+          {lv.wfo_state && lv.wfo_state !== 'INSUFFICIENT_DATA'
+            ? `Walk-forward verdict: ${lv.wfo_state}.`
+            : 'Validating… no decision-relevant WFO result yet.'}
+        </div>
+      )}
+      {lv.wfo_state && lv.wfo_state !== 'GREEN' && (
+        <div className="sx-action sx-action-amber">
+          {lv.wfo_state.startsWith('RED') ? '🔴' : '🟡'} WFO {lv.wfo_state}: Core sleeve cleared ·
+          Satellite {lv.satellite_real_money_ok ? 'cleared' : `NOT cleared for real money (paper, or ≤${lv.satellite_max_pct_nav_each}% NAV each)`}
+        </div>
       )}
       {lv.legacy_is_mixed && (
         <div className="sx-action sx-action-amber">

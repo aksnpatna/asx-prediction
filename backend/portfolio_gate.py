@@ -22,7 +22,7 @@ MAX_TOTAL_POSITIONS = 25
 MAX_SINGLE_POSITION_PCT = 0.07          # 7% of NAV max per satellite position
 MAX_SINGLE_POSITION_PCT_CORE = 0.12      # 12% for core holdings
 MAX_POSITION_PCT_OF_ADV = 0.02           # max 2% of 20-day ADV
-MIN_CASH_BUFFER_PCT = 0.15               # 15% cash floor
+MIN_CASH_BUFFER_PCT = 0.10               # 10% cash floor (60% Core + 30% Satellite + 10% Cash)
 MAX_PORTFOLIO_RISK_PER_TRADE_PCT = 0.015  # 1.5% NAV at risk per trade
 
 SECTOR_CAPS: Dict[str, float] = {

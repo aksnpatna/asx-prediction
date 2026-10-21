@@ -192,11 +192,11 @@ def _format_data_blob(state: AgentState) -> str:
 
     verdict_section = ""
     if model_ctx.get("prior_verdicts"):
-        verdict_section = "Prior AI Verdicts (last 3 days — anchor to continuity):\n"
+        verdict_section = "Prior AI Verdicts (last 3 days — informational context only):\n"
         for v in model_ctx["prior_verdicts"]:
             verdict_section += (f"  {v.get('date','?')}: {v.get('decision','?')} "
                                 f"(confidence {v.get('confidence','?')})\n")
-        verdict_section += "  If REJECTED before, state whether the reason has RESOLVED; if not, reject again.\n"
+        verdict_section += "  Evaluate today's quantitative model edge and setup independently; do NOT mechanically repeat a prior REJECT if the model probability has positive edge.\n"
 
     macro_section = ""
     if state.get("macro_data"):

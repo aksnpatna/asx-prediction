@@ -69,36 +69,38 @@ def get_core_candidates() -> List[Dict]:
 
 
 def compute_core_sleeve_state(conn, nav: float) -> Dict:
-    rows = conn.execute(
-        "SELECT symbol, qty, entry_price, sector, thesis, next_review_date, franking_pct, yield_est, created_at "
+    from sqlalchemy import text as _text
+    rows = conn.execute(_text(
+        "SELECT id, symbol, qty, entry_price, sector, thesis, next_review_date, franking_pct, yield_est, created_at "
         "FROM core_positions WHERE status = 'active' ORDER BY created_at"
-    ).fetchall()
+    )).fetchall()
 
     positions = []
     total_value = 0.0
     for row in rows:
-        sym, qty, entry, sector, thesis, review, franking, yld, created = row
-        val = (qty or 0) * (entry or 0)
+        pid, sym, qty, entry, sector, thesis, review, franking, yld, created = row
+        val = float(qty or 0) * float(entry or 0)
         total_value += val
         positions.append({
+            "id": pid,
             "symbol": sym,
-            "qty": qty,
-            "entry_price": entry,
+            "qty": float(qty or 0),
+            "entry_price": float(entry or 0),
             "value": round(val, 2),
             "pct_of_nav": round(val / nav * 100, 1) if nav > 0 else 0,
             "sector": sector,
             "thesis": thesis,
             "next_review": str(review) if review else None,
-            "franking_pct": franking,
-            "yield_est": yld,
-            "days_held": (date.today() - created.date()).days if created else 0,
+            "franking_pct": float(franking or 0),
+            "yield_est": float(yld or 0),
+            "days_held": (date.today() - created.date()).days if created and hasattr(created, "date") else 0,
         })
 
     core_nav_pct = round(total_value / nav * 100, 1) if nav > 0 else 0
     review_due = False
     now = date.today()
     for p in positions:
-        if p["next_review"] and date.fromisoformat(p["next_review"]) <= now:
+        if p["next_review"] and date.fromisoformat(p["next_review"][:10]) <= now:
             review_due = True
             break
 
@@ -120,46 +122,48 @@ def compute_core_sleeve_state(conn, nav: float) -> Dict:
 
 def create_core_position(conn, user_id: str, symbol: str, qty: float, entry_price: float,
                          market: str = "AU", notes: str = "") -> Optional[str]:
+    from sqlalchemy import text as _text
     sym_info = {**CORE_SYMBOLS, **CORE_ETF_SYMBOLS}.get(symbol.upper(), {})
     sector = sym_info.get("sector", "Unknown")
     thesis = sym_info.get("thesis", notes or "Manual core position")
     yield_est = sym_info.get("yield_est", 0)
     franking = sym_info.get("franking", 0)
 
-    existing = conn.execute(
-        "SELECT COUNT(*) FROM core_positions WHERE symbol = :sym AND status = 'active'",
-        {"sym": symbol.upper()}
-    ).fetchone()
+    existing = conn.execute(_text(
+        "SELECT COUNT(*) FROM core_positions WHERE symbol = :sym AND status = 'active' AND user_id = :uid"
+    ), {"sym": symbol.upper(), "uid": user_id}).fetchone()
     if existing and existing[0] > 0:
         return None
 
-    count = conn.execute(
-        "SELECT COUNT(*) FROM core_positions WHERE status = 'active'"
-    ).fetchone()
+    count = conn.execute(_text(
+        "SELECT COUNT(*) FROM core_positions WHERE status = 'active' AND user_id = :uid"
+    ), {"uid": user_id}).fetchone()
     if count and count[0] >= CORE_MAX_POSITIONS:
         return None
 
     pos_id = str(uuid.uuid4())
     next_review = get_next_review_date()
-    conn.execute(
+    conn.execute(_text(
         """INSERT INTO core_positions (id, user_id, symbol, market, qty, entry_price,
            sector, thesis, franking_pct, yield_est, next_review_date, status, notes)
            VALUES (:id, :uid, :sym, :mkt, :qty, :entry, :sector, :thesis,
-           :franking, :yield, :review, 'active', :notes)""",
-        {
-            "id": pos_id, "uid": user_id, "sym": symbol.upper(), "mkt": market,
-            "qty": qty, "entry": entry_price, "sector": sector,
-            "thesis": thesis, "franking": franking, "yield": yield_est,
-            "review": next_review.isoformat(), "notes": notes,
-        }
-    )
+           :franking, :yield, :review, 'active', :notes)"""
+    ), {
+        "id": pos_id, "uid": user_id, "sym": symbol.upper(), "mkt": market,
+        "qty": qty, "entry": entry_price, "sector": sector,
+        "thesis": thesis, "franking": franking, "yield": yield_est,
+        "review": next_review.isoformat(), "notes": notes,
+    })
+    conn.commit()
     return pos_id
 
 
 def close_core_position(conn, position_id: str, exit_reason: str = "manual") -> bool:
-    conn.execute(
+    from sqlalchemy import text as _text
+    conn.execute(_text(
         "UPDATE core_positions SET status = 'closed', exit_reason = :reason, "
-        "closed_at = NOW(), updated_at = NOW() WHERE id = :id",
-        {"reason": exit_reason, "id": position_id}
-    )
+        "closed_at = NOW(), updated_at = NOW() WHERE id = :id"
+    ), {"reason": exit_reason, "id": position_id})
+    conn.commit()
     return True
+

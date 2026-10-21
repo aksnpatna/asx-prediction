@@ -103,45 +103,62 @@ def get_upcoming_dividends(symbol: str, api_key: str = None) -> Optional[Dict]:
     if not api_key:
         import os
         api_key = os.getenv("EODHD_API_KEY", "")
-    if not api_key:
-        return None
 
+    if api_key:
+        try:
+            import requests
+            r = requests.get(
+                f"https://eodhd.com/api/div/{symbol}.AU",
+                params={"api_token": api_key, "fmt": "json",
+                        "from": date.today().isoformat()},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    upcoming = []
+                    for d in data:
+                        try:
+                            d_date = date.fromisoformat(d["date"][:10])
+                            if d_date > date.today():
+                                upcoming.append({
+                                    "date": str(d_date),
+                                    "days_to_ex_div": (d_date - date.today()).days,
+                                    "value": d.get("value", 0),
+                                })
+                        except Exception:
+                            continue
+                    if upcoming:
+                        next_div = upcoming[0]
+                        return {
+                            "symbol": symbol,
+                            "ex_div_date": next_div["date"],
+                            "days_to_ex_div": next_div["days_to_ex_div"],
+                            "dividend_amount": next_div["value"],
+                            "all_upcoming": upcoming[:3],
+                        }
+        except Exception:
+            pass
+
+    # Free yfinance fallback for ex-dividend date and dividend rate
     try:
-        import requests
-        r = requests.get(
-            f"https://eodhd.com/api/div/{symbol}.AU",
-            params={"api_token": api_key, "fmt": "json",
-                    "from": date.today().isoformat()},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return None
-
-        upcoming = []
-        for d in data:
-            try:
-                d_date = date.fromisoformat(d["date"][:10])
-                if d_date > date.today():
-                    upcoming.append({
-                        "date": str(d_date),
-                        "days_to_ex_div": (d_date - date.today()).days,
-                        "value": d.get("value", 0),
-                    })
-            except Exception:
-                continue
-
-        if upcoming:
-            next_div = upcoming[0]
-            return {
-                "symbol": symbol,
-                "ex_div_date": next_div["date"],
-                "days_to_ex_div": next_div["days_to_ex_div"],
-                "dividend_amount": next_div["value"],
-                "all_upcoming": upcoming[:3],
-            }
-        return None
+        import yfinance as yf
+        tk = yf.Ticker(f"{symbol.upper().replace('.AX', '')}.AX")
+        info = tk.info or {}
+        ex_ts = info.get("exDividendDate")
+        div_rate = info.get("dividendRate") or info.get("lastDividendValue") or 0
+        if ex_ts:
+            from datetime import datetime as _dt
+            d_date = _dt.utcfromtimestamp(int(ex_ts)).date() if isinstance(ex_ts, (int, float)) else date.fromisoformat(str(ex_ts)[:10])
+            if d_date >= date.today():
+                return {
+                    "symbol": symbol,
+                    "ex_div_date": str(d_date),
+                    "days_to_ex_div": (d_date - date.today()).days,
+                    "dividend_amount": round(float(div_rate) / 2.0, 4) if div_rate else 0,
+                    "all_upcoming": [{"date": str(d_date), "days_to_ex_div": (d_date - date.today()).days, "value": round(float(div_rate) / 2.0, 4) if div_rate else 0}],
+                }
     except Exception:
-        return None
+        pass
+    return None
+

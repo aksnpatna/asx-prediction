@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Test script to verify improved weekly_data predictions"""
+"""Weekly SMSF Engine Verification & Auto-Status Report (V2 Top-Decile + ETF Core)"""
 
 import requests
-import json
 
-# Try login directly since user is probably already registered
+BASE_URL = "http://localhost:8000"
+
 login_response = requests.post(
-    "http://localhost:8000/api/auth/login",
+    f"{BASE_URL}/api/auth/login",
     json={"email": "test-weekly@example.com", "password": "TestPassword123!"}
 )
-token = login_response.json().get("access_token")
+token = login_response.json().get("access_token") if login_response.ok else None
 
 if not token:
-    # Try register if login failed
-    login_response = requests.post(
-        "http://localhost:8000/api/auth/register",
+    requests.post(
+        f"{BASE_URL}/api/auth/register",
         json={
             "full_name": "Test User",
             "email": "test-weekly@example.com",
@@ -22,45 +21,33 @@ if not token:
         }
     )
     login_response = requests.post(
-        "http://localhost:8000/api/auth/login",
+        f"{BASE_URL}/api/auth/login",
         json={"email": "test-weekly@example.com", "password": "TestPassword123!"}
     )
-    token = login_response.json().get("access_token", "")
+    token = login_response.json().get("access_token", "") if login_response.ok else ""
 
 if token:
-    # Test ANZ analysis with new weekly_data
     headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(
-        "http://localhost:8000/api/ai/analyze/ANZ",
-        headers=headers
-    )
-    
-    data = response.json()
-    print("=" * 60)
-    print("ANZ ANALYSIS - WEEKLY DATA (IMPROVED PREDICTIONS)")
-    print("=" * 60)
-    
-    weekly = data.get("weekly_data", [])
-    if weekly:
-        print(f"\nTotal data points: {len(weekly)}\n")
-        print("Date         | Actual Price | Predicted Price | Difference")
-        print("-" * 60)
-        
-        total_error = 0
-        for day in weekly:
-            date = day["date"]
-            actual = day["actual_price"]
-            predicted = day["predicted_price"]
-            diff = actual - predicted
-            total_error += abs(diff)
-            
-            print(f"{date} | ${actual:>11.2f} | ${predicted:>14.2f} | ${diff:>10.2f}")
-        
-        avg_error = total_error / len(weekly) if weekly else 0
-        print("-" * 60)
-        print(f"Average Absolute Error: ${avg_error:.2f}\n")
-        print("✅ PREDICTIONS NOW USE ACTUAL MODEL (NOT RANDOM)")
-    else:
-        print("No weekly data returned")
+    scan = requests.get(f"{BASE_URL}/api/screener/scan", headers=headers).json()
+    etf = requests.get(f"{BASE_URL}/api/etf/signals", headers=headers).json()
+    health = requests.get(f"{BASE_URL}/api/model/health-summary", headers=headers).json()
+
+    print("=" * 72)
+    print("ASX SMSF V2 ENGINE — WEEKLY STATUS REPORT")
+    print("=" * 72)
+    print(f"Stocks Screened   : {scan.get('stocks_screened', 0)} (Last Scan: {scan.get('last_scan')})")
+    print(f"Model Top-Decile  : {scan.get('top_decile_hit')}% hit rate ({scan.get('model_edge')}x edge, AUC={scan.get('auc')})")
+    print(f"Deployable Picks  : {scan.get('high_conviction', 0)} top-decile (10pct/8pct) candidates")
+    print(f"WFO Gate State    : {health.get('wfo_state')}")
+    print(f"ETF Regime        : {etf.get('regime')} (As of {etf.get('as_of')})")
+    print("-" * 72)
+    print("Top 8 Satellite Candidates Today:")
+    for c in (scan.get("candidates") or [])[:8]:
+        print(f"  {c['symbol']:<6} | Tier: {c['tier']:<5} | Price: ${c.get('price') or 0:>7.2f} | Target: ${c.get('target_price') or 0:>7.2f} | SMSF Size: ${c.get('smsf_size') or 0:>6.0f}")
+    print("-" * 72)
+    print("ETF Target Weights:")
+    for sym, w in (etf.get("target_weights") or {}).items():
+        print(f"  {sym:<6} : {w*100:>5.1f}%")
+    print("=" * 72)
 else:
-    print("Failed to get authentication token")
+    print("Failed to authenticate with backend")

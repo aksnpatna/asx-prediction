@@ -222,115 +222,182 @@ def backfill_asx_universe(batch_size: int = 500, max_workers: int = 4):
 def incremental_daily_update() -> dict:
     """Daily job: fill OHLC gaps for the last 5 trading days.
 
-    Uses eod-bulk-last-day/AU (1 API call for all tickers).
-    Falls back to per-ticker fetch for failed symbols.
+    Uses eod-bulk-last-day/AU (1 API call for all tickers) when EODHD_API_KEY is active.
+    Falls back to free yfinance batch download for liquid universe + ETFs if EODHD fails or has no key.
+    Also refreshes market='ETF' (all 22 ETFs + XJO index) every day.
     """
     global _EODHD_KEY
     _EODHD_KEY = os.getenv("EODHD_API_KEY", "").strip()
-    if not _EODHD_KEY:
-        return {"status": "no_key"}
 
     from sqlalchemy import text
     from main import db_conn
 
     inserted = 0
+    bulk_ok = False
 
-    try:
-        r = requests.get(
-            "https://eodhd.com/api/eod-bulk-last-day/AU",
-            params={"api_token": _EODHD_KEY, "fmt": "json", "filter": "extended"},
-            timeout=60,
-        )
-        if r.status_code == 200:
-            bulk_data = r.json()
-            if isinstance(bulk_data, list):
-                rows = []
-                for item in bulk_data:
-                    code = item.get("code", "")
-                    if not code:
-                        continue
-                    sym = code.replace(".AU", "").replace(".AX", "")
-                    dt = item.get("date", date.today().isoformat())
-                    adjusted = item.get("adjusted_close")
-                    raw_close = item.get("close", 0)
-                    stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
-                    rows.append(
-                        (
-                            sym,
-                            "AU",
-                            dt,
-                            item.get("open"),
-                            item.get("high"),
-                            item.get("low"),
-                            stored_close,
-                            item.get("volume", 0),
+    if _EODHD_KEY:
+        try:
+            r = requests.get(
+                "https://eodhd.com/api/eod-bulk-last-day/AU",
+                params={"api_token": _EODHD_KEY, "fmt": "json", "filter": "extended"},
+                timeout=60,
+            )
+            if r.status_code == 200:
+                bulk_data = r.json()
+                if isinstance(bulk_data, list) and len(bulk_data) > 0:
+                    rows = []
+                    for item in bulk_data:
+                        code = item.get("code", "")
+                        if not code:
+                            continue
+                        sym = code.replace(".AU", "").replace(".AX", "")
+                        dt = item.get("date", date.today().isoformat())
+                        adjusted = item.get("adjusted_close")
+                        raw_close = item.get("close", 0)
+                        stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
+                        rows.append(
+                            (
+                                sym,
+                                "AU",
+                                dt,
+                                item.get("open"),
+                                item.get("high"),
+                                item.get("low"),
+                                stored_close,
+                                item.get("volume", 0),
+                            )
                         )
-                    )
 
-                if rows:
-                    with db_conn() as conn:
-                        _insert_ohlc_batch(conn, rows)
-                    inserted = len(rows)
-                    print(f"[IncUpdate] Bulk inserted {inserted} rows from eod-bulk-last-day.")
+                    if rows:
+                        with db_conn() as conn:
+                            _insert_ohlc_batch(conn, rows)
+                            conn.commit()
+                        inserted = len(rows)
+                        bulk_ok = True
+                        print(f"[IncUpdate] Bulk inserted {inserted} rows from eod-bulk-last-day.")
+        except Exception as e:
+            print(f"[IncUpdate] Bulk fetch failed: {e}")
+
+    # Free yfinance fallback for liquid universe when EODHD is disabled/expired
+    if not bulk_ok:
+        try:
+            import yfinance as yf
+            from config.universe import get_universe_symbols
+            syms = list(set(get_universe_symbols("core") + get_universe_symbols("broad")))
+            yf_rows = []
+            for i in range(0, len(syms), 50):
+                chunk_syms = syms[i : i + 50]
+                tickers_str = " ".join(f"{s}.AX" for s in chunk_syms)
+                df_dl = yf.download(tickers_str, period="5d", group_by="ticker", progress=False, threads=True)
+                if df_dl is None or df_dl.empty:
+                    continue
+                for s in chunk_syms:
+                    tk = f"{s}.AX"
+                    sub = df_dl[tk] if tk in df_dl else (df_dl if len(chunk_syms) == 1 else None)
+                    if sub is None or sub.empty:
+                        continue
+                    sub = sub.dropna(subset=["Close"])
+                    for idx_dt, r_val in sub.iterrows():
+                        dt_str = idx_dt.strftime("%Y-%m-%d") if hasattr(idx_dt, "strftime") else str(idx_dt)[:10]
+                        c_val = float(r_val["Close"])
+                        if c_val > 0:
+                            yf_rows.append((
+                                s, "AU", dt_str,
+                                float(r_val.get("Open", c_val)),
+                                float(r_val.get("High", c_val)),
+                                float(r_val.get("Low", c_val)),
+                                c_val,
+                                int(r_val.get("Volume", 0) or 0),
+                            ))
+            if yf_rows:
+                with db_conn() as conn:
+                    _insert_ohlc_batch(conn, yf_rows)
+                    conn.commit()
+                inserted += len(yf_rows)
+                print(f"[IncUpdate] Free yfinance fallback inserted {len(yf_rows)} AU rows.")
+        except Exception as e:
+            print(f"[IncUpdate] yfinance fallback error: {e}")
+
+    # Always refresh ETF universe + XJO index daily so ETF momentum signals are never stale
+    try:
+        etf_res = backfill_etf_universe(from_date_override=(date.today() - timedelta(days=15)).isoformat())
+        print(f"[IncUpdate] Daily ETF+XJO refresh: {etf_res}")
     except Exception as e:
-        print(f"[IncUpdate] Bulk fetch failed: {e}")
+        print(f"[IncUpdate] ETF refresh failed: {e}")
 
     return {"status": "ok", "rows_inserted": inserted}
 
 
-def backfill_etf_universe(max_workers: int = 3) -> dict:
+def backfill_etf_universe(max_workers: int = 3, from_date_override: str = None) -> dict:
     """Populate eod_ohl_history with OHLC for the ETF universe + XJO index.
 
-    ETF symbols are NOT in the common-stock list (Type='Common Stock' filter),
-    so they are backfilled here explicitly by trading ticker. XJO (ASX200 index)
-    is also backfilled here since it is not in the common-stock list and is
-    needed by the ETF regime signal (XJO vs SMA200).
-
-    IMPORTANT — isolation from the stock universe: rows are written with
-    market='ETF' (NOT 'AU'), so they do NOT leak into config/universe.py's
-    ranked list (which filters market='AU') or the stock satellite scan. This
-    avoids feeding ETFs/indexes into the stock model's fundamental fetch path.
-    Idempotent via ON CONFLICT in _insert_ohlc_batch.
+    Uses EODHD if available, and seamlessly falls back to free yfinance (.AX / ^AXJO)
+    so ETF and XJO data stays 100% current even without an EODHD subscription.
     """
     global _EODHD_KEY
     _EODHD_KEY = os.getenv("EODHD_API_KEY", "").strip()
-    if not _EODHD_KEY:
-        print("[ETFFill] No EODHD_API_KEY set. Aborting.")
-        return {"status": "no_key", "fetched": 0}
 
     from etf_universe import all_etf_symbols
     from main import db_conn
 
     symbols = all_etf_symbols()
-    index_targets = {"XJO": "XJO.INDX"}   # local symbol -> EODHD end-of-day code
+    index_targets = {"XJO": ("XJO.INDX", "^AXJO")}
     today = date.today().isoformat()
+    start_dt = from_date_override or FROM_DATE
     mkt = "ETF"
 
     results = {"fetched": 0, "failed": [], "symbols": len(symbols) + len(index_targets)}
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _rows_for(code, market=mkt):
-        data = _eodhd_historical(code, FROM_DATE, today, _EODHD_KEY)
-        if not data:
+    def _rows_for_yf(code: str, yf_ticker: str, market: str = mkt) -> list:
+        try:
+            import yfinance as yf
+            tk = yf.Ticker(yf_ticker)
+            hist = tk.history(start=start_dt, auto_adjust=True)
+            if hist is None or hist.empty:
+                return []
+            rows = []
+            for idx_dt, d in hist.iterrows():
+                dt = idx_dt.strftime("%Y-%m-%d") if hasattr(idx_dt, "strftime") else str(idx_dt)[:10]
+                c_val = float(d.get("Close", 0) or 0)
+                if c_val <= 0:
+                    continue
+                rows.append((
+                    code, market, dt,
+                    float(d.get("Open", c_val) or c_val),
+                    float(d.get("High", c_val) or c_val),
+                    float(d.get("Low", c_val) or c_val),
+                    c_val,
+                    int(d.get("Volume", 0) or 0),
+                ))
+            return rows
+        except Exception:
             return []
-        rows = []
-        for d in data:
-            dt = d.get("date", "")
-            if not dt:
-                continue
-            adjusted = d.get("adjusted_close")
-            raw_close = d.get("close", 0)
-            stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
-            rows.append((code, market, dt, d.get("open"), d.get("high"),
-                         d.get("low"), stored_close, d.get("volume", 0)))
-        return rows
+
+    def _rows_for(code, market=mkt):
+        data = _eodhd_historical(code, start_dt, today, _EODHD_KEY) if _EODHD_KEY else []
+        if data:
+            rows = []
+            for d in data:
+                dt = d.get("date", "")
+                if not dt:
+                    continue
+                adjusted = d.get("adjusted_close")
+                raw_close = d.get("close", 0)
+                stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
+                rows.append((code, market, dt, d.get("open"), d.get("high"),
+                             d.get("low"), stored_close, d.get("volume", 0)))
+            if rows:
+                return rows
+        return _rows_for_yf(code, f"{code}.AX", market)
 
     def _run(sym):
         rows = _rows_for(sym, mkt)
         if rows:
             with db_conn() as conn:
                 _insert_ohlc_batch(conn, rows)
+                conn.commit()
         return (sym, len(rows))
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -342,34 +409,40 @@ def backfill_etf_universe(max_workers: int = 3) -> dict:
             else:
                 results["failed"].append(sym)
 
-    # Backfill index targets (XJO) — indices use the .INDX suffix (NOT .AU),
-    # fetched with a direct request and stored under the local bare symbol.
-    for local, code in index_targets.items():
-        try:
-            url = f"https://eodhd.com/api/eod/{code}"
-            r = requests.get(url, params={"api_token": _EODHD_KEY, "fmt": "json",
-                                          "from": FROM_DATE, "to": today}, timeout=30)
-            rows = []
-            if r.status_code == 200 and isinstance(r.json(), list):
-                for d in r.json():
-                    dt = d.get("date", "")
-                    if not dt:
-                        continue
-                    adjusted = d.get("adjusted_close")
-                    raw_close = d.get("close", 0)
-                    stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
-                    rows.append((local, mkt, dt, d.get("open"), d.get("high"),
-                                 d.get("low"), stored_close, d.get("volume", 0)))
-            if rows:
+    # Backfill index targets (XJO) — EODHD .INDX first, then free yfinance ^AXJO fallback
+    for local, (eod_code, yf_code) in index_targets.items():
+        rows = []
+        if _EODHD_KEY:
+            try:
+                url = f"https://eodhd.com/api/eod/{eod_code}"
+                r = requests.get(url, params={"api_token": _EODHD_KEY, "fmt": "json",
+                                              "from": start_dt, "to": today}, timeout=30)
+                if r.status_code == 200 and isinstance(r.json(), list):
+                    for d in r.json():
+                        dt = d.get("date", "")
+                        if not dt:
+                            continue
+                        adjusted = d.get("adjusted_close")
+                        raw_close = d.get("close", 0)
+                        stored_close = adjusted if adjusted is not None and adjusted > 0 else raw_close
+                        rows.append((local, mkt, dt, d.get("open"), d.get("high"),
+                                     d.get("low"), stored_close, d.get("volume", 0)))
+            except Exception:
+                pass
+        if not rows:
+            rows = _rows_for_yf(local, yf_code, mkt)
+        if rows:
+            try:
                 with db_conn() as conn:
                     _insert_ohlc_batch(conn, rows)
+                    conn.commit()
                 results["fetched"] += 1
                 results["failed"] = [f for f in results["failed"] if f != local]
-            elif local not in results["failed"]:
-                results["failed"].append(local)
-        except Exception:
-            if local not in results["failed"]:
-                results["failed"].append(local)
+            except Exception:
+                if local not in results["failed"]:
+                    results["failed"].append(local)
+        elif local not in results["failed"]:
+            results["failed"].append(local)
 
     print(f"[ETFFill] Done: {results['fetched']}/{results['symbols']} populated (market='{mkt}'), failed={results['failed']}")
     return results

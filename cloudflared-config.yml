@@ -39,4 +39,9 @@ ingress:
     service: http://host.docker.internal:8005
   - hostname: invoice.akstest.win
     service: http://host.docker.internal:5174
+  - hostname: camping.akstest.win
+    path: /api
+    service: http://host.docker.internal:8021
+  - hostname: camping.akstest.win
+    service: http://host.docker.internal:3021
   - service: http_status:404

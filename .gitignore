@@ -67,3 +67,4 @@ backups/
 backend/data/*.json
 backend/data/eodhd_features.json
 weekly.log
+*.pkl

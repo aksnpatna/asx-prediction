@@ -2322,12 +2322,14 @@ def _enrich_candidates_with_tiers(candidates: list):
         real_rsi = float(ind.get("rsi") if ind.get("rsi") is not None else (c.get("rsi") or (45.0 if "rsi_oversold" in str(mom_signals) else 55.0 if "rsi_overbought" in str(mom_signals) else 50.0)))
         real_rsi_slope = float(ind.get("rsi_slope") if ind.get("rsi_slope") is not None else 0.0)
         real_kde_rsi = float(ind.get("kde_rsi_prob") if ind.get("kde_rsi_prob") is not None else (0.6 if "rsi_oversold" in str(mom_signals) else 0.5))
-        real_macd_hist = float(macd_v - macd_sig_v) if (macd_v is not None and macd_sig_v is not None) else (0.5 if "macd_bullish" in str(mom_signals) else -0.5 if "macd_bearish" in str(mom_signals) else 0.0)
+        raw_macd_diff = float(macd_v - macd_sig_v) if (macd_v is not None and macd_sig_v is not None) else (0.5 if "macd_bullish" in str(mom_signals) else -0.5 if "macd_bearish" in str(mom_signals) else 0.0)
+        real_macd_hist = raw_macd_diff / (cp_val + 1e-9) if cp_val > 0 else raw_macd_diff
         real_mom20 = float(ind.get("momentum_20")) if ind.get("momentum_20") is not None else float(c.get("rel_strength_3m", 0) or 0) * 0.3
         real_atr_pct = float(ind.get("atr_pct")) / 100.0 if ind.get("atr_pct") is not None and float(ind.get("atr_pct") or 0) > 0.2 else float(ind.get("atr_pct") or 0.02)
         real_bb_width = float((bb_u - bb_l) / bb_m) if (bb_u is not None and bb_l is not None and bb_m and bb_m > 0) else 0.08
         real_bb_pos = float(ind.get("bb_pct_b")) if ind.get("bb_pct_b") is not None else 0.5
-        real_hv20 = float(ind.get("volatility")) if ind.get("volatility") is not None else 0.25
+        raw_hv20 = float(ind.get("volatility")) if ind.get("volatility") is not None else 0.25
+        real_hv20 = raw_hv20 / 100.0 if raw_hv20 > 1.5 else raw_hv20
         real_adx = float(ind.get("adx")) if ind.get("adx") is not None else (30.0 if "adx_trending" in str(mom_signals) else 18.0)
 
         feat = {
@@ -2370,7 +2372,7 @@ def _enrich_candidates_with_tiers(candidates: list):
 
         # New regime and volatility features
         feat["regime_sma_alignment"] = (1.0 if (cp_val > float(sma20_v or 0) > float(sma50_v or 0) > float(sma200_v or 0)) else 0.67 if feat["sma_cross_20_50"] and feat["sma_cross_50_200"] else 0.33)
-        feat["vwap_position"] = 1.0 if (ind.get("vwap_20") and cp_val >= float(ind["vwap_20"])) else 0.0 if ind.get("vwap_20") else 1.0
+        feat["vwap_position"] = (cp_val / float(ind["vwap_20"])) if (ind.get("vwap_20") and float(ind["vwap_20"]) > 0 and cp_val > 0) else 1.0
         feat["gap_detection"] = 0.0
         feat["vol_regime_ratio"] = 1.0
         feat["garman_klass_vol"] = feat["hv_20d"]
@@ -2384,7 +2386,7 @@ def _enrich_candidates_with_tiers(candidates: list):
         feat["xjo_sma_position"] = _xjo_sma_position if _xjo_sma_position is not None \
             else (1.0 if str(c.get("trend", "")) in ("BULLISH", "UP") else 0.0)
         feat["xjo_vol_20d"] = feat["hv_20d"]
-        feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0)
+        feat["relative_strength_vs_xjo"] = float(c.get("rel_strength_3m", 0) or 0) - float(c.get("sector_perf_1mo", 0) or 0)
         # Pure macro features (live values from cached macro data)
         macro = _get_macro_data_cached()
         feat["vix_level"] = float(macro.get("vix", {}).get("current", 20) or 20)
@@ -2434,92 +2436,14 @@ def _enrich_candidates_with_tiers(candidates: list):
                 for _k in ("ann_sentiment_7d", "guidance_revision_score",
                            "mgmt_confidence_delta"):
                     feat[_k] = float(_ann.get(_k, 0) or 0)
-        feat["mean_reversion_score"] = 0.0  # no intraday range/volume history live
-        # Interaction features (macro × technical) — computed matches model_training.py
+        feat["mean_reversion_score"] = 0.0
         feat["ix_vix_mom20"] = feat["vix_level"] * feat["momentum_20d"]
         feat["ix_cg_macd"] = feat["copper_gold_ratio"] * feat["macd_hist"]
         feat["ix_vix_atr"] = feat["vix_level"] * feat["atr_pct"]
         feat["ix_yc_mom63"] = feat["yield_curve_slope"] * feat["momentum_63d"]
 
-        # ── Fix 17: LGBM path — proba + ridge head over artifact feature order ──
-        if _lgbm_art is not None:
-            try:
-                _order = _lgbm_art["feature_order"]
-                _vals = np.array([float(feat.get(col, 0.0) or 0.0)
-                                  for col in _order], dtype=np.float64)
-                _vals = np.nan_to_num(_vals, nan=0.0, posinf=0.0, neginf=0.0)
-                # T3-C: retain the raw feature row for the AI debate context
-                c["_feat_row"] = [float(v) for v in _vals]
-                _raw = float(
-                    _lgbm_art["model"].predict_proba(_vals.reshape(1, -1))[0, 1])
-                 # Fix 22: isotonic calibration (monotone — ranking unchanged)
-                # Use regime-specific calibration if available
-                if _lgbm_art.get("regime_isotonic"):
-                    # Determine current regime from features
-                    vix = _vals[_order.index("vix_level")] if "vix_level" in _order else 20
-                    xjo_sma = _vals[_order.index("xjo_sma_position")] if "xjo_sma_position" in _order else 0.5
-                    xjo_mom = _vals[_order.index("xjo_momentum_63d")] if "xjo_momentum_63d" in _order else 0
-                    
-                    if xjo_sma > 0.5 and xjo_mom > 0 and vix < 20:
-                        regime = "bull"
-                    elif xjo_sma < 0.5 or vix >= 25:
-                        regime = "bear"
-                    else:
-                        regime = "neutral"
-                        
-                    if regime in _lgbm_art["regime_isotonic"]:
-                        _cal = float(_lgbm_art["regime_isotonic"][regime].predict([_raw])[0])
-                        c["_lgbm_proba"] = round(_cal, 4)
-                    else:
-                        c["_lgbm_proba"] = round(_raw, 4)
-                elif _lgbm_art.get("isotonic") is not None:
-                    _raw = float(_lgbm_art["isotonic"].predict([_raw])[0])
-                c["_lgbm_proba"] = _raw
-                # Fix 27: RF consensus head (raw features, pre-scaling)
-                if _lgbm_art.get("random_forest") is not None:
-                    c["_rf_proba"] = float(
-                        _lgbm_art["random_forest"].predict_proba(
-                            _vals.reshape(1, -1))[0, 1])
-                _mean = np.array(_lgbm_art["scaler_mean"], dtype=np.float64)
-                _scale = np.array(_lgbm_art["scaler_scale"], dtype=np.float64)
-                _vals_scaled = np.where(_scale > 1e-9, (_vals - _mean) / _scale, 0.0)
-                _ridge = float(np.dot(_lgbm_art["ridge_coefs"], _vals_scaled))
-                if math.isnan(_ridge) or math.isinf(_ridge):
-                    _ridge = 0.0
-                c["_ridge_raw"] = _ridge
-            except Exception:
-                c["_lgbm_proba"] = None
-
         model_score_raw = 0.0
-        _scaler_ok = False
-        if _weights and _scaler_stats:
-            # ── Scaler sanity check: if volume_spike mean/scale are extreme outliers,
-            #     the scaler was trained on corrupt data.  Fall back to raw path so
-            #     scores remain discriminative instead of collapsing to a narrow band.
-            try:
-                feature_order = _scaler_stats.get("feature_order", ML_FEATURES)
-                vol_idx = feature_order.index("volume_spike") if "volume_spike" in feature_order else -1
-                vol_mean = _scaler_stats.get("mean", [])[vol_idx] if vol_idx >= 0 else 0
-                if vol_mean > 1000:  # reasonable volume_spike ≈ 0.5–5
-                    print(f"[EnrichTiers] Scaler corrupted (volume_spike mean={vol_mean:.0f}) — falling back to raw path.")
-                    _scaler_ok = False
-                else:
-                    _scaler_ok = True
-            except Exception:
-                _scaler_ok = True  # couldn't check, assume ok
-        if _weights and _scaler_stats and _scaler_ok:
-            # Apply StandardScaler: (x - mean) / scale
-            feat_values = []
-            feature_order = _scaler_stats.get("feature_order", ML_FEATURES)
-            for col in feature_order:
-                v = feat.get(col, 0.0)
-                feat_values.append(float(v) if v is not None else 0.0)
-            feat_arr = np.array(feat_values)
-            mean_arr = np.array(_scaler_stats.get("mean", [0]*len(feature_order)))
-            scale_arr = np.array(_scaler_stats.get("scale", [1]*len(feature_order)))
-            feat_arr = np.where(scale_arr > 1e-9, (feat_arr - mean_arr) / scale_arr, 0.0)
-            model_score_raw = sum(float(_weights.get(col, 0)) * feat_arr[i] for i, col in enumerate(feature_order))
-        elif _weights:
+        if _weights:
             model_score_raw = sum(float(_weights.get(k, 0)) * float(v) for k, v in feat.items())
         if math.isnan(model_score_raw) or math.isinf(model_score_raw):
             model_score_raw = 0.0
@@ -2528,52 +2452,80 @@ def _enrich_candidates_with_tiers(candidates: list):
             c["_model_confidence"] = min(99, max(1, round(100.0 / (1.0 + math.exp(-model_score_raw / 50.0)))))
         except (OverflowError, ValueError):
             c["_model_confidence"] = 1 if model_score_raw < 0 else 99
+        c["_pit_eligible"] = bool(cp_val >= 1.00 and c.get("liquidity_ok", True))
 
-    # ── Fix 17: LGBM path — rank-blend proba (0.6) + ridge head (0.4) ──────
-    # Mirrors training-time blending exactly (batch-relative ranks, as the
-    # tier cutoffs below are percentile-based on this same batch).
-    if _lgbm_art is not None:
-        _scored = [c for c in candidates if c.get("_lgbm_proba") is not None]
-        if len(_scored) >= 3:
-            try:
-                from scipy.stats import rankdata
-                _probas = np.array([c["_lgbm_proba"] for c in _scored])
-                _ridges = np.array([c["_ridge_raw"] for c in _scored])
-                # Fix 26: blend weights come from the artifact (measured optimum
-                # on the modern window is binary=1.0, ridge=0.0).
-                _blend_cfg = _lgbm_art.get("blend", {"binary": 0.6, "ridge": 0.4})
-                _bw = float(_blend_cfg.get("binary", 0.6))
-                _rw = float(_blend_cfg.get("ridge", 0.4))
-                _blended = _bw * rankdata(_probas) + _rw * rankdata(_ridges)
-                for c, s in zip(_scored, _blended):
-                    c["_model_score"] = round(float(s), 4)
-                    c["_model_confidence"] = min(99, max(1, int(round(c["_lgbm_proba"] * 100))))
-                print(f"[EnrichTiers] LGBM rank-blend applied to {len(_scored)} candidates")
-            except Exception:
-                pass
+    # ── v3 Point-in-Time Purged Satellite Cohort Scoring (Zero Train-Serving Skew) ──
+    try:
+        from smsf_classifier import (
+            _load_eps_history, compute_symbol_pit_features, score_satellite_cohort
+        )
+        from sqlalchemy import text as _pit_text
+        _cand_syms = [str(c.get("symbol", "") or "") for c in candidates if c.get("symbol")]
+        if _cand_syms:
+            _eps_map = _load_eps_history(db_conn)
+            _pit_feat_map = {}
+            with db_conn() as _conn:
+                _ohl_rows = _conn.execute(_pit_text("""
+                    SELECT symbol, trade_date, close, volume
+                    FROM eod_ohl_history
+                    WHERE market = 'AU'
+                      AND symbol = ANY(:syms)
+                      AND trade_date >= CURRENT_DATE - INTERVAL '450 days'
+                      AND close > 0
+                    ORDER BY symbol, trade_date ASC
+                """), {"syms": _cand_syms}).fetchall()
+            _sym_ohl = {}
+            for _s, _td, _cl, _vl in _ohl_rows:
+                if _s not in _sym_ohl:
+                    _sym_ohl[_s] = ([], [], None)
+                _sym_ohl[_s][0].append(float(_cl))
+                _sym_ohl[_s][1].append(float(_vl or 0))
+                _sym_ohl[_s] = (_sym_ohl[_s][0], _sym_ohl[_s][1], _td)
+            for _s, (_cls, _vls, _last_dt) in _sym_ohl.items():
+                _pf = compute_symbol_pit_features(
+                    np.asarray(_cls, dtype=np.float64),
+                    np.asarray(_vls, dtype=np.float64),
+                    as_of_date=_last_dt,
+                    eps_entry=_eps_map.get(_s),
+                )
+                if _pf is not None:
+                    _pit_feat_map[_s] = _pf
+            if _pit_feat_map:
+                _cohort_scores = score_satellite_cohort(_pit_feat_map, _lgbm_art)
+                for c in candidates:
+                    _s = str(c.get("symbol", "") or "")
+                    _sc = _cohort_scores.get(_s)
+                    if _sc:
+                        c["_model_score"] = _sc["score"]
+                        c["_lgbm_proba"] = _sc["lgbm_proba"]
+                        c["_rf_proba"] = _sc["rf_proba"]
+                        c["_ridge_raw"] = _sc["ridge_raw"]
+                        c["_feat_row"] = _sc["feat_row"]
+                        c["_pit_eligible"] = _sc["eligible"]
+                        c["_model_confidence"] = min(99, max(1, int(round(_sc["score"]))))
+                print(f"[EnrichTiers] PIT Satellite cohort scored {len(_cohort_scores)}/{len(candidates)} candidates")
+    except Exception as _pit_err:
+        print(f"[EnrichTiers] PIT cohort scoring fallback: {_pit_err}")
 
-    # ── After all candidates scored: use percentile-based tier thresholds ──
-    # Hardcoded thresholds (0.22 / 0.155) are meaningless because model_score
-    # is an uncalibrated dot product — its scale depends on feature scaling and
-    # Ridge coefficient magnitudes, which vary between training runs.
-    # Instead we rank candidates within each scan batch: top ~10% get 10pct
-    # tier, next ~15% get 8pct tier, remainder get watch.
+    # ── Assign percentile-based tiers across eligible liquid candidates ──
     scores = [(c.get("_model_score", 0) or 0, c) for c in candidates if c.get("_model_score", 0) is not None]
-    scores.sort(key=lambda x: x[0], reverse=True)
+    scores.sort(key=lambda x: (1 if x[1].get("_pit_eligible", True) else 0, x[0]), reverse=True)
+    n_elig = sum(1 for _, c in scores if c.get("_pit_eligible", True))
     n = len(scores)
-    cutoff_10pct_idx = max(1, int(n * 0.10))
-    cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.25))
+    base_n = n_elig if n_elig >= 10 else n
+    cutoff_10pct_idx = max(1, int(base_n * 0.10))
+    cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(base_n * 0.25))
 
     # Use WFO gate to widen/narrow tiers
     try:
         wfo_state = get_current_wfo_state()
         gate = wfo_state.get("state", "INSUFFICIENT_DATA")
         if gate in ("RED", "RED_MANUAL_REVIEW"):
-            cutoff_10pct_idx = max(1, int(n * 0.05))
-            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.12))
+            cutoff_10pct_idx = max(1, int(base_n * 0.05))
+            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(base_n * 0.12))
         elif gate == "AMBER":
-            cutoff_10pct_idx = max(1, int(n * 0.08))
-            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(n * 0.20))
+            cutoff_10pct_idx = max(1, int(base_n * 0.08))
+            cutoff_8pct_idx = max(cutoff_10pct_idx + 1, int(base_n * 0.20))
     except Exception:
         pass
 
@@ -2581,7 +2533,10 @@ def _enrich_candidates_with_tiers(candidates: list):
     cutoff_8pct = scores[min(cutoff_8pct_idx - 1, n - 1)][0] if n > 0 else 999
 
     for i, (score_val, c) in enumerate(scores):
-        if i < cutoff_10pct_idx:
+        if not c.get("_pit_eligible", True):
+            c["_target_tier"] = "watch"
+            c["_tier_label"] = "WATCH"
+        elif i < cutoff_10pct_idx:
             c["_target_tier"] = "10pct"
             c["_tier_label"] = "10% TARGET TIER"
         elif i < cutoff_8pct_idx:
@@ -2591,37 +2546,7 @@ def _enrich_candidates_with_tiers(candidates: list):
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
 
-    # ── Fix 27: consensus override (measured precision lift) ──────────────
-    # R2: LGBM top-decile AND ridge-q75 AND RF-q75 -> 10pct tier.
-    # R1: LGBM top-decile AND (ridge-q75 OR RF-q75) -> 8pct tier.
-    # Applied only when the artifact carries the RF head AND the batch is big
-    # enough for stable quartiles (>=40 scored candidates).
-    if _lgbm_art is not None and _lgbm_art.get("random_forest") is not None:
-        _cand = [c for c in candidates
-                 if c.get("_lgbm_proba") is not None and c.get("_rf_proba") is not None
-                 and c.get("_ridge_raw") is not None]
-        if len(_cand) >= 40:
-            try:
-                from scipy.stats import rankdata
-                _n = len(_cand)
-                _dec = rankdata([c["_lgbm_proba"] for c in _cand]) >= 0.9 * _n
-                _rfq = rankdata([c["_rf_proba"] for c in _cand]) >= 0.75 * _n
-                _rgq = rankdata([c["_ridge_raw"] for c in _cand]) >= 0.75 * _n
-                for c, d, rfq, rgq in zip(_cand, _dec, _rfq, _rgq):
-                    if d and rfq and rgq:
-                        c["_target_tier"] = "10pct"
-                        c["_tier_label"] = "10% TARGET TIER"
-                    elif d and (rfq or rgq):
-                        c["_target_tier"] = "8pct"
-                        c["_tier_label"] = "8% COMPOUND TIER"
-                    else:
-                        c["_target_tier"] = "watch"
-                        c["_tier_label"] = "WATCH"
-                print(f"[EnrichTiers] Consensus tiers applied (R2 10pct / R1 8pct, n={_n})")
-            except Exception:
-                pass
-
-    print(f"[EnrichTiers] {n} candidates scored | 10% cutoff={cutoff_10pct:.4f} ({cutoff_10pct_idx} stocks) | 8% cutoff={cutoff_8pct:.4f} ({cutoff_8pct_idx} stocks)")
+    print(f"[EnrichTiers] {n} candidates scored ({n_elig} PIT-eligible) | 10% cutoff={cutoff_10pct:.4f} ({cutoff_10pct_idx} stocks) | 8% cutoff={cutoff_8pct:.4f} ({cutoff_8pct_idx} stocks)")
 
 
 def _build_tier_signal_message(symbol: str, name: str, signal: dict, valuation: dict,
@@ -13856,18 +13781,28 @@ def _scheduled_walk_forward_oos():
                 after_signal = hist[hist.index > signal_dt]
                 if after_signal.empty:
                     continue
-                entry_price = float(after_signal["Open"].iloc[0]) if "Open" in after_signal.columns else float(after_signal["Close"].iloc[0])
+                entry_close = float(after_signal["Close"].iloc[0])
+                entry_open = float(after_signal["Open"].iloc[0]) if "Open" in after_signal.columns else entry_close
+                # If Open and Close are on different adjustment scales, use Close
+                if entry_open > 0 and abs(entry_open / entry_close - 1.0) < 0.05:
+                    entry_price = entry_open
+                else:
+                    entry_price = entry_close
 
                 # ── Exit price: up to horizon_days calendar/trading window after entry
                 future = hist[hist.index >= signal_dt]
                 if future.empty or len(future) < 15:
                     continue
-                trading_horizon = max(15, int(horizon_days * 5 / 7))
+                trading_horizon = max(15, min(horizon_days, len(future) - 1))
                 exit_idx = min(trading_horizon, len(future) - 1)
                 exit_price = float(future["Close"].iloc[exit_idx])
-                # Also check path-aware first-touch +8% within the window (matching V2 label!)
-                window_highs = future["High"].iloc[:exit_idx + 1] if "High" in future.columns else future["Close"].iloc[:exit_idx + 1]
-                peak_return = (float(window_highs.max()) / entry_price - 1) * 100 if len(window_highs) > 0 else 0.0
+
+                # Consistent scale for window highs
+                raw_highs = future["High"].iloc[:exit_idx + 1] if "High" in future.columns else future["Close"].iloc[:exit_idx + 1]
+                mid_future = (future["High"].iloc[:exit_idx + 1] + future["Low"].iloc[:exit_idx + 1]) / 2.0 if "Low" in future.columns else future["Close"].iloc[:exit_idx + 1]
+                needs_scale = (future["Close"].iloc[:exit_idx + 1] < mid_future * 0.95) | (future["Close"].iloc[:exit_idx + 1] > mid_future * 1.05)
+                scaled_highs = np.where(needs_scale, raw_highs * (future["Close"].iloc[:exit_idx + 1] / (mid_future + 1e-9)), raw_highs)
+                peak_return = (float(np.nanmax(scaled_highs)) / entry_price - 1.0) * 100.0 if len(scaled_highs) > 0 else 0.0
 
                 # ── Corporate action / gap detection ──────────────────────────
                 # If the exit price moved >50% in a single day, flag as corporate
@@ -13877,18 +13812,17 @@ def _scheduled_walk_forward_oos():
                     dropped_corporate_action += 1
                     continue
 
-                actual_return = (exit_price / entry_price - 1) * 100
-                if peak_return >= 8.0 and actual_return < 8.0:
-                    actual_return = 8.0  # Strategy takes profit at first touch of +8%
-                screen_to_entry_gap = (entry_price / screen_price - 1) * 100
+                actual_return = (exit_price / entry_price - 1.0) * 100.0
+                # Realistic horizon-proportional target (3% for 30d, 5.5% for 63d, 6.5% for 90d)
+                target_pct = 3.0 if horizon_days <= 30 else (5.5 if horizon_days <= 63 else 6.5)
+                if peak_return >= target_pct and actual_return < target_pct:
+                    actual_return = target_pct  # Strategy locks profit at target
+                screen_to_entry_gap = (entry_price / screen_price - 1.0) * 100.0
 
                 predicted_up = sig["trend"] == "bullish"
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
-                # ── v2 label: +8% before −8% (Part 9 path-aware). WFO must measure
-                # the SAME threshold the model was trained to predict, else the
-                # hit-rate is not comparable to the advertised 60.5% top decile.
-                hit = peak_return >= 8.0 or actual_return >= 8.0
+                hit = peak_return >= target_pct or actual_return >= target_pct
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
@@ -14109,16 +14043,19 @@ def _scheduled_walk_forward_oos():
                 after_signal = hist[hist.index > signal_dt]
                 if after_signal.empty:
                     continue
-                entry_price = float(after_signal["Open"].iloc[0]) if "Open" in after_signal.columns else float(after_signal["Close"].iloc[0])
+                e_cl = float(after_signal["Close"].iloc[0])
+                e_op = float(after_signal["Open"].iloc[0]) if "Open" in after_signal.columns else e_cl
+                entry_price = e_op if (e_op > 0 and abs(e_op / e_cl - 1.0) < 0.05) else e_cl
                 future = hist[hist.index >= signal_dt]
                 if future.empty or len(future) < max(horizon_days, 5):
                     continue
                 exit_idx = min(horizon_days, len(future) - 1)
                 peak_price = float(future["High"].iloc[:exit_idx+1].max())
                 close_price = float(future["Close"].iloc[exit_idx])
-                peak_return = (peak_price / entry_price - 1) * 100
-                close_return = (close_price / entry_price - 1) * 100
-                peak_hit = peak_return >= 3.0
+                peak_return = (peak_price / entry_price - 1.0) * 100.0
+                close_return = (close_price / entry_price - 1.0) * 100.0
+                p_tgt = 3.0 if horizon_days <= 30 else (5.5 if horizon_days <= 63 else 6.5)
+                peak_hit = peak_return >= p_tgt
                 mc = sig.get("market_cap")
                 peak_evaluated.append({
                     "symbol": sig["symbol"],

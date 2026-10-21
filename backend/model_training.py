@@ -51,9 +51,19 @@ FEATURE_COLS = [
 def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """Vectorized: compute all features for every row in df in one pass. O(n)."""
     close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    open_ = df["Open"].astype(float)
+    raw_high = df["High"].astype(float)
+    raw_low = df["Low"].astype(float)
+    raw_open = df["Open"].astype(float)
+    # Fix historical dividend-adjusted Close vs unadjusted Open/High/Low in eod_ohl_history
+    mid_hl = ((raw_high + raw_low) / 2.0).where((raw_high + raw_low) > 0, close)
+    needs_adj = (close < raw_low * 0.995) | (close > raw_high * 1.005)
+    adj_ratio = (close / (mid_hl + 1e-9)).where(needs_adj, 1.0).rolling(5, min_periods=1).median()
+    high = np.maximum(np.where(needs_adj, raw_high * adj_ratio, raw_high), close)
+    low = np.minimum(np.where(needs_adj, raw_low * adj_ratio, raw_low), close)
+    open_ = np.where(needs_adj, raw_open * adj_ratio, raw_open)
+    high = pd.Series(high, index=df.index, dtype=float)
+    low = pd.Series(low, index=df.index, dtype=float)
+    open_ = pd.Series(open_, index=df.index, dtype=float)
     vol = df.get("Volume", pd.Series(0, index=df.index)).astype(float)
     n = len(df)
 
@@ -173,8 +183,9 @@ def _build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     rsi_recovering = ((rsi_low_10d < 35) & (rsi_now > 40)).astype(float)
     vol_20d_avg = vol.rolling(20).mean().shift(1)
     vol_dry_up = (1 - vol / (vol_20d_avg + 1e-9)).clip(0, 1)
-    high_52w = close.rolling(252).max()
+    high_52w = close.rolling(252, min_periods=20).max()
     pct_from_high = (close / (high_52w + 1e-9) - 1) * 100
+    fm["fund_pct_from_52w_high"] = pct_from_high.fillna(0)
     in_sweet_spot = ((-40 <= pct_from_high) & (pct_from_high <= -15)).astype(float)
     daily_range = (high - low) / (close + 1e-9)
     range_narrowing = (daily_range.rolling(5).mean() < daily_range.rolling(60).mean() * 0.7).astype(float)
@@ -492,12 +503,11 @@ def _enrich_fundamentals():
                         ELSE 3 END,
                     'fund_earnings_growth', COALESCE(f.earnings_growth * 100, 0),
                     'fund_revenue_growth', COALESCE(f.revenue_growth * 100, 0),
-                    'fund_beta', COALESCE(f.beta, 1),
-                    'fund_pct_from_52w_high', CASE WHEN f.high_52w > 0
-                        THEN (mts.entry_price / f.high_52w - 1) * 100 ELSE 0 END
+                    'fund_beta', COALESCE(f.beta, 1)
                 )
                 FROM fundamental_snapshots f
                 WHERE f.symbol = mts.symbol
+                  AND f.snapshot_date <= mts.signal_date
                   AND (NOT (mts.features ? 'fund_pe_inv') OR (mts.features->>'fund_pe_inv')::numeric = 0)
                   AND f.trailing_pe IS NOT NULL
             """)).rowcount

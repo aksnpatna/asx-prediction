@@ -1774,165 +1774,76 @@ def _eodhd_fundamentals(symbol: str, market: str) -> dict:
     return {}
 
 def get_valuation_metrics(symbol: str, market: str = None) -> dict:
-    """Fetch valuation metrics — DB snapshot first, then free yfinance fallback."""
+    """Fetch valuation metrics from local PostgreSQL (fundamental_snapshots + eps_history + eod_ohl_history) without slow yfinance calls."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     if market is None:
         market = detect_market(s)
 
-    # 1. Try cached monthly fundamental snapshot (fast, no API call)
+    # 1. Read from local PostgreSQL fundamental_snapshots (5,742 rows) + eps_history (9,839 rows)
     try:
         from fundamental_feeder import get_fundamentals_for_symbol
-        cached = get_fundamentals_for_symbol(s)
-        if cached and (cached.get("trailing_pe") is not None or cached.get("market_cap") is not None):
-            current_p = 0
-            try:
-                sd = get_stock_data(s, market)
-                current_p = sd.get("current_price", 0) or 0
-            except Exception:
-                pass
-            upside = None
-            if cached.get("analyst_target_mean") and current_p > 0:
-                upside = round((float(cached["analyst_target_mean"]) / current_p - 1) * 100, 2)
-            return {
-                "pe": cached.get("trailing_pe"),
-                "forward_pe": cached.get("forward_pe"),
-                "market_cap": cached.get("market_cap"),
-                "dividend_yield": cached.get("dividend_yield"),
-                "analyst_target_mean": cached.get("analyst_target_mean"),
-                "analyst_upside_pct": upside,
-                "analyst_recommendation": cached.get("analyst_rec", ""),
-                "revenue_growth": cached.get("revenue_growth"),
-                "earnings_growth": cached.get("earnings_growth"),
-                "52w_high": cached.get("high_52w"),
-                "52w_low": cached.get("low_52w"),
-                "pct_from_52w_high": round((current_p / float(cached["high_52w"]) - 1) * 100, 2) if cached.get("high_52w") and current_p > 0 else None,
-                "avg_volume": cached.get("avg_volume"),
-                "beta": cached.get("beta"),
-                "pb": cached.get("price_to_book"),
-                "sector": cached.get("sector") or ASX_SECTORS.get(s, ""),
-                "_source": "db_snapshot",
-            }
-    except Exception:
-        pass
-
-    # 2. Free yfinance fallback (no $59 EODHD plan needed)
-    eodhd_data = {}
-    
-    # 3. Fallback to yfinance ONLY if EODHD data is missing or empty
-    stock = None
-    info = {}
-    if not eodhd_data or not eodhd_data.get("market_cap"):
-        with _YFINANCE_LOCK:
-            stock = yf.Ticker(format_ticker(s, market))
+        cached = get_fundamentals_for_symbol(s) or {}
+        current_p = 0.0
+        high_52w = cached.get("high_52w")
+        low_52w = cached.get("low_52w")
         try:
-            with _YFINANCE_LOCK:
-                info = stock.info
-        except:
+            with db_conn() as conn:
+                r_price = conn.execute(text(
+                    "SELECT close FROM eod_ohl_history WHERE symbol=:s AND close > 0 ORDER BY trade_date DESC LIMIT 1"
+                ), {"s": s}).fetchone()
+                if r_price and r_price[0]:
+                    current_p = float(r_price[0])
+                if not high_52w or not low_52w:
+                    r_hl = conn.execute(text(
+                        "SELECT MAX(high), MIN(low) FROM eod_ohl_history WHERE symbol=:s AND trade_date >= CURRENT_DATE - INTERVAL '365 days'"
+                    ), {"s": s}).fetchone()
+                    if r_hl and r_hl[0]:
+                        high_52w = high_52w or float(r_hl[0])
+                        low_52w = low_52w or float(r_hl[1])
+        except Exception:
             pass
-    
-    # Handle dividend yield (comes as decimal like 0.042, convert to %)
-    div_yield = info.get('dividendYield')
-    if div_yield is not None:
-        div_yield = float(div_yield) * 100 if div_yield < 1 else float(div_yield)
-    
-    market_cap = info.get('marketCap')
-    if market_cap is not None:
-        market_cap = float(market_cap)
-
-    target_mean = eodhd_data.get('analyst_target_mean') or info.get('targetMeanPrice')
-    target_high = info.get('targetHighPrice')
-    target_low  = info.get('targetLowPrice')
-    current_p   = info.get('currentPrice') or info.get('regularMarketPreviousClose') or 0
-    upside_to_target = None
-    if target_mean and current_p and current_p > 0:
-        upside_to_target = round(((float(target_mean) - float(current_p)) / float(current_p)) * 100, 2)
-
-    high_52w = eodhd_data.get('52w_high') or info.get('fiftyTwoWeekHigh')
-    low_52w  = eodhd_data.get('52w_low') or info.get('fiftyTwoWeekLow')
-    pct_from_52w_high = None
-    if high_52w and current_p and current_p > 0:
-        pct_from_52w_high = round(((float(current_p) - float(high_52w)) / float(high_52w)) * 100, 2)
-
-    short_pct = eodhd_data.get('short_pct_float') or info.get('shortPercentOfFloat')
-    if short_pct is not None and short_pct < 1:
-        short_pct = round(float(short_pct) * 100, 2)
-
-    trailing_eps = eodhd_data.get('trailing_eps') or info.get('trailingEps')
-    forward_eps  = eodhd_data.get('forward_eps') or info.get('forwardEps')
-    eps_growth_fwd = eodhd_data.get('eps_growth_fwd_pct')
-    if eps_growth_fwd is None and trailing_eps and forward_eps and float(trailing_eps) != 0:
-        eps_growth_fwd = round(((float(forward_eps) - float(trailing_eps)) / abs(float(trailing_eps))) * 100, 2)
-
-    next_earnings_date = None
-    days_to_earnings = None
-    try:
-        if stock is not None:
-            cal = stock.calendar
-            if cal is not None:
-                if hasattr(cal, 'T'):
-                    if 'Earnings Date' in cal.index:
-                        raw_ed = cal.loc['Earnings Date']
-                        raw_ed = raw_ed.dropna() if hasattr(raw_ed, 'dropna') else raw_ed
-                        if hasattr(raw_ed, 'iloc') and len(raw_ed) > 0:
-                            raw_ed = raw_ed.iloc[0]
-                        if hasattr(raw_ed, 'date'):
-                            next_earnings_date = str(raw_ed.date())
-                elif isinstance(cal, dict):
-                    raw_ed = cal.get('Earnings Date')
-                    if raw_ed:
-                        if isinstance(raw_ed, list) and len(raw_ed) > 0:
-                            raw_ed = raw_ed[0]
-                        if hasattr(raw_ed, 'date'):
-                            next_earnings_date = str(raw_ed.date())
-                        elif isinstance(raw_ed, str):
-                            next_earnings_date = raw_ed
-        if next_earnings_date:
-            from datetime import date as _date
-            ed = _date.fromisoformat(next_earnings_date[:10])
-            days_to_earnings = (ed - datetime.utcnow().date()).days
+        upside = None
+        if cached.get("analyst_target_mean") and current_p > 0:
+            upside = round((float(cached["analyst_target_mean"]) / current_p - 1) * 100, 2)
+        return {
+            "pe": cached.get("trailing_pe"),
+            "forward_pe": cached.get("forward_pe"),
+            "market_cap": cached.get("market_cap"),
+            "dividend_yield": cached.get("dividend_yield"),
+            "analyst_target_mean": cached.get("analyst_target_mean"),
+            "analyst_upside_pct": upside,
+            "analyst_recommendation": cached.get("analyst_rec", ""),
+            "revenue_growth": cached.get("revenue_growth"),
+            "earnings_growth": cached.get("earnings_growth"),
+            "52w_high": round(float(high_52w), 3) if high_52w else None,
+            "52w_low": round(float(low_52w), 3) if low_52w else None,
+            "pct_from_52w_high": round((current_p / float(high_52w) - 1) * 100, 2) if high_52w and current_p > 0 else None,
+            "avg_volume": cached.get("avg_volume"),
+            "beta": cached.get("beta"),
+            "pb": cached.get("price_to_book"),
+            "sector": cached.get("sector") or ASX_SECTORS.get(s, ""),
+            "days_to_earnings": None,
+            "_source": "db_snapshot",
+        }
     except Exception:
-        pass
-
-    return {
-        "pe": eodhd_data.get('pe') or info.get('trailingPE'),
-        "forward_pe": eodhd_data.get('forward_pe') or info.get('forwardPE'),
-        "peg": info.get('pegRatio'),
-        "pb": info.get('priceToBook'),
-        "dividend_yield": eodhd_data.get('dividend_yield') or div_yield,
-        "market_cap": eodhd_data.get('market_cap') or market_cap,
-        "sector": eodhd_data.get('sector') or info.get('sector'),
-        "industry": eodhd_data.get('industry') or info.get('industry'),
-        "analyst_target_mean": round(float(target_mean), 2) if target_mean else None,
-        "analyst_target_high": round(float(target_high), 2) if target_high else None,
-        "analyst_target_low":  round(float(target_low), 2)  if target_low  else None,
-        "analyst_upside_pct":  upside_to_target,
-        "analyst_recommendation": eodhd_data.get('analyst_recommendation') or info.get('recommendationKey'),
-        "num_analyst_opinions": eodhd_data.get('num_analyst_opinions') or info.get('numberOfAnalystOpinions'),
-        "next_earnings_date": next_earnings_date,
-        "days_to_earnings": days_to_earnings,
-        "short_pct_float": short_pct,
-        "52w_high": round(float(high_52w), 3) if high_52w else None,
-        "52w_low":  round(float(low_52w), 3)  if low_52w  else None,
-        "pct_from_52w_high": pct_from_52w_high,
-    }
+        return {"sector": ASX_SECTORS.get(s, ""), "_source": "fallback"}
 
 
 def get_risk_metrics(symbol: str) -> dict:
-    """Calculate risk metrics: Beta, Max Drawdown, Sharpe Ratio"""
+    """Calculate risk metrics (Beta, Max Drawdown, Sharpe Ratio) using local eod_ohl_history + EODHD $19 plan."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
     market = detect_market(s)
-    stock = yf.Ticker(format_ticker(s, market))
 
-    # Get 1 year of data for calculations
-    hist = stock.history(period="1y")
+    # Get 1 year of data from local DB / EODHD $19 plan (no flaky yfinance call)
+    hist = get_historical_data(s, "1y", market)
 
-    if len(hist) < 50:
+    if hist is None or hist.empty or len(hist) < 50:
         return {"beta": None, "max_drawdown_90d": None, "sharpe_90d": None}
 
-    # Use the appropriate benchmark index for beta
-    _benchmark_ticker = {"US": "^GSPC", "IN": "^NSEI"}.get(market, "^AXJO")
+    # Use local XJO benchmark from eod_ohl_history (market='ETF', symbol='XJO')
+    asx200 = None
     try:
-        asx200 = yf.Ticker(_benchmark_ticker).history(period="1y")
+        asx200 = get_historical_data("XJO", "1y", "ETF")
     except Exception:
         asx200 = None
     

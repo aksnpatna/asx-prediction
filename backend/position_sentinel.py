@@ -150,8 +150,18 @@ def evaluate_position(
     buy_thesis: str = "",
     macro_note: str = "",
 ) -> Dict:
-    pnl_pct = (current_price / entry_price - 1) * 100
-    days_held = (date.today() - entry_date).days
+    if isinstance(entry_date, datetime):
+        entry_date = entry_date.date()
+    elif isinstance(entry_date, str):
+        try:
+            entry_date = date.fromisoformat(entry_date[:10])
+        except Exception:
+            entry_date = date.today()
+    elif not isinstance(entry_date, date):
+        entry_date = date.today()
+
+    pnl_pct = (current_price / entry_price - 1) * 100 if entry_price else 0.0
+    days_held = max(0, (date.today() - entry_date).days)
 
     prompt = build_sentinel_prompt(
         symbol, sector, entry_date, entry_price, current_price,

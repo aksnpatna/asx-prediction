@@ -16308,6 +16308,24 @@ def _scheduled_smsf_pipeline():
         from macro_rotation import classify_regime, build_telegram_regime_report
 
         users = _get_all_telegram_users()
+        wfo = get_current_wfo_state()
+        cal = get_calendar_status(
+            wfo_state=wfo["state"],
+            axjo_vs_sma200_pct=_get_axjo_vs_sma200(),
+            vix=_get_vix_level(),
+        )
+        if cal.get("stop_tighten_pct", 0) > 0:
+            alerts.append(f"📅 Calendar: {cal['reason']} — tighten stops by {cal['stop_tighten_pct']}%")
+
+        macro_note = ""
+        try:
+            regime = classify_regime({})
+            macro_note = regime.get("alert", "")
+        except Exception:
+            pass
+
+        eval_cache = {}
+        alerted_syms = set()
         for user in users:
             uid = user["id"]
             paper = list_paper_trades(uid)
@@ -16315,42 +16333,33 @@ def _scheduled_smsf_pipeline():
             if not open_positions:
                 continue
 
-            # Calendar gate
-            wfo = get_current_wfo_state()
-            cal = get_calendar_status(
-                wfo_state=wfo["state"],
-                axjo_vs_sma200_pct=_get_axjo_vs_sma200(),
-                vix=_get_vix_level(),
-            )
-            if cal.get("stop_tighten_pct", 0) > 0:
-                alerts.append(f"📅 Calendar: {cal['reason']} — tighten stops by {cal['stop_tighten_pct']}%")
-
-            # Position sentinel
-            macro_note = ""
-            try:
-                regime = classify_regime({})
-                macro_note = regime.get("alert", "")
-            except Exception:
-                pass
-
             for pos in open_positions:
+                sym = pos.get("symbol", "")
+                if not sym:
+                    continue
                 try:
-                    result = evaluate_position(
-                        symbol=pos.get("symbol", ""),
-                        sector=pos.get("sector", "Unknown"),
-                        entry_date=pos.get("entry_date_parsed", date.today()),
-                        entry_price=float(pos.get("entry_price", 0)),
-                        current_price=float(pos.get("current_price", 0)),
-                    )
+                    if sym not in eval_cache:
+                        eval_cache[sym] = evaluate_position(
+                            symbol=sym,
+                            sector=pos.get("sector", "Unknown"),
+                            entry_date=pos.get("entry_date_parsed") or pos.get("entry_date") or date.today(),
+                            entry_price=float(pos.get("entry_price", 0)),
+                            current_price=float(pos.get("current_price", 0)),
+                            macro_note=macro_note,
+                        )
+                    result = eval_cache[sym]
                     if result.get("verdict") == "BROKEN":
-                        alerts.append(f"🚨 SENTINEL BROKEN: {result['symbol']} — {result.get('reason','')[:100]}")
-                        _auto_close_paper_trade(uid, result["symbol"], "AU",
+                        if sym not in alerted_syms:
+                            alerts.append(f"🚨 SENTINEL BROKEN: {result['symbol']} — {result.get('reason','')[:100]}")
+                            alerted_syms.add(sym)
+                        _auto_close_paper_trade(uid, result["symbol"], pos.get("market") or "AU",
                                                 float(pos.get("current_price", 0)),
                                                 reason="smsf_pipeline")
-                    elif result.get("verdict") == "WEAKENED":
+                    elif result.get("verdict") == "WEAKENED" and sym not in alerted_syms:
                         alerts.append(f"⚠️ SENTINEL WEAKENED: {result['symbol']} — {result.get('reason','')[:100]}")
+                        alerted_syms.add(sym)
                 except Exception as e:
-                    print(f"[SMSF] Sentinel failed for {pos.get('symbol')}: {e}")
+                    print(f"[SMSF] Sentinel failed for {sym}: {e}")
 
         if alerts:
             _send_telegram_broadcast("\n".join(alerts), "smsf_sentinel")
@@ -16431,9 +16440,10 @@ def _scheduled_pipeline_health_report():
                 "SELECT MAX(trade_date) FROM eod_ohl_history"
             )).fetchone()
             latest_ohlc = r[0] if r else None
-            days_behind = (today - latest_ohlc).days if latest_ohlc and hasattr(latest_ohlc, 'date') else 99
+            latest_d = latest_ohlc.date() if hasattr(latest_ohlc, "date") else latest_ohlc
+            days_behind = (today - latest_d).days if isinstance(latest_d, date) else 99
             if days_behind <= 1:
-                _ok("Data", f"latest {latest_ohlc}")
+                _ok("Data", f"latest {latest_d}")
             elif days_behind <= 2:
                 _warn("Data", f"{days_behind}d stale")
             else:
@@ -16545,7 +16555,7 @@ def _scheduled_pipeline_health_report():
 
             # 9. Pipeline activity check (failure alerting)
             r = c.execute(text(
-                "SELECT COUNT(*) FROM job_runs WHERE started_at >= CURRENT_DATE"
+                "SELECT COUNT(*) FROM job_run_log WHERE started_at >= CURRENT_DATE"
             )).fetchone()
             jobs_today = r[0] if r else 0
             if jobs_today == 0:

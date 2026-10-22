@@ -1773,6 +1773,28 @@ def _eodhd_fundamentals(symbol: str, market: str) -> dict:
     """$59/mo EODHD Fundamentals plan retired — returns {} so local DB snapshots & free yfinance are used."""
     return {}
 
+ASX_SECTORS = {
+    "BHP": "Materials", "RIO": "Materials", "FMG": "Materials", "MIN": "Materials", "PLS": "Materials",
+    "CBA": "Financials", "NAB": "Financials", "ANZ": "Financials", "WBC": "Financials", "MQG": "Financials",
+    "CSL": "Healthcare", "COH": "Healthcare", "RMD": "Healthcare", "SHL": "Healthcare",
+    "WES": "Consumer Discretionary", "WOW": "Consumer Staples", "COL": "Consumer Staples",
+    "WDS": "Energy", "STO": "Energy", "BPT": "Energy", "WHC": "Energy",
+    "TLS": "Telecommunications", "XRO": "Technology", "WTC": "Technology", "TNE": "Technology",
+    "GMG": "Real Estate", "SCG": "Real Estate", "TCL": "Industrials", "QAN": "Industrials"
+}
+try:
+    _sec_map_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sector_map.json")
+    if os.path.exists(_sec_map_path):
+        with open(_sec_map_path, "r") as _f:
+            _loaded = json.load(_f)
+            for _k, _v in _loaded.items():
+                if isinstance(_v, dict) and "sector" in _v:
+                    ASX_SECTORS[_k] = _v["sector"]
+                elif isinstance(_v, str):
+                    ASX_SECTORS[_k] = _v
+except Exception:
+    pass
+
 def get_valuation_metrics(symbol: str, market: str = None) -> dict:
     """Fetch valuation metrics from local PostgreSQL (fundamental_snapshots + eps_history + eod_ohl_history) without slow yfinance calls."""
     s = symbol.upper().replace(".AX", "").replace(".NS", "")
@@ -13189,14 +13211,9 @@ def _scheduled_v2_daily_scan():
         picks_json = json.dumps(candidates_sorted[:200], default=str)
         with db_conn() as conn:
             conn.execute(text("""
-                INSERT INTO wealth_scan_cache (scan_mode, scanned_count, candidates_found, picks, generated_at)
-                VALUES ('broad', :sc, :cf, :picks, NOW())
-                ON CONFLICT (scan_mode) DO UPDATE SET
-                    scanned_count = EXCLUDED.scanned_count,
-                    candidates_found = EXCLUDED.candidates_found,
-                    picks = EXCLUDED.picks,
-                    generated_at = NOW()
-            """), {"sc": len(candidates), "cf": len(candidates_sorted), "picks": picks_json})
+                INSERT INTO wealth_scan_cache (id, market, scan_mode, scanned_count, candidates_found, picks, generated_at)
+                VALUES (:id, 'AU', 'broad', :sc, :cf, :picks, NOW())
+            """), {"id": str(uuid4()), "sc": len(candidates), "cf": len(candidates_sorted), "picks": picks_json})
     except Exception as e:
         print(f"[V2DailyScan] Cache sync failed (non-blocking): {e}")
 
@@ -16506,7 +16523,7 @@ def _scheduled_pipeline_health_report():
 
             # 9. Pipeline activity check (failure alerting)
             r = c.execute(text(
-                "SELECT COUNT(*) FROM job_run_log WHERE started_at >= CURRENT_DATE"
+                "SELECT COUNT(*) FROM job_runs WHERE started_at >= CURRENT_DATE"
             )).fetchone()
             jobs_today = r[0] if r else 0
             if jobs_today == 0:

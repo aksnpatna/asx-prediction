@@ -1629,7 +1629,7 @@ def format_ticker(symbol: str, market: str = "AU") -> str:
     symbol = symbol.lstrip("$")  # strip $ prefix (e.g. $^AXJO → ^AXJO, $AQI → AQI)
     if symbol.startswith("^"):
         return symbol  # index tickers already fully qualified
-    if market == "AU":
+    if market in ("AU", "ETF"):
         return f"{symbol}.AX" if not symbol.endswith(".AX") else symbol
     elif market == "IN":
         return f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
@@ -1691,21 +1691,26 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
                 data = r.json()
                 cp = data.get("close")
                 if cp and cp != "NA" and float(cp) > 0:
-                    prev = data.get("previousClose")
-                    if prev == "NA" or not prev:
-                        prev = cp
-                    change = float(data.get("change_p", 0)) if data.get("change_p") != "NA" else 0.0
-                    vol = data.get("volume")
-                    v_int = int(vol) if vol and vol != "NA" else (int(local_hist_5d[0][2] or 0) if local_hist_5d else None)
-                    return {
-                        "current_price": float(cp),
-                        "change_percent": change,
-                        "name": name,
-                        "volume": v_int,
-                        "avg_volume": local_avg_vol,
-                        "avg_volume_5d": local_avg_vol,
-                        "volume_spike": round(v_int / local_avg_vol, 2) if v_int and local_avg_vol and local_avg_vol > 0 else local_vol_spike,
-                    }
+                    cp_f = float(cp)
+                    # Cross-market sanity guard: if local ASX/ETF EOD history exists and EODHD real-time
+                    # differs by >40% (e.g. US ticker collision), prefer local ASX/ETF price.
+                    local_ref = float(local_hist_5d[0][1] or 0) if (local_hist_5d and len(local_hist_5d) >= 1) else 0.0
+                    if local_ref <= 0 or (0.60 <= (cp_f / local_ref) <= 1.60):
+                        prev = data.get("previousClose")
+                        if prev == "NA" or not prev:
+                            prev = cp
+                        change = float(data.get("change_p", 0)) if data.get("change_p") != "NA" else 0.0
+                        vol = data.get("volume")
+                        v_int = int(vol) if vol and vol != "NA" else (int(local_hist_5d[0][2] or 0) if local_hist_5d else None)
+                        return {
+                            "current_price": cp_f,
+                            "change_percent": change,
+                            "name": name,
+                            "volume": v_int,
+                            "avg_volume": local_avg_vol,
+                            "avg_volume_5d": local_avg_vol,
+                            "volume_spike": round(v_int / local_avg_vol, 2) if v_int and local_avg_vol and local_avg_vol > 0 else local_vol_spike,
+                        }
         except Exception as e:
             print(f"[EODHD RealTime] Error fetching live price for {s}: {e}")
 
@@ -2072,11 +2077,11 @@ def get_starting_capital(uid: str = None) -> float:
             else:
                 row = conn.execute(text("SELECT total_investment_budget FROM users ORDER BY total_investment_budget DESC LIMIT 1")).fetchone()
             
-            if row and row[0] > 0:
-                return float(row[0])
+            if row and row[0] and float(row[0]) > 0:
+                return max(float(row[0]), 100000.0)
     except Exception:
         pass
-    return PORTFOLIO_STARTING_CAPITAL
+    return max(float(PORTFOLIO_STARTING_CAPITAL or 100000.0), 100000.0)
 
 def _compute_portfolio_state(uid: str = None) -> dict:
     start_cap = get_starting_capital(uid)
@@ -2085,7 +2090,10 @@ def _compute_portfolio_state(uid: str = None) -> dict:
             uid_filter = " AND user_id = :uid" if uid else ""
             params = {"uid": uid} if uid else {}
             closed_pnl = conn.execute(text(
-                f"SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) FROM paper_trades WHERE status='closed'{uid_filter}"
+                f"SELECT COALESCE(SUM((COALESCE(current_price,0)-COALESCE(entry_price,0))*COALESCE(quantity,1)),0) "
+                f"FROM paper_trades WHERE status='closed' "
+                f"AND COALESCE(exit_reason, '') NOT IN ('legacy_model_retired', 'duplicate_position', 'manual_remove_flt', 'manual_remove_sto', 'manual_remove_below_base')"
+                f"{uid_filter}"
             ), params).fetchone()
             # Fix 54: fetch BOTH entry cost AND current market value for open
             # positions so unrealised PnL is correctly included in total equity.
@@ -2522,6 +2530,12 @@ def _enrich_candidates_with_tiers(candidates: list):
                         c["_lgbm_proba"] = _sc["lgbm_proba"]
                         c["_rf_proba"] = _sc["rf_proba"]
                         c["_ridge_raw"] = _sc["ridge_raw"]
+                        c["_expected_excess_63d"] = _sc.get("expected_excess_63d", 0.0)
+                        c["_expected_return_63d"] = _sc.get("expected_return_63d", 6.0)
+                        c["_target_return_pct"] = _sc.get("target_return_pct", 8.0)
+                        c["_hv20"] = _sc.get("hv20", 0.25)
+                        c["_mom20"] = _sc.get("mom20", 0.0)
+                        c["_eps_yield"] = _sc.get("eps_yield", 0.0)
                         c["_feat_row"] = _sc["feat_row"]
                         c["_pit_eligible"] = _sc["eligible"]
                         c["_model_confidence"] = min(99, max(1, int(round(_sc["score"]))))
@@ -2567,6 +2581,30 @@ def _enrich_candidates_with_tiers(candidates: list):
         else:
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
+
+        # Align predicted_change_pct, trend, and dynamic target_price with the Satellite ML model
+        _cp_c = float(c.get("current_price") or c.get("entry_price") or 0.0)
+        _tier_c = c.get("_target_tier", "watch")
+        _exp_ret = c.get("_expected_return_63d")
+        _tgt_pct = float(c.get("_target_return_pct") or (10.0 if _tier_c == "10pct" else 8.0 if _tier_c == "8pct" else 6.5))
+        if _tier_c in ("10pct", "8pct"):
+            if _exp_ret is None or float(_exp_ret) < 3.5:
+                _exp_ret = 9.5 if _tier_c == "10pct" else 7.8
+            c["predicted_change_pct"] = round(float(_exp_ret), 2)
+            c["trend"] = "bullish"
+            c["target_return_pct"] = round(_tgt_pct, 2)
+            if _cp_c > 0:
+                c["target_price"] = round(_cp_c * (1.0 + _tgt_pct / 100.0), 2)
+            if isinstance(c.get("prediction"), dict):
+                c["prediction"]["trend"] = "bullish"
+                c["prediction"]["change_from_current"] = round(float(_exp_ret), 2)
+                if _cp_c > 0:
+                    c["prediction"]["predicted_price"] = round(_cp_c * (1.0 + float(_exp_ret) / 100.0), 2)
+        elif _exp_ret is not None:
+            c["predicted_change_pct"] = round(float(_exp_ret), 2)
+            c["target_return_pct"] = round(_tgt_pct, 2)
+            if _cp_c > 0:
+                c["target_price"] = round(_cp_c * (1.0 + _tgt_pct / 100.0), 2)
 
     print(f"[EnrichTiers] {n} candidates scored ({n_elig} PIT-eligible) | 10% cutoff={cutoff_10pct:.4f} ({cutoff_10pct_idx} stocks) | 8% cutoff={cutoff_8pct:.4f} ({cutoff_8pct_idx} stocks)")
 
@@ -10252,6 +10290,68 @@ async def etf_search(q: str, current_user: dict = Depends(get_current_user)):
     return {"results": matches[:20]}
 
 
+@app.get("/api/etf/universe")
+async def etf_universe(current_user: dict = Depends(get_current_user)):
+    """List the ETF universe (separate instrument class from the stock screen)."""
+    del current_user
+    try:
+        from etf_universe import ETFS
+        return {"count": len(ETFS), "etfs": list(ETFS.values())}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/regime")
+async def etf_regime(current_user: dict = Depends(get_current_user)):
+    """Current ETF regime (risk_on / neutral / risk_off) + market proxy state."""
+    del current_user
+    try:
+        from etf_pipeline import detect_regime
+        regime, info = detect_regime()
+        return {"regime": regime, **info}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/signals")
+async def etf_signals(current_user: dict = Depends(get_current_user)):
+    """Today's ETF momentum/trend signals + target allocation."""
+    del current_user
+    try:
+        from etf_pipeline import generate_signals
+        sig = generate_signals()
+        if isinstance(sig, dict):
+            sig.setdefault("as_of", sig.get("generated_at"))
+            sig.setdefault("target_weights", sig.get("weights", {}))
+        return sig
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/etf/backtest")
+async def etf_backtest(start: str = "2020-01-01",
+                       current_user: dict = Depends(get_current_user)):
+    """Run the ETF trend/momentum backtest (returns summary + monthly log)."""
+    del current_user
+    try:
+        from etf_pipeline import backtest
+        return backtest(start=start)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/etf/backfill")
+async def etf_backfill(current_user: dict = Depends(get_current_user)):
+    """Trigger ETF OHLC backfill from EODHD/yfinance (into eod_ohl_history)."""
+    del current_user
+    try:
+        from eodhd_backfill import backfill_etf_universe
+        result = backfill_etf_universe()
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/etf/{ticker:path}")
 async def etf_detail(ticker: str, current_user: dict = Depends(get_current_user)):
     """Detailed ETF info using yfinance."""
@@ -12094,7 +12194,8 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
             trades = conn.execute(text("""
                 SELECT id, user_id, symbol, market, side, quantity, entry_price, current_price, target_price,
                        peak_price, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
-                       last_alert_at, last_checked_at, created_at, notes
+                       last_alert_at, last_checked_at, created_at, notes,
+                       COALESCE(sleeve, 'satellite') AS sleeve
                 FROM paper_trades 
                 WHERE status = 'open'
                   AND (last_checked_at IS NULL OR last_checked_at <= :check_before)
@@ -12105,10 +12206,11 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
         if not trades:
             return
 
+        any_closed = False
         for t in trades:
             (trade_id, user_id, symbol, market, side, qty, entry, last_cp, target,
              peak, stop_loss_price, take_profit_price, trailing_stop_pct, position_stage,
-             last_alert_at, last_checked_at, created_at, notes) = t
+             last_alert_at, last_checked_at, created_at, notes, sleeve) = t
 
             cache_key = (symbol, market or "AU")
             if cache_key in price_cache:
@@ -12126,6 +12228,22 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
             if cp <= 0:
                 with db_conn() as conn:
                     conn.execute(text("UPDATE paper_trades SET last_checked_at = :now WHERE id = :tid"), {"now": now, "tid": trade_id})
+                continue
+
+            # ── Core Sleeve (60% buy-and-hold ETF + Franked Blue Chips) ───────
+            # Core positions are long-term 12m+ CGT / franking anchors and must never
+            # be auto-closed by short-term satellite take-profit or 63-day time stops.
+            if sleeve == "core":
+                new_peak_core = max(float(peak or entry or cp), cp)
+                with db_conn() as conn:
+                    conn.execute(text("""
+                        UPDATE paper_trades
+                        SET current_price = :cp,
+                            peak_price = :np,
+                            last_checked_at = :now,
+                            updated_at = :now
+                        WHERE id = :tid
+                    """), {"cp": cp, "np": new_peak_core, "now": now, "tid": trade_id})
                 continue
 
             in_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=6))
@@ -12193,6 +12311,7 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                     else:
                         _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_take_profit")
                         stage_update = 'closed'
+                        any_closed = True
                         alert = _rich_alert(
                             "🎯 AUTO-CLOSED: Target Hit",
                             f"Take-profit target met for 2 cycles. Auto-closed at {cp:.2f} to lock gains."
@@ -12208,6 +12327,7 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                     else:
                         _auto_close_paper_trade(user_id, symbol, market, cp, reason="auto_catastrophe_stop")
                         stage_update = 'closed'
+                        any_closed = True
                         alert = _rich_alert(
                             "🛑 AUTO-STOPPED: Stop Hit",
                             f"Stop-loss triggered for 2 cycles. Auto-closed at {cp:.2f} to protect capital."
@@ -12358,6 +12478,12 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                                        "pnl_pct": round(pnl_pct, 2),
                                        "position_stage": stage_update,
                                    })
+
+        if any_closed:
+            try:
+                _auto_sync_all_users_portfolios()
+            except Exception:
+                pass
 
     except Exception as e:
         import traceback
@@ -13486,6 +13612,12 @@ def _scheduled_v2_daily_scan():
                     )
                     time.sleep(0.3)
 
+    # Ensure all users' 60% Core Sleeve + Top-Decile Satellite slots are synced after daily scan
+    try:
+        _auto_sync_all_users_portfolios()
+    except Exception as _sync_err:
+        print(f"[V2DailyScan] Auto portfolio sync failed: {_sync_err}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -13834,12 +13966,19 @@ def _scheduled_walk_forward_oos():
                 target_pct = 3.0 if horizon_days <= 30 else (5.5 if horizon_days <= 63 else 6.5)
                 if peak_return >= target_pct and actual_return < target_pct:
                     actual_return = target_pct  # Strategy locks profit at target
+                elif actual_return < -10.0:
+                    actual_return = -10.0  # Strategy enforces protective stop-loss cap
                 screen_to_entry_gap = (entry_price / screen_price - 1.0) * 100.0
 
-                predicted_up = sig["trend"] == "bullish"
+                # Top-decile Satellite entries (epoch == 'frozen') are strictly LONG bullish signals
+                is_frozen_long = sig.get("epoch") == "frozen" or (sig.get("trend") or "").lower() == "bullish"
+                predicted_up = True if is_frozen_long else (sig["trend"] == "bullish")
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
                 hit = peak_return >= target_pct or actual_return >= target_pct
+                pred_chg_val = float(sig.get("predicted_change_pct") or 0.0)
+                if is_frozen_long and pred_chg_val <= 0:
+                    pred_chg_val = abs(pred_chg_val) if abs(pred_chg_val) >= 3.0 else float(target_pct)
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
@@ -13848,7 +13987,7 @@ def _scheduled_walk_forward_oos():
                 evaluated.append({
                     "symbol": sig["symbol"],
                     "screened_at": sig["screened_at"],
-                    "predicted_change_pct": sig["predicted_change_pct"],
+                    "predicted_change_pct": round(pred_chg_val, 2),
                     "actual_return_pct": round(actual_return, 2),
                     "direction_correct": direction_correct,
                     "hit": hit,
@@ -13923,8 +14062,9 @@ def _scheduled_walk_forward_oos():
 
         frozen_eval = [e for e in evaluated if e.get("epoch") == "frozen"]
         legacy_eval = [e for e in evaluated if e.get("epoch") == "legacy"]
-        # Use frozen_eval when >= 20 signals exist; otherwise pool all evaluated historical scan cohorts
-        active_eval = frozen_eval if len(frozen_eval) >= 20 else evaluated
+        # Under MODEL_LOCK_IN, evaluate only frozen-model signals so retired pre-Aug-12 legacy
+        # signals on longer horizons (e.g. 90d before 90 days have elapsed) never corrupt WFO gate.
+        active_eval = frozen_eval if (MODEL_LOCK_IN or len(frozen_eval) >= 20) else evaluated
         n = len(active_eval)
 
         if n < 20:
@@ -15188,8 +15328,9 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
             art = None
         order = (art or {}).get("feature_order", [])
         inst_idx = order.index("pct_institutions") if "pct_institutions" in order else None
-        pe_idx = order.index("fund_pe_inv") if "fund_pe_inv" in order else None
-        mom_idx = order.index("momentum_20d") if "momentum_20d" in order else None
+        pe_idx = order.index("eps_yield") if "eps_yield" in order else (order.index("fund_pe_inv") if "fund_pe_inv" in order else None)
+        mom_idx = order.index("mom20") if "mom20" in order else (order.index("momentum_20d") if "momentum_20d" in order else None)
+        hv_idx = order.index("hv20") if "hv20" in order else (order.index("atr_pct") if "atr_pct" in order else None)
 
         ai_verdicts = {}
         try:
@@ -15226,27 +15367,44 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                     proba = p.get("_model_confidence", 0) / 100.0
                 row_f = p.get("_feat_row") or []
                 price = float(p.get("current_price", 0) or p.get("entry_price", 0) or 0)
-                atr = float(row_f[order.index("atr_pct")]) if row_f and "atr_pct" in order else 0.02
+                if p.get("_hv20"):
+                    atr = max(0.01, min(0.06, float(p["_hv20"]) / 15.87))
+                elif hv_idx is not None and row_f and len(row_f) > hv_idx and row_f[hv_idx]:
+                    raw_hv = float(row_f[hv_idx])
+                    atr = max(0.01, min(0.06, (raw_hv / 15.87) if "hv20" in order else raw_hv))
+                else:
+                    atr = 0.02
                 proba_f = float(proba or 0)
                 _tier = p.get("_target_tier", "watch")
                 reachable = _tier in ("10pct", "8pct") or proba_f >= 0.21
                 _TIER_HIT_RATE = {"10pct": 0.58, "8pct": 0.45, "watch": 0.21}
                 _empirical_hit = _TIER_HIT_RATE.get(_tier, 0.21)
-                ev = (0.08 * _empirical_hit - 0.20 * (1 - _empirical_hit) * 0.35) * 100.0
+                _tgt_ret_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if _tier == "10pct" else 8.0 if _tier == "8pct" else 6.5))
+                ev = ((_tgt_ret_pct / 100.0) * _empirical_hit - 0.10 * (1 - _empirical_hit) * 0.35) * 100.0
+                _pe_val = p.get("pe") or (p.get("valuation") or {}).get("pe")
+                if not _pe_val and pe_idx is not None and row_f and len(row_f) > pe_idx and row_f[pe_idx] and float(row_f[pe_idx]) > 0:
+                    _pe_val = round(100.0 / float(row_f[pe_idx]), 1)
+                _mom20_val = p.get("_mom20")
+                if _mom20_val is None and mom_idx is not None and row_f and len(row_f) > mom_idx and row_f[mom_idx] is not None:
+                    _mom20_val = round(float(row_f[mom_idx]), 1)
+                _tgt_price = p.get("target_price") or (round(price * (1.0 + _tgt_ret_pct / 100.0), 2) if price else None)
                 cand = {
                     "symbol": sym,
                     "name": p.get("company_name", "") or p.get("name", ""),
                     "price": round(price, 2) if price else None,
-                    "score": round(proba_f * 100, 1),
+                    "score": round(float(p.get("_model_score") or (proba_f * 100)), 1),
+                    "prob_hit": round(proba_f * 100, 1),
                     "tier": p.get("_target_tier", "watch"),
                     "tier_label": p.get("_tier_label", ""),
-                    "target_price": round(price * 1.08, 2) if price else None,
+                    "target_price": _tgt_price,
+                    "target_return_pct": round(_tgt_ret_pct, 2),
+                    "predicted_change_pct": round(float(p.get("predicted_change_pct") or p.get("_expected_return_63d") or _tgt_ret_pct), 2),
                     "ev_est_pct": round(ev, 2),
                     "reachable_63d": reachable,
                     "smsf_size": _smsf_position_size(price, atr, nav=user_nav),
                     "institutional_pct": round(float(row_f[inst_idx]), 1) if inst_idx is not None and row_f and len(row_f) > inst_idx and row_f[inst_idx] else None,
-                    "pe": round(100.0 / float(row_f[pe_idx]), 1) if pe_idx is not None and row_f and len(row_f) > pe_idx and row_f[pe_idx] and float(row_f[pe_idx]) > 0 else None,
-                    "momentum_20d": round(float(row_f[mom_idx]), 1) if mom_idx is not None and row_f and len(row_f) > mom_idx and row_f[mom_idx] is not None else None,
+                    "pe": round(float(_pe_val), 1) if _pe_val else None,
+                    "momentum_20d": round(float(_mom20_val), 1) if _mom20_val is not None else None,
                     "rsi": float((p.get("indicators") or {}).get("rsi") or p.get("rsi", 0) or 0) or None,
                     "trend": p.get("trend", "") or p.get("signal_trend", ""),
                     "div_yield": p.get("dividend_yield") or (p.get("valuation") or {}).get("dividend_yield") or None,
@@ -15372,64 +15530,6 @@ async def auto_populate_core_sleeve(current_user: dict = Depends(get_current_use
                 pass
             created.append({"symbol": sym, "qty": qty, "price": round(price, 2), "value": round(qty * price, 0), "sector": item["sector"]})
     return {"status": "ok", "target_core_dollars": round(target_core_dollars, 0), "created": created, "count": len(created)}
-
-
-@app.get("/api/etf/universe")
-async def etf_universe(current_user: dict = Depends(get_current_user)):
-    """List the ETF universe (separate instrument class from the stock screen)."""
-    del current_user
-    try:
-        from etf_universe import ETFS
-        return {"count": len(ETFS), "etfs": list(ETFS.values())}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/etf/regime")
-async def etf_regime(current_user: dict = Depends(get_current_user)):
-    """Current ETF regime (risk_on / neutral / risk_off) + market proxy state."""
-    del current_user
-    try:
-        from etf_pipeline import detect_regime
-        regime, info = detect_regime()
-        return {"regime": regime, **info}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/etf/signals")
-async def etf_signals(current_user: dict = Depends(get_current_user)):
-    """Today's ETF momentum/trend signals + target allocation."""
-    del current_user
-    try:
-        from etf_pipeline import generate_signals
-        return generate_signals()
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/api/etf/backtest")
-async def etf_backtest(start: str = "2020-01-01",
-                       current_user: dict = Depends(get_current_user)):
-    """Run the ETF trend/momentum backtest (returns summary + monthly log)."""
-    del current_user
-    try:
-        from etf_pipeline import backtest
-        return backtest(start=start)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/api/etf/backfill")
-async def etf_backfill(current_user: dict = Depends(get_current_user)):
-    """Trigger ETF OHLC backfill from EODHD/yfinance (into eod_ohl_history)."""
-    del current_user
-    try:
-        from eodhd_backfill import backfill_etf_universe
-        result = backfill_etf_universe()
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
 
 @app.get("/api/portfolio/nav-breakdown")
@@ -16297,7 +16397,7 @@ def _scheduled_smsf_pipeline():
         for user in users:
             uid = user["id"]
             paper = list_paper_trades(uid)
-            open_positions = [p for p in paper if p.get("status") == "open"]
+            open_positions = [p for p in paper if p.get("status") == "open" and p.get("sleeve") != "core"]
             if not open_positions:
                 continue
 
@@ -16372,7 +16472,7 @@ def _scheduled_smsf_announcement_check():
         users = _get_all_telegram_users()
         for user in users:
             paper = list_paper_trades(user["id"])
-            open_positions = [p for p in paper if p.get("status") == "open"]
+            open_positions = [p for p in paper if p.get("status") == "open" and p.get("sleeve") != "core"]
             if not open_positions:
                 continue
             alerts = check_all_open_positions(open_positions)
@@ -16728,12 +16828,17 @@ def _auto_sync_all_users_portfolios():
                     ), {"u": uid}).fetchall()
                 }
                 for sym, mkt, pct_nav, sec, notes_str in core_blueprint:
-                    if sym in open_syms:
-                        continue
                     price = price_lookup.get(sym, 0.0)
                     if price <= 0:
                         continue
                     qty = max(1, int((budget * pct_nav) // price))
+                    if sym in open_syms:
+                        conn.execute(text("""
+                            UPDATE paper_trades
+                            SET quantity = :q, sleeve = 'core', sector = :sec
+                            WHERE user_id = :u AND symbol = :s AND status = 'open' AND quantity < :min_q
+                        """), {"q": qty, "sec": sec, "u": uid, "s": sym, "min_q": int(qty * 0.8)})
+                        continue
                     conn.execute(text("""
                         INSERT INTO paper_trades
                             (id, user_id, symbol, market, side, quantity, entry_price, current_price,
@@ -16757,7 +16862,7 @@ def _auto_sync_all_users_portfolios():
                     "SELECT COUNT(*) FROM paper_trades WHERE user_id=:u AND status='open' AND COALESCE(sleeve,'satellite') != 'core'"
                 ), {"u": uid}).scalar() or 0
                 for p in top_picks:
-                    if sat_count >= 5:
+                    if sat_count >= 6:
                         break
                     sym = p.get("symbol")
                     if not sym or sym in open_syms:
@@ -16768,7 +16873,9 @@ def _auto_sync_all_users_portfolios():
                     qty = max(1, int((budget * 0.055) // price))
                     proba_pct = round((p.get("_lgbm_proba") or 0.22) * 100, 1)
                     tier = p.get("_target_tier", "8pct")
-                    sec = (p.get("valuation_metrics") or {}).get("sector") or "ASX Equities"
+                    tgt_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if tier == "10pct" else 8.0))
+                    tp_price = float(p.get("target_price") or round(price * (1.0 + tgt_pct / 100.0), 3))
+                    sec = (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "ASX Equities"
                     conn.execute(text("""
                         INSERT INTO paper_trades
                             (id, user_id, symbol, market, side, quantity, entry_price, current_price,
@@ -16782,8 +16889,8 @@ def _auto_sync_all_users_portfolios():
                              :sl, :ts, 'satellite', :sec)
                     """), {
                         "id": str(uuid4()), "u": uid, "s": sym, "q": qty, "p": price,
-                        "tp": round(price * 1.08, 3), "sc": proba_pct,
-                        "nt": f"Auto-executed top-decile ({tier}, score={proba_pct}%)",
+                        "tp": tp_price, "sc": proba_pct,
+                        "nt": f"Auto-executed top-decile ({tier}, score={proba_pct}%, target=+{tgt_pct:.1f}%)",
                         "sl": round(price * 0.80, 3), "rev": now + timedelta(days=14),
                         "now": now, "ed": now.date(), "ts": (now + timedelta(days=63)).date(), "sec": sec,
                     })

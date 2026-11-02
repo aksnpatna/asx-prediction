@@ -1695,7 +1695,7 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
                     # Cross-market sanity guard: if local ASX/ETF EOD history exists and EODHD real-time
                     # differs by >40% (e.g. US ticker collision), prefer local ASX/ETF price.
                     local_ref = float(local_hist_5d[0][1] or 0) if (local_hist_5d and len(local_hist_5d) >= 1) else 0.0
-                    if local_ref <= 0 or (0.60 <= (cp_f / local_ref) <= 1.60):
+                    if local_ref <= 0 or (0.60 <= (cp_f / local_ref) <= 1.40):
                         prev = data.get("previousClose")
                         if prev == "NA" or not prev:
                             prev = cp
@@ -1711,6 +1711,8 @@ def get_stock_data(symbol: str, market: str = None) -> dict:
                             "avg_volume_5d": local_avg_vol,
                             "volume_spike": round(v_int / local_avg_vol, 2) if v_int and local_avg_vol and local_avg_vol > 0 else local_vol_spike,
                         }
+                    else:
+                        print(f"[EODHD RealTime] Rejected cross-market/divergent price for {s} ({ticker_eodhd}): live={cp_f:.2f} vs local_ref={local_ref:.2f}", flush=True)
         except Exception as e:
             print(f"[EODHD RealTime] Error fetching live price for {s}: {e}")
 
@@ -2078,7 +2080,7 @@ def get_starting_capital(uid: str = None) -> float:
                 row = conn.execute(text("SELECT total_investment_budget FROM users ORDER BY total_investment_budget DESC LIMIT 1")).fetchone()
             
             if row and row[0] and float(row[0]) > 0:
-                return max(float(row[0]), 100000.0)
+                return float(row[0])
     except Exception:
         pass
     return max(float(PORTFOLIO_STARTING_CAPITAL or 100000.0), 100000.0)
@@ -2582,24 +2584,23 @@ def _enrich_candidates_with_tiers(candidates: list):
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
 
-        # Align predicted_change_pct, trend, and dynamic target_price with the Satellite ML model
+        # Align predicted_change_pct, trend, and target_price with the Satellite ML model (no hardcoded return floors)
         _cp_c = float(c.get("current_price") or c.get("entry_price") or 0.0)
         _tier_c = c.get("_target_tier", "watch")
         _exp_ret = c.get("_expected_return_63d")
-        _tgt_pct = float(c.get("_target_return_pct") or (10.0 if _tier_c == "10pct" else 8.0 if _tier_c == "8pct" else 6.5))
+        _tgt_pct = float(c.get("_target_return_pct") or (10.0 if _tier_c == "10pct" else 8.0 if _tier_c == "8pct" else 6.0))
         if _tier_c in ("10pct", "8pct"):
-            if _exp_ret is None or float(_exp_ret) < 3.5:
-                _exp_ret = 9.5 if _tier_c == "10pct" else 7.8
-            c["predicted_change_pct"] = round(float(_exp_ret), 2)
-            c["trend"] = "bullish"
+            _exp_val = float(_exp_ret) if _exp_ret is not None else _tgt_pct
+            c["predicted_change_pct"] = round(_exp_val, 2)
+            c["trend"] = "bullish" if _exp_val >= 0 else "neutral"
             c["target_return_pct"] = round(_tgt_pct, 2)
             if _cp_c > 0:
                 c["target_price"] = round(_cp_c * (1.0 + _tgt_pct / 100.0), 2)
             if isinstance(c.get("prediction"), dict):
-                c["prediction"]["trend"] = "bullish"
-                c["prediction"]["change_from_current"] = round(float(_exp_ret), 2)
+                c["prediction"]["trend"] = c["trend"]
+                c["prediction"]["change_from_current"] = round(_exp_val, 2)
                 if _cp_c > 0:
-                    c["prediction"]["predicted_price"] = round(_cp_c * (1.0 + float(_exp_ret) / 100.0), 2)
+                    c["prediction"]["predicted_price"] = round(_cp_c * (1.0 + _exp_val / 100.0), 2)
         elif _exp_ret is not None:
             c["predicted_change_pct"] = round(float(_exp_ret), 2)
             c["target_return_pct"] = round(_tgt_pct, 2)
@@ -12232,9 +12233,13 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
 
             # ── Core Sleeve (60% buy-and-hold ETF + Franked Blue Chips) ───────
             # Core positions are long-term 12m+ CGT / franking anchors and must never
-            # be auto-closed by short-term satellite take-profit or 63-day time stops.
+            # be auto-closed by short-term satellite take-profit or 63-day time stops,
+            # though extreme drawdown advisories (-20%+) still notify the user.
             if sleeve == "core":
                 new_peak_core = max(float(peak or entry or cp), cp)
+                core_entry_f = float(entry or 0)
+                core_pnl_pct = ((cp - core_entry_f) / core_entry_f * 100.0) if core_entry_f > 0 else 0.0
+                core_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=24))
                 with db_conn() as conn:
                     conn.execute(text("""
                         UPDATE paper_trades
@@ -12244,6 +12249,17 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                             updated_at = :now
                         WHERE id = :tid
                     """), {"cp": cp, "np": new_peak_core, "now": now, "tid": trade_id})
+                if core_pnl_pct <= -20.0 and not core_cooldown and recipients:
+                    for rec in recipients:
+                        _send_telegram_alert(
+                            f"<b>⚠️ CORE SLEEVE DRAWDOWN ADVISORY (NO AUTO-CLOSE)</b>\n"
+                            f"📌 <b>{symbol}</b> ({market or 'AU'}) | Entry: ${core_entry_f:.2f} → Now: ${cp:.2f} ({core_pnl_pct:+.1f}%)\n"
+                            f"Core 60% position held open for long-term CGT/franking; manual review recommended.",
+                            chat_id=rec.get("chat_id"),
+                            bot_token=rec.get("bot_token") or None,
+                        )
+                    with db_conn() as conn:
+                        conn.execute(text("UPDATE paper_trades SET last_alert_at = :now WHERE id = :tid"), {"now": now, "tid": trade_id})
                 continue
 
             in_cooldown = bool(last_alert_at and isinstance(last_alert_at, datetime) and (now - last_alert_at) < timedelta(hours=6))
@@ -13946,11 +13962,14 @@ def _scheduled_walk_forward_oos():
                 exit_idx = min(trading_horizon, len(future) - 1)
                 exit_price = float(future["Close"].iloc[exit_idx])
 
-                # Consistent scale for window highs
+                # Consistent scale for window highs and lows
                 raw_highs = future["High"].iloc[:exit_idx + 1] if "High" in future.columns else future["Close"].iloc[:exit_idx + 1]
-                mid_future = (future["High"].iloc[:exit_idx + 1] + future["Low"].iloc[:exit_idx + 1]) / 2.0 if "Low" in future.columns else future["Close"].iloc[:exit_idx + 1]
+                raw_lows = future["Low"].iloc[:exit_idx + 1] if "Low" in future.columns else future["Close"].iloc[:exit_idx + 1]
+                mid_future = (raw_highs + raw_lows) / 2.0
                 needs_scale = (future["Close"].iloc[:exit_idx + 1] < mid_future * 0.95) | (future["Close"].iloc[:exit_idx + 1] > mid_future * 1.05)
-                scaled_highs = np.where(needs_scale, raw_highs * (future["Close"].iloc[:exit_idx + 1] / (mid_future + 1e-9)), raw_highs)
+                scale_factor = future["Close"].iloc[:exit_idx + 1] / (mid_future + 1e-9)
+                scaled_highs = np.where(needs_scale, raw_highs * scale_factor, raw_highs)
+                scaled_lows = np.where(needs_scale, raw_lows * scale_factor, raw_lows)
                 peak_return = (float(np.nanmax(scaled_highs)) / entry_price - 1.0) * 100.0 if len(scaled_highs) > 0 else 0.0
 
                 # ── Corporate action / gap detection ──────────────────────────
@@ -13961,24 +13980,36 @@ def _scheduled_walk_forward_oos():
                     dropped_corporate_action += 1
                     continue
 
-                actual_return = (exit_price / entry_price - 1.0) * 100.0
+                raw_close_return = (exit_price / entry_price - 1.0) * 100.0
                 # Realistic horizon-proportional target (3% for 30d, 5.5% for 63d, 6.5% for 90d)
+                # and true strategy -20.0% catastrophe stop, evaluated strictly in path order:
                 target_pct = 3.0 if horizon_days <= 30 else (5.5 if horizon_days <= 63 else 6.5)
-                if peak_return >= target_pct and actual_return < target_pct:
-                    actual_return = target_pct  # Strategy locks profit at target
-                elif actual_return < -10.0:
-                    actual_return = -10.0  # Strategy enforces protective stop-loss cap
+                catastrophe_stop_pct = -20.0
+                high_ret_path = (np.asarray(scaled_highs, dtype=float) / entry_price - 1.0) * 100.0
+                low_ret_path = (np.asarray(scaled_lows, dtype=float) / entry_price - 1.0) * 100.0
+                hit_days = np.where(high_ret_path >= target_pct)[0]
+                stop_days = np.where(low_ret_path <= catastrophe_stop_pct)[0]
+                first_hit_day = int(hit_days[0]) if len(hit_days) > 0 else 999999
+                first_stop_day = int(stop_days[0]) if len(stop_days) > 0 else 999999
+
+                if first_hit_day < first_stop_day and first_hit_day < 999999:
+                    actual_return = max(raw_close_return, target_pct)
+                    hit = True
+                elif first_stop_day < first_hit_day and first_stop_day < 999999:
+                    actual_return = catastrophe_stop_pct
+                    hit = False
+                else:
+                    actual_return = raw_close_return
+                    hit = raw_close_return >= target_pct
+
                 screen_to_entry_gap = (entry_price / screen_price - 1.0) * 100.0
 
-                # Top-decile Satellite entries (epoch == 'frozen') are strictly LONG bullish signals
+                # Top-decile Satellite entries (epoch == 'frozen') are strictly LONG signals
                 is_frozen_long = sig.get("epoch") == "frozen" or (sig.get("trend") or "").lower() == "bullish"
                 predicted_up = True if is_frozen_long else (sig["trend"] == "bullish")
                 actual_up = actual_return > 0
                 direction_correct = predicted_up == actual_up
-                hit = peak_return >= target_pct or actual_return >= target_pct
                 pred_chg_val = float(sig.get("predicted_change_pct") or 0.0)
-                if is_frozen_long and pred_chg_val <= 0:
-                    pred_chg_val = abs(pred_chg_val) if abs(pred_chg_val) >= 3.0 else float(target_pct)
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
@@ -15234,12 +15265,14 @@ _TELEGRAM_BOT_COMMANDS_HELP = """\
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _smsf_position_size(entry_price: float, atr_pct: float, nav: float = 200000.0) -> float:
-    """Vol-adjusted sizing per strategy: 1.5% NAV at risk, stop = max(-20%, -2.5*ATR), cap 5.5% NAV (~5-6 satellite positions = 30% sleeve)."""
+    """Vol-adjusted sizing per strategy: 1.1% NAV volatility budget divided by 63d annualized vol (hv20),
+    floored at 2.0% NAV and capped at 5.5% NAV (~5-6 satellite positions = 30% sleeve)."""
     if not entry_price or entry_price <= 0:
         return 0.0
-    stop_pct = max(0.20, 2.5 * (atr_pct / 100.0) if atr_pct else 0.20)
-    value = nav * 0.015 / stop_pct
-    return round(min(value, nav * 0.055), 0)
+    atr_frac = (atr_pct / 100.0) if (atr_pct and atr_pct > 0.20) else float(atr_pct or 0.015)
+    hv_est = max(0.20, min(0.45, atr_frac * 15.87))
+    value = nav * 0.011 / hv_est
+    return round(max(nav * 0.020, min(value, nav * 0.055)), 0)
 
 
 @app.get("/api/screener/sparklines")
@@ -15305,6 +15338,7 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
         out["last_scan"] = str(row[3])[:19] if row[3] else None
         picks = json.loads(row[2]) if isinstance(row[2], str) else (row[2] or [])
 
+        base_rate = 51.6
         try:
             with db_conn() as conn:
                 mrow = conn.execute(text(
@@ -15315,10 +15349,11 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                     notes = json.loads(mrow[0]) if isinstance(mrow[0], str) else (mrow[0] or {})
                     out["top_decile_hit"] = notes.get("top_decile")
                     out["auc"] = notes.get("auc")
+                    if notes.get("base_rate"):
+                        base_rate = float(notes["base_rate"])
         except Exception:
             pass
-        base_rate = 21.3
-        if out["top_decile_hit"]:
+        if out["top_decile_hit"] and base_rate > 0:
             out["model_edge"] = round(float(out["top_decile_hit"]) / base_rate, 2)
 
         art = None
@@ -15376,11 +15411,12 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                     atr = 0.02
                 proba_f = float(proba or 0)
                 _tier = p.get("_target_tier", "watch")
-                reachable = _tier in ("10pct", "8pct") or proba_f >= 0.21
-                _TIER_HIT_RATE = {"10pct": 0.58, "8pct": 0.45, "watch": 0.21}
-                _empirical_hit = _TIER_HIT_RATE.get(_tier, 0.21)
-                _tgt_ret_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if _tier == "10pct" else 8.0 if _tier == "8pct" else 6.5))
-                ev = ((_tgt_ret_pct / 100.0) * _empirical_hit - 0.10 * (1 - _empirical_hit) * 0.35) * 100.0
+                reachable = _tier in ("10pct", "8pct") or proba_f >= 0.55
+                _TIER_HIT_RATE = {"10pct": 0.604, "8pct": 0.554, "watch": 0.45}
+                _empirical_hit = float(np.clip(0.5 * proba_f + 0.5 * _TIER_HIT_RATE.get(_tier, 0.45), 0.25, 0.75)) if proba_f > 0 else _TIER_HIT_RATE.get(_tier, 0.45)
+                _tgt_ret_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if _tier == "10pct" else 8.0 if _tier == "8pct" else 6.0))
+                # Conservative EV using true -20% catastrophe stop and empirical non-hit loss fraction (0.35 of stop)
+                ev = ((_tgt_ret_pct / 100.0) * _empirical_hit - 0.20 * (1.0 - _empirical_hit) * 0.35) * 100.0
                 _pe_val = p.get("pe") or (p.get("valuation") or {}).get("pe")
                 if not _pe_val and pe_idx is not None and row_f and len(row_f) > pe_idx and row_f[pe_idx] and float(row_f[pe_idx]) > 0:
                     _pe_val = round(100.0 / float(row_f[pe_idx]), 1)
@@ -15957,14 +15993,14 @@ async def dashboard_morning_brief(current_user: dict = Depends(get_current_user)
                 if _row:
                     _picks = json.loads(_row[0]) if isinstance(_row[0], str) else (_row[0] or [])
                     _top = [p for p in _picks if p.get("_target_tier") in ("10pct", "8pct")][:5]
-                    _WL_TIER_EV = {"10pct": 0.58, "8pct": 0.45}
+                    _WL_TIER_EV = {"10pct": 0.604, "8pct": 0.554}
                     out["watchlist"] = [{
                         "symbol": p.get("symbol"),
-                        "score": round(float(p.get("_lgbm_proba") or p.get("_model_confidence", 0) / 100.0), 3),
+                        "score": round(float((p.get("_model_score") or 0) / 100.0 or p.get("_lgbm_proba") or 0), 3),
                         "tier": p.get("_target_tier"),
                         "ev_est_pct": round(
-                            _WL_TIER_EV.get(p.get("_target_tier"), 0.21) * 0.08
-                            + (1 - _WL_TIER_EV.get(p.get("_target_tier"), 0.21)) * (-0.20) * 0.35, 3
+                            _WL_TIER_EV.get(p.get("_target_tier"), 0.45) * (float(p.get("target_return_pct") or p.get("_target_return_pct") or 8.0) / 100.0)
+                            + (1.0 - _WL_TIER_EV.get(p.get("_target_tier"), 0.45)) * (-0.20) * 0.35, 3
                         ),
                         "name": p.get("company_name") or p.get("name", ""),
                         "price": p.get("current_price") or p.get("entry_price"),
@@ -16811,7 +16847,8 @@ def _auto_sync_all_users_portfolios():
         ]
         price_lookup = {}
         with db_conn() as conn:
-            for sym, _, _, _, _ in core_blueprint:
+            all_lookup_syms = [sym for sym, _, _, _, _ in core_blueprint] + [p.get("symbol") for p in top_picks if p.get("symbol")]
+            for sym in set(all_lookup_syms):
                 r = conn.execute(text(
                     "SELECT close FROM eod_ohl_history WHERE symbol=:s AND close > 0 ORDER BY trade_date DESC LIMIT 1"
                 ), {"s": sym}).fetchone()
@@ -16821,12 +16858,16 @@ def _auto_sync_all_users_portfolios():
         now = datetime.utcnow()
         with db_conn() as conn:
             for uid, budget_raw in users:
-                budget = max(float(budget_raw or 100000.0), 100000.0)
-                open_syms = {
-                    r[0] for r in conn.execute(text(
-                        "SELECT symbol FROM paper_trades WHERE user_id=:u AND status='open'"
-                    ), {"u": uid}).fetchall()
-                }
+                budget = float(budget_raw) if (budget_raw and float(budget_raw) > 0) else 100000.0
+                open_rows = conn.execute(text(
+                    "SELECT symbol, COALESCE(sleeve, 'satellite'), COALESCE(sector, '') FROM paper_trades WHERE user_id=:u AND status='open'"
+                ), {"u": uid}).fetchall()
+                open_syms = {r[0] for r in open_rows}
+                sat_sector_counts = {}
+                for _, slv, sec_r in open_rows:
+                    if slv != "core" and sec_r:
+                        sat_sector_counts[sec_r] = sat_sector_counts.get(sec_r, 0) + 1
+
                 for sym, mkt, pct_nav, sec, notes_str in core_blueprint:
                     price = price_lookup.get(sym, 0.0)
                     if price <= 0:
@@ -16835,9 +16876,9 @@ def _auto_sync_all_users_portfolios():
                     if sym in open_syms:
                         conn.execute(text("""
                             UPDATE paper_trades
-                            SET quantity = :q, sleeve = 'core', sector = :sec
-                            WHERE user_id = :u AND symbol = :s AND status = 'open' AND quantity < :min_q
-                        """), {"q": qty, "sec": sec, "u": uid, "s": sym, "min_q": int(qty * 0.8)})
+                            SET sleeve = 'core', sector = COALESCE(NULLIF(sector, ''), :sec)
+                            WHERE user_id = :u AND symbol = :s AND status = 'open'
+                        """), {"sec": sec, "u": uid, "s": sym})
                         continue
                     conn.execute(text("""
                         INSERT INTO paper_trades
@@ -16858,24 +16899,30 @@ def _auto_sync_all_users_portfolios():
                     })
                     open_syms.add(sym)
 
+                gate_info = _wfo_position_gate(uid)
+                max_sat = min(6, int(gate_info.get("max_positions", 6) or 6))
                 sat_count = conn.execute(text(
                     "SELECT COUNT(*) FROM paper_trades WHERE user_id=:u AND status='open' AND COALESCE(sleeve,'satellite') != 'core'"
                 ), {"u": uid}).scalar() or 0
                 for p in top_picks:
-                    if sat_count >= 6:
+                    if sat_count >= max_sat:
                         break
                     sym = p.get("symbol")
                     if not sym or sym in open_syms:
                         continue
-                    price = float(p.get("current_price") or p.get("entry_price") or 0)
+                    sec = (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "ASX Equities"
+                    if sec and sec != "ASX Equities" and sat_sector_counts.get(sec, 0) >= 2:
+                        continue
+                    price = float(price_lookup.get(sym) or p.get("current_price") or p.get("entry_price") or 0)
                     if price <= 0:
                         continue
-                    qty = max(1, int((budget * 0.055) // price))
-                    proba_pct = round((p.get("_lgbm_proba") or 0.22) * 100, 1)
+                    hv20_p = float(p.get("_hv20") or 0.22)
+                    pos_dollars = _smsf_position_size(price, hv20_p / 15.87, nav=budget)
+                    qty = max(1, int(pos_dollars // price))
+                    score_val = round(float(p.get("_model_score") or (p.get("_lgbm_proba") or 0.55) * 100), 1)
                     tier = p.get("_target_tier", "8pct")
                     tgt_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if tier == "10pct" else 8.0))
-                    tp_price = float(p.get("target_price") or round(price * (1.0 + tgt_pct / 100.0), 3))
-                    sec = (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "ASX Equities"
+                    tp_price = round(price * (1.0 + tgt_pct / 100.0), 3)
                     conn.execute(text("""
                         INSERT INTO paper_trades
                             (id, user_id, symbol, market, side, quantity, entry_price, current_price,
@@ -16889,13 +16936,15 @@ def _auto_sync_all_users_portfolios():
                              :sl, :ts, 'satellite', :sec)
                     """), {
                         "id": str(uuid4()), "u": uid, "s": sym, "q": qty, "p": price,
-                        "tp": tp_price, "sc": proba_pct,
-                        "nt": f"Auto-executed top-decile ({tier}, score={proba_pct}%, target=+{tgt_pct:.1f}%)",
+                        "tp": tp_price, "sc": score_val,
+                        "nt": f"Auto-executed top-decile ({tier}, score={score_val}, target=+{tgt_pct:.1f}%)",
                         "sl": round(price * 0.80, 3), "rev": now + timedelta(days=14),
                         "now": now, "ed": now.date(), "ts": (now + timedelta(days=63)).date(), "sec": sec,
                     })
                     open_syms.add(sym)
                     sat_count += 1
+                    if sec:
+                        sat_sector_counts[sec] = sat_sector_counts.get(sec, 0) + 1
         print("[AutoPortfolioSync] Verified Core + Top-Decile Satellite positions for all users.", flush=True)
     except Exception as e:
         print(f"[AutoPortfolioSync] Non-blocking error: {e}", flush=True)

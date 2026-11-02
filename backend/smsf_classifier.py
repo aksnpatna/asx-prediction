@@ -544,23 +544,15 @@ def score_satellite_cohort(
         mom20_i = float(f_sym.get("mom20", 0.0) or 0.0)
         eps_y_i = float(f_sym.get("eps_yield", 0.0) or 0.0)
 
-        # Model-driven 63d expected return (%) & dynamic volatility-calibrated target (%)
-        # Combines ASX 63d baseline drift (~2.0%), LGBM regressor excess return (ex_63),
-        # and cross-sectional rank edge.
-        raw_exp_63d = 2.0 + 1.15 * ex_63 + 4.5 * (blended_pct[i] - 0.5)
+        # Model-driven 63d expected return (%) directly from LGBMRegressor trained on 63d managed return,
+        # and tier-aligned target_return_pct (never raising profit targets for higher volatility).
+        exp_ret_63d = float(np.clip(ex_63, -15.0, 25.0))
         if eligible_mask[i] and sc_i >= 88.0:
-            exp_ret_63d = float(np.clip(max(raw_exp_63d, 5.5), 5.5, 16.0))
-            vol_bump = float(np.clip((hv20_i - 0.18) * 12.0, 0.0, 2.5))
-            reg_bump = float(np.clip(ex_63 * 0.4, 0.0, 1.5))
-            tgt_ret_pct = round(float(np.clip(9.0 + vol_bump + reg_bump, 9.0, 12.5)), 2)
+            tgt_ret_pct = round(float(np.clip(max(exp_ret_63d, 8.0), 8.0, 10.5)), 2)
         elif eligible_mask[i] and sc_i >= 72.0:
-            exp_ret_63d = float(np.clip(max(raw_exp_63d, 3.8), 3.8, 12.0))
-            vol_bump = float(np.clip((hv20_i - 0.18) * 8.0, 0.0, 1.5))
-            reg_bump = float(np.clip(ex_63 * 0.3, 0.0, 1.0))
-            tgt_ret_pct = round(float(np.clip(7.5 + vol_bump + reg_bump, 7.5, 9.8)), 2)
+            tgt_ret_pct = 8.0
         else:
-            exp_ret_63d = float(np.clip(raw_exp_63d, -8.0, 8.0))
-            tgt_ret_pct = 6.5
+            tgt_ret_pct = 6.0
 
         out[s] = {
             "score": round(sc_i, 4),
@@ -819,12 +811,16 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
 
     df["cohort_ret"] = df.groupby("yw")["fwd_ret"].transform("mean")
     df["excess_ret"] = df["fwd_ret"] - df["cohort_ret"]
-    df[" managed_ret"] = np.where(
-        df["hit6"] == 1, np.maximum(df["fwd_ret"], 6.0),
-        np.where((df["fwd_dd"] <= -7.5) & (df["fwd_peak"] < 5.5), np.maximum(df["fwd_ret"], -7.5), df["fwd_ret"])
+    df["managed_ret"] = np.clip(
+        np.where(
+            df["hit6"] == 1, np.maximum(df["fwd_ret"], 6.0),
+            np.where((df["fwd_dd"] <= -7.5) & (df["fwd_peak"] < 5.5), np.maximum(df["fwd_ret"], -7.5), df["fwd_ret"])
+        ),
+        -25.0, 35.0,
     )
-    df["qual_target"] = (df["excess_ret"] + 0.35 * df[" managed_ret"]) * np.where(df["hv63"] <= 0.42, 1.0, 0.3)
-    df["y_bin"] = ((df["hit6"] == 1) & (df["excess_ret"] > 0) & (df["hv63"] <= 0.42)).astype(int)
+    # Single non-circular binary target (hit6: reaches +5.5% before -7.5% stop within 63d)
+    # and direct 63d managed return regression target (%)
+    df["y_bin"] = df["hit6"].astype(int)
 
     active_features = list(SATELLITE_FEATURE_ORDER)
     # Purged chronological split: last 12 months OOS test, with a strict 95-calendar-day (65-trading-day) embargo!
@@ -832,15 +828,15 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     test_start = max_dt - pd.Timedelta(days=365)
     train_cutoff = test_start - pd.Timedelta(days=95)
 
-    tr = df[(df["date"] <= train_cutoff) & ~((df["date"] >= "2020-03-01") & (df["date"] <= "2020-08-31"))].copy()
-    te = df[df["date"] >= test_start].copy()
+    tr = df[(df["date"] <= train_cutoff) & ~((df["date"] >= "2020-03-01") & (df["date"] <= "2020-08-31"))].copy().reset_index(drop=True)
+    te = df[df["date"] >= test_start].copy().reset_index(drop=True)
 
     X_train = tr[active_features].values.astype(np.float32)
     y_train = tr["y_bin"].values
-    y_reg_train = tr["qual_target"].values
+    y_reg_train = tr["managed_ret"].values
 
     X_test = te[active_features].values.astype(np.float32)
-    y_test = te["hit6"].values
+    y_test = te["y_bin"].values
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
@@ -872,21 +868,34 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     )
     rf_model.fit(X_train, y_train)
 
-    # Evaluate OOS test window with 65-trading-day embargo
+    # Fit Isotonic probability calibrator strictly inside the training set using a purged
+    # chronological validation split (95-calendar-day embargo) — zero leakage from OOS X_test!
     from sklearn.isotonic import IsotonicRegression
     from sklearn.metrics import brier_score_loss
+    cal_start = tr["date"].max() - pd.Timedelta(days=365)
+    sub_tr_cutoff = cal_start - pd.Timedelta(days=95)
+    sub_tr_mask = (tr["date"] <= sub_tr_cutoff).values
+    cal_mask = (tr["date"] >= cal_start).values
+    iso_cal = IsotonicRegression(y_min=0.02, y_max=0.95, out_of_bounds="clip")
+    if sub_tr_mask.sum() >= 500 and cal_mask.sum() >= 200:
+        m_bin_sub = lgb.LGBMClassifier(
+            n_estimators=200, learning_rate=0.03, num_leaves=15, max_depth=4,
+            min_child_samples=150, subsample=0.8, colsample_bytree=0.7,
+            reg_alpha=5.0, reg_lambda=20.0, random_state=42, n_jobs=-1, verbose=-1,
+        ).fit(X_train[sub_tr_mask], y_train[sub_tr_mask])
+        p_cal_raw = m_bin_sub.predict_proba(X_train[cal_mask])[:, 1]
+        iso_cal.fit(p_cal_raw, y_train[cal_mask])
+    else:
+        iso_cal.fit(m_bin.predict_proba(X_train)[:, 1], y_train)
+
+    # Evaluate 100% untouched OOS test window with 65-trading-day embargo on single consistent target
     p_reg = m_reg.predict(X_test)
     p_bin_raw = m_bin.predict_proba(X_test)[:, 1]
+    p_bin = iso_cal.predict(p_bin_raw)
     p_ridge = reg_model.predict(X_test_s)
 
-    # Fit out-of-sample Isotonic probability calibrator on chronological first half of OOS
-    # against hit6 target so probabilities match true empirical hit rates (~20%–65%)
-    n_cal = max(100, len(X_test) // 2)
-    iso_cal = IsotonicRegression(y_min=0.02, y_max=0.95, out_of_bounds="clip")
-    iso_cal.fit(p_bin_raw[:n_cal], y_test[:n_cal])
-    p_bin = iso_cal.predict(p_bin_raw)
-    brier_raw = round(float(brier_score_loss(y_test[n_cal:], p_bin_raw[n_cal:])), 4)
-    brier_calibrated = round(float(brier_score_loss(y_test[n_cal:], p_bin[n_cal:])), 4)
+    brier_raw = round(float(brier_score_loss(y_test, p_bin_raw)), 4)
+    brier_calibrated = round(float(brier_score_loss(y_test, p_bin)), 4)
 
     vol_guard = np.where(te["hv63"] <= 0.38, 1.0, np.where(te["hv63"] <= 0.45, 0.4, -1.0))
     trend_guard = np.where((te["dist_sma200"] > -2.0) & (te["mom126"] > 2.0), 1.0, -0.5)
@@ -912,19 +921,16 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     sorted_idx = np.argsort(blended)[::-1]
     decile_size = max(1, len(sorted_idx) // 10)
     decile_hit_rates = []
-    y_test_qual = te["y_bin"].values
-    decile_qual_rates = []
     for d in range(10):
         start = d * decile_size
         end = start + decile_size if d < 9 else len(sorted_idx)
         decile_hit_rates.append(round(float(y_test[sorted_idx[start:end]].mean()) * 100, 1))
-        decile_qual_rates.append(round(float(y_test_qual[sorted_idx[start:end]].mean()) * 100, 1))
 
     top_decile_hit = decile_hit_rates[0]
-    bottom_decile_hit = decile_qual_rates[-1]
+    bottom_decile_hit = decile_hit_rates[-1]
     spread = round(top_decile_hit - bottom_decile_hit, 1)
-    auc = round(float(roc_auc_score(y_test_qual, blended)), 4)
-    avg_precision = round(float(average_precision_score(y_test_qual, blended)), 4)
+    auc = round(float(roc_auc_score(y_test, blended)), 4)
+    avg_precision = round(float(average_precision_score(y_test, blended)), 4)
     base_rate_test = float(y_test.mean())
 
     top10_df = te[te["pct_rank"] >= 0.90]
@@ -932,16 +938,16 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
     print(f"[Classifier] Purged OOS (65d embargo) RESULTS:", flush=True)
     print(f"  Train: {len(tr):,} rows ({tr['date'].min().date()} -> {tr['date'].max().date()})", flush=True)
     print(f"  Test : {len(te):,} rows ({te['date'].min().date()} -> {te['date'].max().date()})", flush=True)
-    print(f"  Top-10% Hit +5.5% before Stop : {top_decile_hit:.1f}% (Peak>=5.5%: {(top10_df['fwd_peak']>=5.5).mean()*100:.1f}%)", flush=True)
-    print(f"  Top-10% 63d Managed Return    : {top10_df[' managed_ret'].mean():+.2f}% vs Bot-10% {bot10_df['fwd_ret'].mean():+.2f}%", flush=True)
+    print(f"  Top-10% Hit +5.5% before Stop : {top_decile_hit:.1f}% vs Bot-10% {bottom_decile_hit:.1f}% (Base: {base_rate_test*100:.1f}%)", flush=True)
+    print(f"  Top-10% 63d Managed Return    : {top10_df['managed_ret'].mean():+.2f}% vs Bot-10% {bot10_df['fwd_ret'].mean():+.2f}%", flush=True)
     print(f"  Top-10% 63d Raw Alpha         : {top10_df['excess_ret'].mean():+.2f}% over universe", flush=True)
-    print(f"  AUC: {auc:.4f}, Spread: {spread:.1f}pp", flush=True)
+    print(f"  AUC: {auc:.4f}, Spread: {spread:.1f}pp, Brier: {brier_raw:.4f} -> {brier_calibrated:.4f}", flush=True)
 
     # Fit production models on full post-COVID dataset (up to latest completed 63d window)
     full_tr = df[~((df["date"] >= "2020-03-01") & (df["date"] <= "2020-08-31"))].copy()
     X_full = full_tr[active_features].values.astype(np.float32)
     y_full_bin = full_tr["y_bin"].values
-    y_full_reg = full_tr["qual_target"].values
+    y_full_reg = full_tr["managed_ret"].values
 
     scaler_full = StandardScaler()
     X_full_s = scaler_full.fit_transform(X_full)
@@ -1024,6 +1030,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 "trained_at": today.isoformat(),
                 "auc": auc,
                 "top_decile": top_decile_hit,
+                "base_rate": round(base_rate_test * 100, 1),
                 "brier_raw": brier_raw,
                 "brier_calibrated": brier_calibrated,
                 "blend": {"binary": 0.25, "lgbm_reg": 0.30, "ridge": 0.10, "struct_prior": 0.35},
@@ -1046,6 +1053,7 @@ def train_classifier(target_col: str = "hit_8pct_before_m8pct",
                 "ok": True, "version": "v3_purged_pit_liquid",
                 "auc": auc, "avg_precision": avg_precision,
                 "top_decile": top_decile_hit, "bottom_decile": bottom_decile_hit,
+                "base_rate": round(base_rate_test * 100, 1),
                 "spread": spread, "deciles": decile_hit_rates,
                 "brier_raw": brier_raw, "brier_calibrated": brier_calibrated,
                 "sha256": sha256, "artifact_path": primary_path,

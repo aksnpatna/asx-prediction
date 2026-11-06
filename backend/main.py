@@ -1781,13 +1781,89 @@ def _eodhd_fundamentals(symbol: str, market: str) -> dict:
     return {}
 
 ASX_SECTORS = {
-    "BHP": "Materials", "RIO": "Materials", "FMG": "Materials", "MIN": "Materials", "PLS": "Materials",
+    # Financials
     "CBA": "Financials", "NAB": "Financials", "ANZ": "Financials", "WBC": "Financials", "MQG": "Financials",
-    "CSL": "Healthcare", "COH": "Healthcare", "RMD": "Healthcare", "SHL": "Healthcare",
-    "WES": "Consumer Discretionary", "WOW": "Consumer Staples", "COL": "Consumer Staples",
-    "WDS": "Energy", "STO": "Energy", "BPT": "Energy", "WHC": "Energy",
-    "TLS": "Telecommunications", "XRO": "Technology", "WTC": "Technology", "TNE": "Technology",
-    "GMG": "Real Estate", "SCG": "Real Estate", "TCL": "Industrials", "QAN": "Industrials"
+    "SUN": "Financials", "QBE": "Financials", "IAG": "Financials", "AMP": "Financials", "CGF": "Financials",
+    "PPT": "Financials", "MFG": "Financials", "HUB": "Financials", "NWL": "Financials", "PTM": "Financials",
+    "GQG": "Financials", "BOQ": "Financials", "BEN": "Financials", "CPU": "Financials", "ASX": "Financials",
+    "IFL": "Financials", "MMS": "Financials", "FWD": "Financials", "AEF": "Financials", "QAL": "Financials",
+    "MOT": "Financials", "AFG": "Financials", "LSF": "Financials", "PGF": "Financials", "MFF": "Financials",
+    "AUB": "Financials", "CCP": "Financials", "JDO": "Financials", "MYS": "Financials", "OFX": "Financials",
+    "PAC": "Financials", "PPS": "Financials", "SIQ": "Financials", "SOL": "Financials", "TGP": "Financials",
+    # Materials / Mining
+    "BHP": "Materials", "RIO": "Materials", "FMG": "Materials", "S32": "Materials", "MIN": "Materials",
+    "OZL": "Materials", "NST": "Materials", "EVN": "Materials", "NCM": "Materials", "SFR": "Materials",
+    "IGO": "Materials", "LYC": "Materials", "PLS": "Materials", "CIA": "Materials", "AWC": "Materials",
+    "BSL": "Materials", "GRR": "Materials", "IPL": "Materials", "ORA": "Materials", "NUF": "Materials",
+    "WGX": "Materials", "SLR": "Materials", "RMS": "Materials", "GOR": "Materials", "CMM": "Materials",
+    "PRU": "Materials", "OGC": "Materials", "TGS": "Materials", "NEM": "Materials", "SGM": "Materials",
+    "RDX": "Materials", "WGN": "Materials", "AAI": "Materials", "EMR": "Materials", "ILU": "Materials",
+    "IMD": "Materials", "JHX": "Materials", "DLX": "Materials", "ABC": "Materials", "SSR": "Materials",
+    "SYA": "Materials", "ORE": "Materials", "TMG": "Materials",
+    # Energy
+    "WDS": "Energy", "STO": "Energy", "BPT": "Energy", "WHC": "Energy", "NHC": "Energy",
+    "KAR": "Energy", "ORG": "Energy", "WOR": "Energy", "ALD": "Energy", "VEA": "Energy",
+    "YAL": "Energy", "STX": "Energy", "OSH": "Energy",
+    # Healthcare
+    "CSL": "Healthcare", "COH": "Healthcare", "RMD": "Healthcare", "SHL": "Healthcare", "RHC": "Healthcare",
+    "MPL": "Healthcare", "NHF": "Healthcare", "HLS": "Healthcare", "PME": "Healthcare", "AHL": "Healthcare",
+    "IDX": "Healthcare", "CAJ": "Healthcare", "TLX": "Healthcare", "IMX": "Healthcare", "PNV": "Healthcare",
+    "ANN": "Healthcare", "ACL": "Healthcare", "CUV": "Healthcare", "SIG": "Healthcare", "PAR": "Healthcare",
+    "OPT": "Healthcare",
+    # Consumer Discretionary
+    "WES": "Consumer Discretionary", "HVN": "Consumer Discretionary", "JBH": "Consumer Discretionary",
+    "PMV": "Consumer Discretionary", "SUL": "Consumer Discretionary", "MYR": "Consumer Discretionary",
+    "KGN": "Consumer Discretionary", "BBN": "Consumer Discretionary", "ADH": "Consumer Discretionary",
+    "BAP": "Consumer Discretionary", "ARB": "Consumer Discretionary", "PWR": "Consumer Discretionary",
+    "APE": "Consumer Discretionary", "GUD": "Consumer Discretionary", "AOV": "Consumer Discretionary",
+    "NCK": "Consumer Discretionary", "SKC": "Consumer Discretionary", "TAH": "Consumer Discretionary",
+    "ALL": "Consumer Discretionary", "SGR": "Consumer Discretionary", "CWN": "Consumer Discretionary",
+    "FLT": "Consumer Discretionary", "WEB": "Consumer Discretionary", "CTD": "Consumer Discretionary",
+    "EVT": "Consumer Discretionary", "LNW": "Consumer Discretionary", "LLC": "Consumer Discretionary",
+    "TLC": "Consumer Discretionary", "IEL": "Consumer Discretionary",
+    # Consumer Staples
+    "WOW": "Consumer Staples", "COL": "Consumer Staples", "TWE": "Consumer Staples", "CCL": "Consumer Staples",
+    "GNC": "Consumer Staples", "ELD": "Consumer Staples", "ING": "Consumer Staples", "AAC": "Consumer Staples",
+    "A2M": "Consumer Staples", "PPC": "Consumer Staples", "RIC": "Consumer Staples", "SHV": "Consumer Staples",
+    # Industrials
+    "BXB": "Industrials", "AZJ": "Industrials", "DOW": "Industrials", "QUB": "Industrials", "TCL": "Industrials",
+    "ALX": "Industrials", "AIA": "Industrials", "SVW": "Industrials", "CWY": "Industrials", "UGL": "Industrials",
+    "MND": "Industrials", "CIM": "Industrials", "RWC": "Industrials", "GWA": "Industrials", "REH": "Industrials",
+    "ALQ": "Industrials", "QAN": "Industrials", "REX": "Industrials", "LYL": "Industrials", "SRG": "Industrials",
+    "IPG": "Industrials", "SYL": "Industrials", "CVL": "Industrials", "DBI": "Industrials", "DNL": "Industrials",
+    "EHL": "Industrials", "GLS": "Industrials", "IPH": "Industrials", "NWH": "Industrials", "PRN": "Industrials",
+    "RPL": "Industrials", "SHA": "Industrials", "SNL": "Industrials", "SSM": "Industrials", "VNT": "Industrials",
+    "DRO": "Industrials", "EOS": "Industrials", "ASB": "Industrials", "DUR": "Industrials",
+    # Technology
+    "XRO": "Technology", "WTC": "Technology", "TNE": "Technology", "NXT": "Technology", "MP1": "Technology",
+    "APX": "Technology", "ALU": "Technology", "IRI": "Technology", "DUB": "Technology", "Z1P": "Technology",
+    "SPT": "Technology", "EML": "Technology", "BTH": "Technology", "LNK": "Technology", "EOL": "Technology",
+    "BVS": "Technology", "DTL": "Technology", "VGN": "Technology", "XYZ": "Technology", "PPH": "Technology",
+    # Communication Services
+    "TLS": "Communication Services", "TPG": "Communication Services", "TPM": "Communication Services",
+    "VOC": "Communication Services", "SPK": "Communication Services", "ABB": "Communication Services",
+    "CAR": "Communication Services", "SEK": "Communication Services", "REA": "Communication Services",
+    "DHG": "Communication Services", "SWM": "Communication Services", "NEC": "Communication Services",
+    "NWS": "Communication Services", "SXL": "Communication Services", "OML": "Communication Services",
+    # Real Estate / REITs
+    "GMG": "Real Estate", "SCG": "Real Estate", "VCX": "Real Estate", "DXS": "Real Estate", "SGP": "Real Estate",
+    "MGR": "Real Estate", "CLW": "Real Estate", "CHC": "Real Estate", "CIP": "Real Estate", "COF": "Real Estate",
+    "ARF": "Real Estate", "SCP": "Real Estate", "CQR": "Real Estate", "GPT": "Real Estate", "NBI": "Real Estate",
+    "URW": "Real Estate",
+    # Utilities
+    "AGL": "Utilities", "APA": "Utilities", "SKI": "Utilities", "AST": "Utilities", "MEZ": "Utilities",
+    "GNE": "Utilities", "CEN": "Utilities", "IFT": "Utilities", "AINF": "Utilities",
+}
+
+_SECTOR_NORMALIZE = {
+    "Basic Materials": "Materials",
+    "Financial Services": "Financials",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Telecommunications": "Communication Services",
+    "Telecom": "Communication Services",
+    "Communications": "Communication Services",
+    "REITs": "Real Estate",
 }
 try:
     _sec_map_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sector_map.json")
@@ -1795,12 +1871,42 @@ try:
         with open(_sec_map_path, "r") as _f:
             _loaded = json.load(_f)
             for _k, _v in _loaded.items():
-                if isinstance(_v, dict) and "sector" in _v:
-                    ASX_SECTORS[_k] = _v["sector"]
-                elif isinstance(_v, str):
-                    ASX_SECTORS[_k] = _v
+                _raw_s = _v.get("sector", "") if isinstance(_v, dict) else (_v if isinstance(_v, str) else "")
+                if _raw_s:
+                    ASX_SECTORS[_k] = _SECTOR_NORMALIZE.get(_raw_s, _raw_s)
 except Exception:
     pass
+
+
+def resolve_asx_sector(symbol: str, fallback: str = "", company_name: str = "") -> str:
+    """Return canonical GICS sector for an ASX symbol using ASX_SECTORS and company-name heuristics."""
+    s = (symbol or "").upper().replace(".AX", "").replace(".NS", "").strip()
+    if fallback and fallback not in ("Unknown", "DEFAULT", "ASX Equities", "N/A", ""):
+        return _SECTOR_NORMALIZE.get(fallback, fallback)
+    if s in ASX_SECTORS:
+        return ASX_SECTORS[s]
+    cname = (company_name or ASX_COMPANIES.get(s, "") or "").lower()
+    if any(k in cname for k in ("mining", "gold", "resources", "metals", "lithium", "copper", "mineral", "iron", "chemical", "nufarm")):
+        return "Materials"
+    if any(k in cname for k in ("energy", "oil", "gas", "coal", "petroleum", "uranium", "power")):
+        return "Energy"
+    if any(k in cname for k in ("bank", "financial", "insurance", "capital", "wealth", "fund", "investment", "trust", "credit")):
+        return "Financials"
+    if any(k in cname for k in ("reit", "property", "real estate", "centres")):
+        return "Real Estate"
+    if any(k in cname for k in ("health", "medical", "pharma", "bio", "diagnostic", "clinical", "hospital", "care")):
+        return "Healthcare"
+    if any(k in cname for k in ("tech", "software", "data", "cyber", "digital", "solutions", "systems")):
+        return "Technology"
+    if any(k in cname for k in ("telecom", "media", "broadband", "communications")):
+        return "Communication Services"
+    if any(k in cname for k in ("retail", "automotive", "travel", "leisure", "entertainment", "holdings")):
+        return "Consumer Discretionary"
+    if any(k in cname for k in ("food", "milk", "wine", "agricult", "grain", "beverage", "grocery")):
+        return "Consumer Staples"
+    if any(k in cname for k in ("engineering", "industrial", "infrastructure", "transport", "logistics", "services", "group")):
+        return "Industrials"
+    return "ASX Equities"
 
 def get_valuation_metrics(symbol: str, market: str = None) -> dict:
     """Fetch valuation metrics from local PostgreSQL (fundamental_snapshots + eps_history + eod_ohl_history) without slow yfinance calls."""
@@ -2584,7 +2690,16 @@ def _enrich_candidates_with_tiers(candidates: list):
             c["_target_tier"] = "watch"
             c["_tier_label"] = "WATCH"
 
-        # Align predicted_change_pct, trend, and target_price with the Satellite ML model (no hardcoded return floors)
+        # Align predicted_change_pct, trend, target_price, and GICS sector with the Satellite ML model
+        _sym_c = str(c.get("symbol", "") or "").upper().replace(".AX", "")
+        _raw_sec = (c.get("valuation_metrics") or {}).get("sector") or (c.get("valuation") or {}).get("sector") or c.get("sector") or ""
+        _resolved_sec = resolve_asx_sector(_sym_c, _raw_sec, c.get("company_name") or c.get("name") or "")
+        c["sector"] = _resolved_sec
+        if isinstance(c.get("valuation_metrics"), dict):
+            c["valuation_metrics"]["sector"] = _resolved_sec
+        if (not c.get("company_name") or c.get("company_name") == _sym_c) and _sym_c in ASX_COMPANIES:
+            c["company_name"] = ASX_COMPANIES[_sym_c]
+
         _cp_c = float(c.get("current_price") or c.get("entry_price") or 0.0)
         _tier_c = c.get("_target_tier", "watch")
         _exp_ret = c.get("_expected_return_63d")
@@ -12314,7 +12429,22 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                 )
 
             if side == 'LONG':
-                new_peak = max(peak or entry, cp)
+                new_peak = max(float(peak or entry or cp), cp)
+                peak_pnl_pct = ((new_peak - entry_f) / entry_f * 100.0) if entry_f > 0 else 0.0
+                eff_stop = float(stop_loss_price) if stop_loss_price else round(entry_f * 0.80, 4)
+                eff_trail = float(trailing_stop_pct) if trailing_stop_pct else 3.0
+
+                # ── 2-Stage Satellite Profit-Lock Ratchet ──────────────────────
+                # Stage 2 (+6.0% peak gain, currently >+2%): tighten trailing stop to 1.5% below peak_price
+                # Stage 1 (+4.0% peak gain, currently >+1%): raise stop_loss_price to breakeven + 0.5% (entry * 1.005)
+                if peak_pnl_pct >= 6.0 and entry_f > 0 and cp > entry_f * 1.02:
+                    ratchet_sl = min(max(round(new_peak * 0.985, 4), round(entry_f * 1.02, 4)), round(cp * 0.995, 4))
+                    eff_stop = max(eff_stop, ratchet_sl)
+                    eff_trail = min(eff_trail, 1.5)
+                elif peak_pnl_pct >= 4.0 and entry_f > 0 and cp > entry_f * 1.01:
+                    eff_stop = max(eff_stop, round(entry_f * 1.005, 4))
+                    eff_trail = min(eff_trail, 2.0)
+                stop_loss_price = eff_stop
 
                 if take_profit_price and cp >= float(take_profit_price):
                     if position_stage != 'trim_signal':
@@ -12408,12 +12538,14 @@ def _scheduled_paper_trade_monitor(max_trades_override: Optional[int] = None):
                         UPDATE paper_trades
                         SET current_price = :cp,
                             peak_price = :np,
+                            stop_loss_price = :sl,
+                            trailing_stop_pct = :tr,
                             position_stage = COALESCE(:stage_update, position_stage),
                             last_alert_at = CASE WHEN :stage_update IS NOT NULL THEN :now ELSE last_alert_at END,
                             last_checked_at = :now,
                             updated_at = :now
                         WHERE id = :tid
-                    """), {"cp": cp, "np": new_peak, "stage_update": stage_update, "now": now, "tid": trade_id})
+                    """), {"cp": cp, "np": new_peak, "sl": eff_stop, "tr": eff_trail, "stage_update": stage_update, "now": now, "tid": trade_id})
 
             elif side == 'SHORT':
                 new_trough = min(peak or entry, cp)
@@ -14013,7 +14145,7 @@ def _scheduled_walk_forward_oos():
 
                 mc = sig.get("market_cap")
                 tier = "large" if (mc and mc > 10_000_000_000) else "mid" if (mc and mc > 2_000_000_000) else "small"
-                sector = sig.get("sector", "Unknown")
+                sector = resolve_asx_sector(sig["symbol"], sig.get("sector", ""))
 
                 evaluated.append({
                     "symbol": sig["symbol"],
@@ -15426,7 +15558,7 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                 _tgt_price = p.get("target_price") or (round(price * (1.0 + _tgt_ret_pct / 100.0), 2) if price else None)
                 cand = {
                     "symbol": sym,
-                    "name": p.get("company_name", "") or p.get("name", ""),
+                    "name": p.get("company_name", "") or p.get("name", "") or ASX_COMPANIES.get(sym, sym),
                     "price": round(price, 2) if price else None,
                     "score": round(float(p.get("_model_score") or (proba_f * 100)), 1),
                     "prob_hit": round(proba_f * 100, 1),
@@ -15445,7 +15577,7 @@ async def screener_scan(current_user: dict = Depends(get_current_user)):
                     "trend": p.get("trend", "") or p.get("signal_trend", ""),
                     "div_yield": p.get("dividend_yield") or (p.get("valuation") or {}).get("dividend_yield") or None,
                     "franked": p.get("franking_pct") or None,
-                    "sector": (p.get("valuation_metrics") or {}).get("sector", "") or (p.get("valuation") or {}).get("sector", "") or p.get("sector", ""),
+                    "sector": resolve_asx_sector(sym, (p.get("valuation_metrics") or {}).get("sector", "") or (p.get("valuation") or {}).get("sector", "") or p.get("sector", ""), p.get("company_name", "") or p.get("name", "")),
                 }
                 v = ai_verdicts.get(sym)
                 cand["ai_decision"] = v["decision"] if v else None
@@ -16467,6 +16599,10 @@ def _scheduled_smsf_pipeline():
 
         if alerts:
             _send_telegram_broadcast("\n".join(alerts), "smsf_sentinel")
+        try:
+            _auto_sync_all_users_portfolios()
+        except Exception as _sync_err:
+            print(f"[SMSF] Auto portfolio sync warning: {_sync_err}")
         _log_job_finish(jid, rows_affected=len(alerts), started_at=started)
     except Exception as e:
         _log_job_finish(jid, status="error", error=str(e), started_at=started)
@@ -16827,9 +16963,25 @@ def _auto_sync_all_users_portfolios():
     try:
         with db_conn() as conn:
             row = conn.execute(text(
-                "SELECT picks FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
+                "SELECT id, picks FROM wealth_scan_cache ORDER BY generated_at DESC LIMIT 1"
             )).fetchone()
-            picks = (json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])) if row and row[0] else []
+            picks = (json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])) if row and row[1] else []
+            cache_updated = False
+            for _p in picks:
+                _s = str(_p.get("symbol", "") or "").upper().replace(".AX", "")
+                if not _s:
+                    continue
+                _sec = resolve_asx_sector(_s, (_p.get("valuation_metrics") or {}).get("sector") or _p.get("sector") or "", _p.get("company_name") or _p.get("name") or "")
+                if _p.get("sector") != _sec:
+                    _p["sector"] = _sec
+                    if isinstance(_p.get("valuation_metrics"), dict):
+                        _p["valuation_metrics"]["sector"] = _sec
+                    cache_updated = True
+                if (not _p.get("company_name") or _p.get("company_name") == _s) and _s in ASX_COMPANIES:
+                    _p["company_name"] = ASX_COMPANIES[_s]
+                    cache_updated = True
+            if cache_updated and row:
+                conn.execute(text("UPDATE wealth_scan_cache SET picks = :p WHERE id = :id"), {"p": json.dumps(picks), "id": row[0]})
             top_picks = [p for p in picks if p.get("_target_tier") in ("10pct", "8pct")]
             users = conn.execute(text(
                 "SELECT id, COALESCE(total_investment_budget, 100000) FROM users"
@@ -16845,9 +16997,11 @@ def _auto_sync_all_users_portfolios():
             ("WES",  "AU",  0.06, "Consumer",           "Core ASX Blue Chip — 100% Franked Dividend"),
             ("TLS",  "AU",  0.06, "Telecom",            "Core ASX Blue Chip — 100% Franked Defensive Yield"),
         ]
+        scan_by_sym = {p.get("symbol"): p for p in picks if p.get("symbol")}
         price_lookup = {}
         with db_conn() as conn:
-            all_lookup_syms = [sym for sym, _, _, _, _ in core_blueprint] + [p.get("symbol") for p in top_picks if p.get("symbol")]
+            open_db_syms = [r[0] for r in conn.execute(text("SELECT DISTINCT symbol FROM paper_trades WHERE status='open'")).fetchall()]
+            all_lookup_syms = [sym for sym, _, _, _, _ in core_blueprint] + [p.get("symbol") for p in top_picks if p.get("symbol")] + open_db_syms
             for sym in set(all_lookup_syms):
                 r = conn.execute(text(
                     "SELECT close FROM eod_ohl_history WHERE symbol=:s AND close > 0 ORDER BY trade_date DESC LIMIT 1"
@@ -16860,13 +17014,58 @@ def _auto_sync_all_users_portfolios():
             for uid, budget_raw in users:
                 budget = float(budget_raw) if (budget_raw and float(budget_raw) > 0) else 100000.0
                 open_rows = conn.execute(text(
-                    "SELECT symbol, COALESCE(sleeve, 'satellite'), COALESCE(sector, '') FROM paper_trades WHERE user_id=:u AND status='open'"
+                    "SELECT id, symbol, COALESCE(sleeve, 'satellite'), COALESCE(sector, ''), COALESCE(entry_price, 0), COALESCE(current_price, 0), COALESCE(peak_price, 0), COALESCE(signal_score, 50.0) FROM paper_trades WHERE user_id=:u AND status='open'"
                 ), {"u": uid}).fetchall()
-                open_syms = {r[0] for r in open_rows}
+                open_syms = set()
                 sat_sector_counts = {}
-                for _, slv, sec_r in open_rows:
-                    if slv != "core" and sec_r:
-                        sat_sector_counts[sec_r] = sat_sector_counts.get(sec_r, 0) + 1
+
+                # ── 1. Backfill GICS sectors & rotate out ineligible / conviction-decayed satellite positions ──
+                for tid, sym_r, slv, sec_r, ep_r, cp_r, pk_r, sig_sc_r in open_rows:
+                    resolved_sec = resolve_asx_sector(sym_r, sec_r)
+                    if resolved_sec != sec_r:
+                        conn.execute(text("UPDATE paper_trades SET sector = :sec WHERE id = :tid"), {"sec": resolved_sec, "tid": tid})
+                    if slv != "core":
+                        live_p = float(cp_r or price_lookup.get(sym_r) or ep_r or 0)
+                        ep_f = float(ep_r or 0)
+                        pk_f = max(float(pk_r or ep_f or live_p), live_p)
+                        pnl_pct = ((live_p - ep_f) / ep_f * 100.0) if ep_f > 0 else 0.0
+                        peak_pnl_pct = ((pk_f - ep_f) / ep_f * 100.0) if ep_f > 0 else 0.0
+                        sc_info = scan_by_sym.get(sym_r)
+                        is_ineligible = (sc_info is not None and sc_info.get("_pit_eligible") is False) or (0 < live_p < 1.00)
+                        is_decayed = (sc_info is not None and float(sc_info.get("_model_score") or 0) < 35.0) or (sc_info is None and float(sig_sc_r or 50.0) < 35.0)
+                        if (is_ineligible or is_decayed) and pnl_pct < 4.0 and len(top_picks) >= 6:
+                            conn.execute(text("""
+                                UPDATE paper_trades
+                                SET status = 'closed',
+                                    current_price = :cp,
+                                    exit_reason = 'conviction_decay_rotation',
+                                    position_stage = 'closed',
+                                    notes = COALESCE(notes, '') || ' | Auto-rotated: v3 conviction decay/ineligible',
+                                    updated_at = :now
+                                WHERE id = :tid
+                            """), {"cp": live_p, "now": now, "tid": tid})
+                            continue
+                        # Also apply 2-stage profit-lock ratchet on active satellite winners (never setting stop >= live_p)
+                        if peak_pnl_pct >= 6.0 and ep_f > 0 and live_p > ep_f * 1.02:
+                            ratchet_sl = min(max(round(pk_f * 0.985, 4), round(ep_f * 1.02, 4)), round(live_p * 0.995, 4))
+                            conn.execute(text("""
+                                UPDATE paper_trades
+                                SET stop_loss_price = GREATEST(COALESCE(stop_loss_price, 0), :sl),
+                                    trailing_stop_pct = LEAST(COALESCE(trailing_stop_pct, 3.0), 1.5),
+                                    peak_price = :pk
+                                WHERE id = :tid
+                            """), {"sl": ratchet_sl, "pk": pk_f, "tid": tid})
+                        elif peak_pnl_pct >= 4.0 and ep_f > 0 and live_p > ep_f * 1.01:
+                            conn.execute(text("""
+                                UPDATE paper_trades
+                                SET stop_loss_price = GREATEST(COALESCE(stop_loss_price, 0), :sl),
+                                    trailing_stop_pct = LEAST(COALESCE(trailing_stop_pct, 3.0), 2.0),
+                                    peak_price = :pk
+                                WHERE id = :tid
+                            """), {"sl": round(ep_f * 1.005, 4), "pk": pk_f, "tid": tid})
+                        if resolved_sec and resolved_sec != "ASX Equities":
+                            sat_sector_counts[resolved_sec] = sat_sector_counts.get(resolved_sec, 0) + 1
+                    open_syms.add(sym_r)
 
                 for sym, mkt, pct_nav, sec, notes_str in core_blueprint:
                     price = price_lookup.get(sym, 0.0)
@@ -16876,7 +17075,7 @@ def _auto_sync_all_users_portfolios():
                     if sym in open_syms:
                         conn.execute(text("""
                             UPDATE paper_trades
-                            SET sleeve = 'core', sector = COALESCE(NULLIF(sector, ''), :sec)
+                            SET sleeve = 'core', sector = :sec
                             WHERE user_id = :u AND symbol = :s AND status = 'open'
                         """), {"sec": sec, "u": uid, "s": sym})
                         continue
@@ -16910,7 +17109,9 @@ def _auto_sync_all_users_portfolios():
                     sym = p.get("symbol")
                     if not sym or sym in open_syms:
                         continue
-                    sec = (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "ASX Equities"
+                    if p.get("_pit_eligible") is False:
+                        continue
+                    sec = resolve_asx_sector(sym, (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "", p.get("company_name") or p.get("name") or "")
                     if sec and sec != "ASX Equities" and sat_sector_counts.get(sec, 0) >= 2:
                         continue
                     price = float(price_lookup.get(sym) or p.get("current_price") or p.get("entry_price") or 0)
@@ -16943,7 +17144,7 @@ def _auto_sync_all_users_portfolios():
                     })
                     open_syms.add(sym)
                     sat_count += 1
-                    if sec:
+                    if sec and sec != "ASX Equities":
                         sat_sector_counts[sec] = sat_sector_counts.get(sec, 0) + 1
         print("[AutoPortfolioSync] Verified Core + Top-Decile Satellite positions for all users.", flush=True)
     except Exception as e:

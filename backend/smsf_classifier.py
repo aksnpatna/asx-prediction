@@ -487,8 +487,18 @@ def score_satellite_cohort(
             0.15 * (1.0 - float(f.get("rk_dist_sma20", 0.5))) +
             0.35 * vol_guard + 0.35 * trend_guard + pullback_bonus + qual_bonus
         )
-        # Hard SMSF eligibility guard against penny stocks & extreme speculative lottery tickers
-        if close_p < 1.00 or dvol < 400_000 or hv63 > 0.48 or (eps_pos <= 0 and hv63 > 0.38):
+        # Hard SMSF eligibility guard:
+        # 1. No penny stocks (< $1.00), illiquid names (< $400k daily vol), or extreme volatility (> 48% hv63)
+        # 2. Hard trend filter: price MUST be above 200-day SMA (dist_sma200 > 0) and not in a steep 6m downtrend
+        #    — eliminates falling-knife / cyclical value traps (e.g. crashing miners with artificially high trailing E/P)
+        if (
+            close_p < 1.00
+            or dvol < 400_000
+            or hv63 > 0.48
+            or (eps_pos <= 0 and hv63 > 0.38)
+            or dist200 <= 0.0
+            or mom126 < -5.0
+        ):
             eligible_mask[i] = False
 
     rk_struct = rankdata(struct_scores, method="average") / float(max(n, 1))
@@ -510,9 +520,13 @@ def score_satellite_cohort(
     if artifact is not None:
         try:
             if artifact.get("model") is not None:
-                p_bin = np.asarray(artifact["model"].predict_proba(X)[:, 1], dtype=np.float64)
+                p_raw = np.asarray(artifact["model"].predict_proba(X)[:, 1], dtype=np.float64)
                 if artifact.get("isotonic") is not None:
-                    p_bin = np.asarray(artifact["isotonic"].predict(p_bin), dtype=np.float64)
+                    p_iso = np.asarray(artifact["isotonic"].predict(p_raw), dtype=np.float64)
+                    # Smooth isotonic step plateaus by blending 50/50 with raw probability
+                    p_bin = np.clip(0.5 * p_raw + 0.5 * p_iso, 0.02, 0.92)
+                else:
+                    p_bin = p_raw
             if artifact.get("lgbm_reg") is not None:
                 p_reg = np.asarray(artifact["lgbm_reg"].predict(X), dtype=np.float64)
             if artifact.get("random_forest") is not None:

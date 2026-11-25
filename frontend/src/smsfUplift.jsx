@@ -771,6 +771,165 @@ export function ScreenerScreen({ token, onRunScan }) {
   )
 }
 
+export function MonthlyAuditPanel({ token, onPortfolioChanged }) {
+  const [refreshKey, setRefreshKey] = useState(0)
+  const { data, loading } = useApi('/smsf/monthly-audit', token, [refreshKey])
+  const [running, setRunning] = useState(false)
+  const [rebalancing, setRebalancing] = useState(false)
+  const [exitingId, setExitingId] = useState(null)
+  const [statusMsg, setStatusMsg] = useState('')
+
+  const handleRunAudit = () => {
+    setRunning(true)
+    setStatusMsg('')
+    axios.post(`${API_BASE}/smsf/monthly-audit/run`, {}, authH(token))
+      .then(() => {
+        setRefreshKey(k => k + 1)
+        setStatusMsg('Live macro & news red-flag audit completed.')
+      })
+      .catch(err => setStatusMsg(err?.response?.data?.detail || 'Audit failed — check backend logs.'))
+      .finally(() => setRunning(false))
+  }
+
+  const handleQuarterlyRebalance = () => {
+    if (!window.confirm('Run Quarterly v4 Rebalance (80% Core ETFs + up to 20% AI-Vetted Satellite)?')) return
+    setRebalancing(true)
+    setStatusMsg('')
+    axios.post(`${API_BASE}/smsf/quarterly-rebalance`, {}, authH(token))
+      .then(res => {
+        setStatusMsg(res?.data?.message || 'Quarterly rebalance synced.')
+        setRefreshKey(k => k + 1)
+        if (onPortfolioChanged) onPortfolioChanged()
+      })
+      .catch(err => setStatusMsg(err?.response?.data?.detail || 'Rebalance failed.'))
+      .finally(() => setRebalancing(false))
+  }
+
+  const handleExitRedFlag = (tradeId, sym) => {
+    if (!window.confirm(`Exit ${sym} due to Monthly Audit red flag?`)) return
+    setExitingId(tradeId)
+    axios.post(`${API_BASE}/smsf/monthly-audit/exit/${tradeId}`, {}, authH(token))
+      .then(() => {
+        setStatusMsg(`Closed ${sym} (monthly_audit_red_flag).`)
+        setRefreshKey(k => k + 1)
+        if (onPortfolioChanged) onPortfolioChanged()
+      })
+      .catch(err => setStatusMsg(err?.response?.data?.detail || `Failed to close ${sym}.`))
+      .finally(() => setExitingId(null))
+  }
+
+  const a = data || {}
+  const regime = (a.regime || 'neutral').toUpperCase()
+  const action = a.rebalance_action || 'HOLD'
+  const regimeColor = regime === 'RISK_ON' ? '#22c55e' : regime === 'DEFENSIVE' ? '#ef4444' : '#f59e0b'
+  const actionBg = action === 'REVIEW_RED_FLAG' ? 'rgba(239,68,68,0.14)' : action === 'QUARTERLY_REBALANCE_DUE' ? 'rgba(245,158,11,0.14)' : 'rgba(34,197,94,0.12)'
+  const actionColor = action === 'REVIEW_RED_FLAG' ? '#f87171' : action === 'QUARTERLY_REBALANCE_DUE' ? '#fbbf24' : '#4ade80'
+  const actionLabel = action === 'REVIEW_RED_FLAG'
+    ? `🚨 RED FLAG DETECTED (${a.red_flag_count || 0}) — REVIEW EXIT`
+    : action === 'QUARTERLY_REBALANCE_DUE'
+      ? '⚖️ QUARTERLY REBALANCE DUE'
+      : '✅ HOLD — NO REBALANCE NEEDED'
+
+  return (
+    <div className="sx-nav-card" style={{ marginTop: 14, border: '1px solid rgba(148,163,184,0.22)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>🛰️ Monthly AI Macro &amp; News Red-Flag Audit</div>
+          <div className="sx-meta">
+            Auto-runs 1st of month (8:30am) · News: <b>{a.news_source || 'loading…'}</b>
+            {a.run_at ? ` · Last run: ${String(a.run_at).slice(0, 16).replace('T', ' ')}` : ''}
+            {a.next_quarterly_rebalance ? ` · Next Quarterly Rebalance: ${a.next_quarterly_rebalance} (${a.days_to_quarterly_rebalance}d)` : ''}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="sx-run-btn" onClick={handleRunAudit} disabled={running}>
+            {running ? '⏳ SCANNING NEWS…' : '🔍 RUN MONTHLY AUDIT NOW'}
+          </button>
+          <button
+            className="sx-run-btn"
+            style={{ background: 'rgba(148,163,184,0.16)', color: '#e2e8f0' }}
+            onClick={handleQuarterlyRebalance}
+            disabled={rebalancing}
+          >
+            {rebalancing ? '⏳ REBALANCING…' : '⚖️ QUARTERLY REBALANCE'}
+          </button>
+        </div>
+      </div>
+
+      {statusMsg && (
+        <div className="sx-meta" style={{ marginTop: 8, color: '#93c5fd' }}>{statusMsg}</div>
+      )}
+
+      {loading && !data ? (
+        <div className="sx-meta" style={{ marginTop: 10 }}>Running initial macro &amp; news audit…</div>
+      ) : (
+        <>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 10, alignItems: 'center' }}>
+            <span style={{ padding: '4px 10px', borderRadius: 999, fontSize: 12, fontWeight: 700, background: 'rgba(15,23,42,0.55)', border: `1px solid ${regimeColor}`, color: regimeColor }}>
+              REGIME: {regime}
+            </span>
+            <span style={{ padding: '4px 10px', borderRadius: 999, fontSize: 12, fontWeight: 700, background: actionBg, color: actionColor }}>
+              {actionLabel}
+            </span>
+          </div>
+
+          {a.macro_summary && (
+            <div className="sx-model-plain" style={{ marginTop: 10 }}>{a.macro_summary}</div>
+          )}
+
+          {(a.macro_bullets || []).length > 0 && (
+            <ul style={{ margin: '8px 0 12px 18px', padding: 0, fontSize: 13, lineHeight: 1.5, opacity: 0.92 }}>
+              {(a.macro_bullets || []).map((b, idx) => <li key={idx}>{b}</li>)}
+            </ul>
+          )}
+
+          <div className="sx-section-title" style={{ marginTop: 8 }}>HOLDINGS NEWS &amp; RED-FLAG VERDICTS</div>
+          {(a.holdings || []).map(h => {
+            const vColor = h.verdict === 'RED_FLAG_EXIT' ? '#f87171' : h.verdict === 'KEEP_WATCH' ? '#fbbf24' : '#4ade80'
+            const topHeadline = (h.headlines || [])[0]
+            return (
+              <div key={h.trade_id || h.symbol} style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap',
+                gap: 8, padding: '8px 10px', borderRadius: 8, marginBottom: 6,
+                background: 'rgba(15,23,42,0.4)', border: `1px solid ${h.verdict === 'RED_FLAG_EXIT' ? 'rgba(248,113,113,0.45)' : 'rgba(148,163,184,0.14)'}`
+              }}>
+                <div style={{ flex: '1 1 280px' }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <b style={{ fontSize: 14 }}>{h.symbol}</b>
+                    <span className="sx-meta">{h.sleeve === 'core' ? 'CORE ETF' : 'SATELLITE'} · {h.sector}</span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: vColor }}>{h.verdict.replace(/_/g, ' ')}</span>
+                    <span className="sx-meta">
+                      {h.pnl_pct >= 0 ? '+' : ''}{h.pnl_pct}% · {h.above_sma200 === true ? 'Above 200d SMA ✅' : h.above_sma200 === false ? 'Below 200d SMA ⚠️' : 'SMA n/a'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12.5, marginTop: 3, opacity: 0.9 }}>{h.summary}</div>
+                  {topHeadline && topHeadline.title && (
+                    <div className="sx-meta" style={{ marginTop: 3 }}>
+                      📰 {topHeadline.url
+                        ? <a href={topHeadline.url} target="_blank" rel="noreferrer" style={{ color: '#93c5fd', textDecoration: 'underline' }}>{topHeadline.title}</a>
+                        : topHeadline.title}
+                    </div>
+                  )}
+                </div>
+                {h.sleeve === 'satellite' && h.verdict === 'RED_FLAG_EXIT' && (
+                  <button
+                    className="sx-run-btn"
+                    style={{ background: '#dc2626', color: '#fff', fontSize: 12 }}
+                    onClick={() => handleExitRedFlag(h.trade_id, h.symbol)}
+                    disabled={exitingId === h.trade_id}
+                  >
+                    {exitingId === h.trade_id ? '⏳ EXITING…' : `🚨 EXIT ${h.symbol}`}
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </>
+      )}
+    </div>
+  )
+}
+
 export function PortfolioScreen({ token }) {
   const [refreshKey, setRefreshKey] = useState(0)
   const { data } = useApi('/portfolio/nav-breakdown', token, [refreshKey])
@@ -782,17 +941,17 @@ export function PortfolioScreen({ token }) {
 
   const handleBuildCore = () => {
     setCoreBuilding(true)
-    axios.post(`${API_BASE}/core-sleeve/auto-populate`, {}, authH(token))
+    axios.post(`${API_BASE}/smsf/quarterly-rebalance`, {}, authH(token))
       .then(() => { setRefreshKey(k => k + 1); setCoreBuilding(false) })
       .catch(() => setCoreBuilding(false))
   }
 
   return (
-    <Screen title="My SMSF Portfolio" subtitle="What you own, how it's doing, what needs attention"
+    <Screen title="My SMSF Portfolio" subtitle="SMSF v4: 80% Core Global+ASX ETFs + 20% Quarterly AI-Vetted Satellite"
       right={
         (!d.core_positions || d.core_positions.length === 0) ? (
           <button className="sx-run-btn" onClick={handleBuildCore} disabled={coreBuilding}>
-            {coreBuilding ? '⏳ ALLOCATING CORE…' : '⚡ AUTO-BUILD 60% CORE SLEEVE'}
+            {coreBuilding ? '⏳ ALLOCATING CORE…' : '⚡ AUTO-BUILD 80% CORE ETFs'}
           </button>
         ) : null
       }>
@@ -810,22 +969,24 @@ export function PortfolioScreen({ token }) {
           <div className="sx-bar-fill sx-split-core" style={{ width: `${d.core_pct || 0}%` }} />
           <div className="sx-bar-fill sx-split-sat" style={{ width: `${d.satellite_pct || 0}%` }} />
         </div>
-        <div className="sx-meta">CORE HOLDINGS {d.core_pct || 0}% (target 60%) · AI/SATELLITE PICKS {d.satellite_pct || 0}% (target 30%)</div>
+        <div className="sx-meta">CORE ETFs {d.core_pct || 0}% (target 80%) · QUARTERLY AI-VETTED SATELLITE {d.satellite_pct || 0}% (target 20%)</div>
         <div className="sx-model-plain">
-          Your core holdings (ETFs + fully franked blue chips) make up {d.core_pct || 0}% of your SMSF;
-          the AI/satellite picks {d.satellite_pct || 0}% — {d.satellite_pct != null && d.satellite_pct <= 40 ? 'within your 30–40% safety target. ✅' : 'above the 40% safety target — new satellite entries are paused until it comes back down. ⚠️'}
+          Your core global + ASX ETFs (VGS, VAS, NDQ, GOLD) make up {d.core_pct || 0}% of your SMSF;
+          quarterly AI-vetted satellite picks make up {d.satellite_pct || 0}% — {d.satellite_pct != null && d.satellite_pct <= 25 ? 'within your 20% safety cap. ✅' : 'above the 20% safety cap — new satellite entries are paused. ⚠️'}
         </div>
       </div>
 
-      <div className="sx-section-title">CORE HOLDINGS — BUY &amp; HOLD (60% TARGET SLEEVE)</div>
+      <MonthlyAuditPanel token={token} onPortfolioChanged={() => setRefreshKey(k => k + 1)} />
+
+      <div className="sx-section-title">CORE HOLDINGS — GLOBAL &amp; ASX ETFs (80% TARGET SLEEVE)</div>
       {(d.core_positions || []).map(p => <CoreSleeveRow key={p.id} pos={p} />)}
       {(!d.core_positions || d.core_positions.length === 0) && (
         <div className="sx-meta">
-          No core positions yet — click <b>⚡ AUTO-BUILD 60% CORE SLEEVE</b> above to allocate VAS/VGS/QUAL/GOLD + Franked Blue Chips.
+          No core positions yet — click <b>⚡ AUTO-BUILD 80% CORE ETFs</b> above to allocate VGS/VAS/NDQ/GOLD.
         </div>
       )}
 
-      <div className="sx-section-title">AI/SATELLITE PICKS — THE 63-DAY CLOCK (30% TARGET SLEEVE)</div>
+      <div className="sx-section-title">QUARTERLY AI-VETTED SATELLITE — 63-DAY CLOCK (20% TARGET SLEEVE)</div>
       {(d.satellite_positions || []).map(p => <SatelliteClock key={p.id} pos={p} />)}
 
       {(d.cgt_alerts || []).map((a, i) => (

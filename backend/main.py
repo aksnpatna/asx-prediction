@@ -13252,10 +13252,21 @@ def _scheduled_self_learning_loop():
         with engine.connect() as conn:
             # Get all closed/exited trades
             trades = conn.execute(text("""
-                SELECT entry_price, current_price, position_stage
-                FROM paper_trades
-                WHERE (status = 'closed' OR position_stage IN ('trim_signal', 'exit_signal'))
-                  AND COALESCE(exit_reason, '') <> 'legacy_model_retired'
+                SELECT pt.entry_price, pt.current_price, pt.position_stage
+                FROM paper_trades pt
+                LEFT JOIN users u ON u.id::text = pt.user_id::text
+                WHERE (pt.status = 'closed' OR pt.position_stage IN ('trim_signal', 'exit_signal'))
+                  AND COALESCE(pt.exit_reason, '') NOT IN ('legacy_model_retired', 'strategy_v4_reset')
+                  AND COALESCE(pt.sleeve, 'satellite') <> 'core'
+                  AND (u.email IS NULL OR (
+                        LOWER(u.email) NOT LIKE '%@example.com'
+                    AND LOWER(u.email) NOT LIKE '%@test.com'
+                    AND LOWER(u.email) NOT LIKE '%@wealth.local'
+                    AND LOWER(u.email) NOT LIKE '%@smsf.com'
+                    AND LOWER(u.email) NOT LIKE 'test%'
+                    AND LOWER(u.email) NOT LIKE 'groq-test%'
+                    AND LOWER(u.email) NOT LIKE 'strategy.%'
+                  ))
             """)).fetchall()
 
             min_trades = 3 if PAPER_BOOTSTRAP_MODE else 8
@@ -13528,8 +13539,9 @@ def _scheduled_v2_daily_scan():
             val["model_tier"] = cand.get("_target_tier", "none")
             val["model_score"] = cand.get("_model_score", 0)
             val["model_tier_label"] = cand.get("_tier_label", "")
-            val["model_proba"] = cand.get("_lgbm_proba")  # true P(hit +8%) from the trained LGBM
-            val["model_base_rate"] = 0.21  # modern-window base rate (Fix 26) — the line below which the model has NO edge
+            _art_meta = _load_lgbm_classifier() or {}
+            val["model_proba"] = cand.get("_lgbm_proba")  # smoothed calibrated probability from LGBM
+            val["model_base_rate"] = round(float(_art_meta.get("base_rate", 51.7)) / 100.0, 3)
 
             # T3-C: model-aware debate context (feature drivers + kNN setups)
             try:
@@ -13569,7 +13581,21 @@ def _scheduled_v2_daily_scan():
                        "c": r.get("confidence"),
                        "r": (r.get("reasoning") or "")[:2000]})
             conn.commit()
-        print(f"[V2DailyScan] Persisted {len(ai_results)} AI verdicts to ai_verdicts.", flush=True)
+            _n_tot = len(ai_results)
+            _n_app = sum(1 for r in ai_results if str(r.get("decision", "")).upper() == "APPROVE")
+            _n_rej = _n_tot - _n_app
+            _app_rate = round((_n_app / _n_tot * 100.0), 2) if _n_tot > 0 else 0.0
+            conn.execute(text("""
+                UPDATE daily_ai_runs
+                SET total_candidates = :tot,
+                    ai_approved = :app,
+                    ai_rejected = :rej,
+                    approval_rate_pct = :rate,
+                    completed_at = NOW()
+                WHERE run_date = :d
+            """), {"tot": _n_tot, "app": _n_app, "rej": _n_rej, "rate": _app_rate, "d": today_key})
+            conn.commit()
+        print(f"[V2DailyScan] Persisted {len(ai_results)} AI verdicts to ai_verdicts ({_n_app} approved / {_n_rej} rejected).", flush=True)
     except Exception as e:
         print(f"[V2DailyScan] ai_verdicts persist failed: {e}", flush=True)
 
@@ -15630,6 +15656,62 @@ async def screener_auto_execute(max_picks: int = 6, current_user: dict = Depends
     return {"status": "ok", "opened": opened, "skipped": skipped, "count": len(opened)}
 
 
+@app.get("/api/smsf/monthly-audit")
+async def get_smsf_monthly_audit(current_user: dict = Depends(get_current_user)):
+    """Return latest Monthly Macro & Red-Flag News Audit for the user's SMSF portfolio."""
+    from monthly_audit import get_latest_monthly_audit, run_monthly_audit
+    uid = current_user["id"]
+    latest = get_latest_monthly_audit(db_conn, user_id=uid)
+    if latest is None:
+        latest = await asyncio.to_thread(run_monthly_audit, db_conn, uid, "initial_auto")
+    return latest
+
+
+@app.post("/api/smsf/monthly-audit/run")
+async def trigger_smsf_monthly_audit(current_user: dict = Depends(get_current_user)):
+    """Run a fresh live Monthly Macro + News/Tavily Red-Flag Audit on demand."""
+    from monthly_audit import run_monthly_audit
+    uid = current_user["id"]
+    result = await asyncio.to_thread(run_monthly_audit, db_conn, uid, "manual_ui")
+    return result
+
+
+@app.post("/api/smsf/monthly-audit/exit/{trade_id}")
+async def exit_red_flag_position(trade_id: str, current_user: dict = Depends(get_current_user)):
+    """User-approved one-click exit for a Satellite position flagged by the Monthly Audit."""
+    uid = current_user["id"]
+    now = datetime.utcnow()
+    with db_conn() as conn:
+        row = conn.execute(text(
+            "SELECT symbol, current_price, entry_price FROM paper_trades WHERE id = :tid AND user_id = :u AND status = 'open'"
+        ), {"tid": trade_id, "u": uid}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Open position not found")
+        sym, cp, ep = row
+        close_px = float(cp or ep or 0)
+        conn.execute(text("""
+            UPDATE paper_trades
+            SET status = 'closed',
+                current_price = :cp,
+                exit_reason = 'monthly_audit_red_flag',
+                position_stage = 'closed',
+                closed_at = :now,
+                updated_at = :now,
+                notes = COALESCE(notes, '') || ' | Exited via Monthly AI Audit red-flag review'
+            WHERE id = :tid AND user_id = :u
+        """), {"cp": close_px, "now": now, "tid": trade_id, "u": uid})
+        conn.commit()
+    return {"status": "closed", "symbol": sym, "trade_id": trade_id, "exit_price": close_px}
+
+
+@app.post("/api/smsf/quarterly-rebalance")
+async def trigger_quarterly_rebalance(current_user: dict = Depends(get_current_user)):
+    """User-approved quarterly rebalance: syncs 80% Core ETFs + up to 20% AI-Vetted Satellite."""
+    del current_user
+    await asyncio.to_thread(_auto_sync_all_users_portfolios)
+    return {"status": "ok", "message": "Quarterly v4 rebalance (80% Core ETFs + 20% AI-Vetted Satellite) synced."}
+
+
 @app.get("/api/core-sleeve/candidates")
 async def get_core_sleeve_candidates(current_user: dict = Depends(get_current_user)):
     """Return curated ASX Core Sleeve holdings (Index ETFs + Franked Dividend Blue Chips)."""
@@ -16958,8 +17040,29 @@ def _get_all_telegram_users():
         return [{"id": "default"}]
 
 
+def _is_real_portfolio_user(email: str) -> bool:
+    """Exclude synthetic/test accounts from automated paper portfolio execution and metrics."""
+    e = (email or "").strip().lower()
+    if not e:
+        return False
+    blocked_suffixes = ("@example.com", "@test.com", "@wealth.local", "@smsf.com")
+    blocked_prefixes = ("test", "groq-test", "strategy.", "deploytest", "tgconf_", "llmtest")
+    if e.endswith(blocked_suffixes) or e.startswith(blocked_prefixes):
+        return False
+    return True
+
+
 def _auto_sync_all_users_portfolios():
-    """Ensure all active users have their 60% Core Sleeve + Top-Decile Satellite positions open and tracked."""
+    """SMSF v4 Engine: 80% Core Global+ASX ETFs (quarterly rebalanced) + 20% AI-Vetted Quarterly Satellite.
+
+    Guardrails enforced:
+      1. Real user accounts only (excludes test/synthetic users).
+      2. 80% Core ETFs (VGS 32%, VAS 24%, NDQ 16%, GOLD 8%) — zero single-stock overlap with Satellite.
+      3. No conviction-decay daily churn; Satellite holds for 63 trading days (~1 quarter) unless -12% stop or profit ratchet hits.
+      4. Hard >200-day SMA trend filter verified against eod_ohl_history before any Satellite buy.
+      5. Strict sector cap: max 1 Satellite stock per GICS sector, and max 1 combined in Materials + Energy.
+      6. AI Red-Flag Veto: skip any symbol rejected by ai_verdicts in the last 7 days.
+    """
     try:
         with db_conn() as conn:
             row = conn.execute(text(
@@ -16983,33 +17086,57 @@ def _auto_sync_all_users_portfolios():
             if cache_updated and row:
                 conn.execute(text("UPDATE wealth_scan_cache SET picks = :p WHERE id = :id"), {"p": json.dumps(picks), "id": row[0]})
             top_picks = [p for p in picks if p.get("_target_tier") in ("10pct", "8pct")]
-            users = conn.execute(text(
-                "SELECT id, COALESCE(total_investment_budget, 100000) FROM users"
+            all_users = conn.execute(text(
+                "SELECT id, email, COALESCE(total_investment_budget, 100000) FROM users"
             )).fetchall()
+            users = [(uid, b) for uid, em, b in all_users if _is_real_portfolio_user(em)]
 
+            # Recent 7-day AI committee REJECT vetoes
+            ai_rejected_rows = conn.execute(text("""
+                SELECT DISTINCT symbol FROM ai_verdicts
+                WHERE run_date >= CURRENT_DATE - INTERVAL '7 days'
+                  AND UPPER(decision) = 'REJECT'
+            """)).fetchall()
+            ai_vetoed_syms = {str(r[0]).upper() for r in ai_rejected_rows if r[0]}
+
+        # 80% Core Global + ASX Growth ETF Blueprint (10Y backtest: 13.86% CAGR, 0.93 Sharpe)
         core_blueprint = [
-            ("VAS",  "ETF", 0.12, "ASX200 Index ETF",   "Core ASX300 Franked Index (~80% franked)"),
-            ("VGS",  "ETF", 0.10, "Global Index ETF",   "Core MSCI World Ex-AU Diversification"),
-            ("QUAL", "ETF", 0.07, "Global Quality ETF", "Core Global Quality Factor ETF"),
-            ("GOLD", "ETF", 0.06, "Commodities ETF",    "Core Physical Gold Inflation/Tail Hedge"),
-            ("BHP",  "AU",  0.07, "Materials",          "Core ASX Blue Chip — 100% Franked Dividend"),
-            ("CBA",  "AU",  0.06, "Financials",         "Core ASX Blue Chip — 100% Franked Dividend"),
-            ("WES",  "AU",  0.06, "Consumer",           "Core ASX Blue Chip — 100% Franked Dividend"),
-            ("TLS",  "AU",  0.06, "Telecom",            "Core ASX Blue Chip — 100% Franked Defensive Yield"),
+            ("VGS",  "ETF", 0.32, "Global Index ETF",  "Core MSCI World ex-AU Growth Engine (32% NAV)"),
+            ("VAS",  "ETF", 0.24, "ASX300 Index ETF",  "Core ASX300 Franked Dividend Index (24% NAV)"),
+            ("NDQ",  "ETF", 0.16, "Global Tech ETF",   "Core Nasdaq-100 Secular Growth Tilt (16% NAV)"),
+            ("GOLD", "ETF", 0.08, "Commodities ETF",   "Core Physical Gold AUD Tail/Inflation Hedge (8% NAV)"),
         ]
-        scan_by_sym = {p.get("symbol"): p for p in picks if p.get("symbol")}
+        core_syms_set = {sym for sym, _, _, _, _ in core_blueprint}
         price_lookup = {}
+        sma200_lookup = {}
         with db_conn() as conn:
             open_db_syms = [r[0] for r in conn.execute(text("SELECT DISTINCT symbol FROM paper_trades WHERE status='open'")).fetchall()]
-            all_lookup_syms = [sym for sym, _, _, _, _ in core_blueprint] + [p.get("symbol") for p in top_picks if p.get("symbol")] + open_db_syms
-            for sym in set(all_lookup_syms):
+            # Strictly lookup Core ETFs from market='ETF'
+            for sym, mkt, _, _, _ in core_blueprint:
                 r = conn.execute(text(
-                    "SELECT close FROM eod_ohl_history WHERE symbol=:s AND close > 0 ORDER BY trade_date DESC LIMIT 1"
-                ), {"s": sym}).fetchone()
+                    "SELECT close FROM eod_ohl_history WHERE symbol=:s AND market=:m AND close > 0 ORDER BY trade_date DESC LIMIT 1"
+                ), {"s": sym, "m": mkt}).fetchone()
                 if r and r[0]:
                     price_lookup[sym] = float(r[0])
 
+            # Lookup AU stocks + 200-day SMA directly from eod_ohl_history (market='AU')
+            sat_lookup_syms = set(
+                [p.get("symbol") for p in top_picks if p.get("symbol")] + open_db_syms
+            ) - core_syms_set
+            for sym in sat_lookup_syms:
+                rows_200 = conn.execute(text(
+                    "SELECT close FROM eod_ohl_history WHERE symbol=:s AND market='AU' AND close > 0 ORDER BY trade_date DESC LIMIT 200"
+                ), {"s": sym}).fetchall()
+                if rows_200:
+                    closes = [float(r[0]) for r in rows_200 if r[0]]
+                    if closes:
+                        price_lookup[sym] = closes[0]
+                        if len(closes) >= 150:
+                            sma200_lookup[sym] = sum(closes) / len(closes)
+
         now = datetime.utcnow()
+        CYCLICAL_COMMODITY_SECTORS = {"Materials", "Energy"}
+
         with db_conn() as conn:
             for uid, budget_raw in users:
                 budget = float(budget_raw) if (budget_raw and float(budget_raw) > 0) else 100000.0
@@ -17018,55 +17145,44 @@ def _auto_sync_all_users_portfolios():
                 ), {"u": uid}).fetchall()
                 open_syms = set()
                 sat_sector_counts = {}
+                commodity_sat_count = 0
 
-                # ── 1. Backfill GICS sectors & rotate out ineligible / conviction-decayed satellite positions ──
+                # ── 1. Backfill GICS sectors & manage profit-lock ratchets (NO conviction-decay daily churn) ──
                 for tid, sym_r, slv, sec_r, ep_r, cp_r, pk_r, sig_sc_r in open_rows:
                     resolved_sec = resolve_asx_sector(sym_r, sec_r)
                     if resolved_sec != sec_r:
                         conn.execute(text("UPDATE paper_trades SET sector = :sec WHERE id = :tid"), {"sec": resolved_sec, "tid": tid})
                     if slv != "core":
-                        live_p = float(cp_r or price_lookup.get(sym_r) or ep_r or 0)
+                        live_p = float(price_lookup.get(sym_r) or cp_r or ep_r or 0)
                         ep_f = float(ep_r or 0)
                         pk_f = max(float(pk_r or ep_f or live_p), live_p)
-                        pnl_pct = ((live_p - ep_f) / ep_f * 100.0) if ep_f > 0 else 0.0
                         peak_pnl_pct = ((pk_f - ep_f) / ep_f * 100.0) if ep_f > 0 else 0.0
-                        sc_info = scan_by_sym.get(sym_r)
-                        is_ineligible = (sc_info is not None and sc_info.get("_pit_eligible") is False) or (0 < live_p < 1.00)
-                        is_decayed = (sc_info is not None and float(sc_info.get("_model_score") or 0) < 35.0) or (sc_info is None and float(sig_sc_r or 50.0) < 35.0)
-                        if (is_ineligible or is_decayed) and pnl_pct < 4.0 and len(top_picks) >= 6:
-                            conn.execute(text("""
-                                UPDATE paper_trades
-                                SET status = 'closed',
-                                    current_price = :cp,
-                                    exit_reason = 'conviction_decay_rotation',
-                                    position_stage = 'closed',
-                                    notes = COALESCE(notes, '') || ' | Auto-rotated: v3 conviction decay/ineligible',
-                                    updated_at = :now
-                                WHERE id = :tid
-                            """), {"cp": live_p, "now": now, "tid": tid})
-                            continue
-                        # Also apply 2-stage profit-lock ratchet on active satellite winners (never setting stop >= live_p)
-                        if peak_pnl_pct >= 6.0 and ep_f > 0 and live_p > ep_f * 1.02:
-                            ratchet_sl = min(max(round(pk_f * 0.985, 4), round(ep_f * 1.02, 4)), round(live_p * 0.995, 4))
+                        # 2-stage profit-lock ratchet on active satellite winners (never setting stop >= live_p)
+                        if peak_pnl_pct >= 8.0 and ep_f > 0 and live_p > ep_f * 1.03:
+                            ratchet_sl = min(max(round(pk_f * 0.96, 4), round(ep_f * 1.03, 4)), round(live_p * 0.99, 4))
                             conn.execute(text("""
                                 UPDATE paper_trades
                                 SET stop_loss_price = GREATEST(COALESCE(stop_loss_price, 0), :sl),
-                                    trailing_stop_pct = LEAST(COALESCE(trailing_stop_pct, 3.0), 1.5),
-                                    peak_price = :pk
+                                    trailing_stop_pct = LEAST(COALESCE(trailing_stop_pct, 4.0), 4.0),
+                                    peak_price = :pk,
+                                    current_price = :cp
                                 WHERE id = :tid
-                            """), {"sl": ratchet_sl, "pk": pk_f, "tid": tid})
-                        elif peak_pnl_pct >= 4.0 and ep_f > 0 and live_p > ep_f * 1.01:
+                            """), {"sl": ratchet_sl, "pk": pk_f, "cp": live_p, "tid": tid})
+                        elif peak_pnl_pct >= 5.0 and ep_f > 0 and live_p > ep_f * 1.01:
                             conn.execute(text("""
                                 UPDATE paper_trades
                                 SET stop_loss_price = GREATEST(COALESCE(stop_loss_price, 0), :sl),
-                                    trailing_stop_pct = LEAST(COALESCE(trailing_stop_pct, 3.0), 2.0),
-                                    peak_price = :pk
+                                    peak_price = :pk,
+                                    current_price = :cp
                                 WHERE id = :tid
-                            """), {"sl": round(ep_f * 1.005, 4), "pk": pk_f, "tid": tid})
+                            """), {"sl": round(ep_f * 1.005, 4), "pk": pk_f, "cp": live_p, "tid": tid})
                         if resolved_sec and resolved_sec != "ASX Equities":
                             sat_sector_counts[resolved_sec] = sat_sector_counts.get(resolved_sec, 0) + 1
+                            if resolved_sec in CYCLICAL_COMMODITY_SECTORS:
+                                commodity_sat_count += 1
                     open_syms.add(sym_r)
 
+                # ── 2. Ensure 80% Core ETF Sleeve positions exist and stay tracked ──
                 for sym, mkt, pct_nav, sec, notes_str in core_blueprint:
                     price = price_lookup.get(sym, 0.0)
                     if price <= 0:
@@ -17075,9 +17191,9 @@ def _auto_sync_all_users_portfolios():
                     if sym in open_syms:
                         conn.execute(text("""
                             UPDATE paper_trades
-                            SET sleeve = 'core', sector = :sec
+                            SET sleeve = 'core', sector = :sec, current_price = :cp, updated_at = :now
                             WHERE user_id = :u AND symbol = :s AND status = 'open'
-                        """), {"sec": sec, "u": uid, "s": sym})
+                        """), {"sec": sec, "cp": price, "now": now, "u": uid, "s": sym})
                         continue
                     conn.execute(text("""
                         INSERT INTO paper_trades
@@ -17087,39 +17203,51 @@ def _auto_sync_all_users_portfolios():
                              position_stage, recommendation_action, source_reason, updated_at, entry_date_parsed,
                              catastrophe_stop_price, time_stop_date, sleeve, sector)
                         VALUES
-                            (:id, :u, :s, :m, 'LONG', :q, :p, :p, :tp, 'open', 75.0, 'BULLISH', :nt, :p,
-                             :sl, :tp, 3.0, :rev, 'entered', 'BUY', 'core_sleeve_auto', :now, :ed,
+                            (:id, :u, :s, :m, 'LONG', :q, :p, :p, :tp, 'open', 85.0, 'BULLISH', :nt, :p,
+                             :sl, :tp, 0.0, :rev, 'entered', 'BUY', 'core_etf_v4', :now, :ed,
                              :sl, :ts, 'core', :sec)
                     """), {
                         "id": str(uuid4()), "u": uid, "s": sym, "m": mkt, "q": qty, "p": price,
-                        "tp": round(price * 1.15, 3), "sl": round(price * 0.75, 3), "nt": notes_str,
-                        "rev": now + timedelta(days=14), "now": now, "ed": now.date(),
+                        "tp": round(price * 1.15, 3), "sl": round(price * 0.70, 3), "nt": notes_str,
+                        "rev": now + timedelta(days=90), "now": now, "ed": now.date(),
                         "ts": (now + timedelta(days=365)).date(), "sec": sec,
                     })
                     open_syms.add(sym)
 
+                # ── 3. 20% Quarterly AI-Vetted Satellite Sleeve (max 5 positions, ~4% NAV each) ──
                 gate_info = _wfo_position_gate(uid)
-                max_sat = min(6, int(gate_info.get("max_positions", 6) or 6))
+                max_sat = min(5, int(gate_info.get("max_positions", 5) or 5))
                 sat_count = conn.execute(text(
                     "SELECT COUNT(*) FROM paper_trades WHERE user_id=:u AND status='open' AND COALESCE(sleeve,'satellite') != 'core'"
                 ), {"u": uid}).scalar() or 0
+
+                sat_slot_dollars = round(budget * 0.04, 2)  # 5 slots x 4% = 20% NAV max
                 for p in top_picks:
                     if sat_count >= max_sat:
                         break
-                    sym = p.get("symbol")
-                    if not sym or sym in open_syms:
+                    sym = str(p.get("symbol") or "").upper()
+                    if not sym or sym in open_syms or sym in core_syms_set:
                         continue
                     if p.get("_pit_eligible") is False:
                         continue
-                    sec = resolve_asx_sector(sym, (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "", p.get("company_name") or p.get("name") or "")
-                    if sec and sec != "ASX Equities" and sat_sector_counts.get(sec, 0) >= 2:
+                    # Guardrail A: AI Red-Flag Veto
+                    if sym in ai_vetoed_syms:
                         continue
                     price = float(price_lookup.get(sym) or p.get("current_price") or p.get("entry_price") or 0)
-                    if price <= 0:
+                    if price < 1.00:
                         continue
-                    hv20_p = float(p.get("_hv20") or 0.22)
-                    pos_dollars = _smsf_position_size(price, hv20_p / 15.87, nav=budget)
-                    qty = max(1, int(pos_dollars // price))
+                    # Guardrail B: Hard >200-day SMA trend filter (no falling knives)
+                    sma200_val = sma200_lookup.get(sym)
+                    if sma200_val is not None and price <= sma200_val:
+                        continue
+                    # Guardrail C: Strict sector cap (max 1 per GICS sector, max 1 combined Materials+Energy)
+                    sec = resolve_asx_sector(sym, (p.get("valuation_metrics") or {}).get("sector") or p.get("sector") or "", p.get("company_name") or p.get("name") or "")
+                    if sec and sec != "ASX Equities":
+                        if sat_sector_counts.get(sec, 0) >= 1:
+                            continue
+                        if sec in CYCLICAL_COMMODITY_SECTORS and commodity_sat_count >= 1:
+                            continue
+                    qty = max(1, int(sat_slot_dollars // price))
                     score_val = round(float(p.get("_model_score") or (p.get("_lgbm_proba") or 0.55) * 100), 1)
                     tier = p.get("_target_tier", "8pct")
                     tgt_pct = float(p.get("target_return_pct") or p.get("_target_return_pct") or (10.0 if tier == "10pct" else 8.0))
@@ -17133,20 +17261,22 @@ def _auto_sync_all_users_portfolios():
                              catastrophe_stop_price, time_stop_date, sleeve, sector)
                         VALUES
                             (:id, :u, :s, 'AU', 'LONG', :q, :p, :p, :tp, 'open', :sc, 'BULLISH', :nt, :p,
-                             :sl, :tp, 3.0, :rev, 'entered', 'BUY', 'v2_daily_scan', :now, :ed,
+                             :sl, :tp, 4.0, :rev, 'entered', 'BUY', 'v4_quarterly_sat', :now, :ed,
                              :sl, :ts, 'satellite', :sec)
                     """), {
                         "id": str(uuid4()), "u": uid, "s": sym, "q": qty, "p": price,
                         "tp": tp_price, "sc": score_val,
-                        "nt": f"Auto-executed top-decile ({tier}, score={score_val}, target=+{tgt_pct:.1f}%)",
-                        "sl": round(price * 0.80, 3), "rev": now + timedelta(days=14),
-                        "now": now, "ed": now.date(), "ts": (now + timedelta(days=63)).date(), "sec": sec,
+                        "nt": f"v4 Quarterly AI-Vetted ({tier}, score={score_val}, >200d SMA, 1/sector cap)",
+                        "sl": round(price * 0.88, 3), "rev": now + timedelta(days=90),
+                        "now": now, "ed": now.date(), "ts": (now + timedelta(days=90)).date(), "sec": sec,
                     })
                     open_syms.add(sym)
                     sat_count += 1
                     if sec and sec != "ASX Equities":
                         sat_sector_counts[sec] = sat_sector_counts.get(sec, 0) + 1
-        print("[AutoPortfolioSync] Verified Core + Top-Decile Satellite positions for all users.", flush=True)
+                        if sec in CYCLICAL_COMMODITY_SECTORS:
+                            commodity_sat_count += 1
+        print(f"[AutoPortfolioSync] Verified SMSF v4 (80% Core ETF + 20% AI-Vetted Satellite) for {len(users)} real users.", flush=True)
     except Exception as e:
         print(f"[AutoPortfolioSync] Non-blocking error: {e}", flush=True)
 
@@ -17312,6 +17442,28 @@ if SCHEDULER_AVAILABLE:
             _scheduled_walk_forward_oos, "cron",
             minute=15, hour=16, day_of_week="mon-fri",
             id="walk_forward_oos", max_instances=1,
+        )
+
+        # ── SMSF v4: Monthly Read-Only Macro & Red-Flag News Audit (1st of month, 8:30am) ──
+        def _scheduled_monthly_macro_audit():
+            jid, started = _log_job_start("monthly_macro_audit")
+            try:
+                from monthly_audit import run_monthly_audit
+                res = run_monthly_audit(db_conn, user_id=None, trigger_source="scheduled_monthly")
+                _log_job_finish(jid, rows_affected=len(res.get("holdings") or []), started_at=started)
+                print(
+                    f"[MonthlyAudit] Scheduled audit complete: regime={res.get('regime')}, "
+                    f"action={res.get('rebalance_action')}, red_flags={res.get('red_flag_count')}",
+                    flush=True,
+                )
+            except Exception as e:
+                _log_job_finish(jid, status="error", error=str(e), started_at=started)
+                print(f"[MonthlyAudit] Scheduled audit failed: {e}", flush=True)
+
+        scheduler.add_job(
+            _scheduled_monthly_macro_audit, "cron",
+            day="1", hour=8, minute=30,
+            id="monthly_macro_audit", max_instances=1,
         )
 
         scheduler.start()

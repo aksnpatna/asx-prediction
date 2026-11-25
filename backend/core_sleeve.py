@@ -26,14 +26,19 @@ CORE_SYMBOLS = {
 }
 
 CORE_ETF_SYMBOLS = {
-    "VAS": {"sector": "ETF-Diversified", "thesis": "Broad ASX300 exposure — reduces single-stock risk", "yield_est": 4.0, "franking": 0.7},
-    "VGS": {"sector": "ETF-International", "thesis": "Global developed markets — currency diversification", "yield_est": 2.5, "franking": 0.0},
+    "VGS": {"sector": "Global Index ETF", "thesis": "MSCI World ex-AU core growth engine (32% NAV)", "yield_est": 2.5, "franking": 0.0, "target_nav_pct": 0.32},
+    "VAS": {"sector": "ASX300 Index ETF", "thesis": "Broad ASX300 exposure with ~80% franked dividends (24% NAV)", "yield_est": 4.0, "franking": 0.8, "target_nav_pct": 0.24},
+    "NDQ": {"sector": "Global Tech ETF", "thesis": "Nasdaq-100 global secular growth tilt (16% NAV)", "yield_est": 1.0, "franking": 0.0, "target_nav_pct": 0.16},
+    "GOLD": {"sector": "Commodities ETF", "thesis": "Physical Gold AUD inflation & crisis hedge (8% NAV)", "yield_est": 0.0, "franking": 0.0, "target_nav_pct": 0.08},
 }
 
-CORE_TARGET_PCT_NAV = 0.60
-CORE_MAX_POSITIONS = 10
-CORE_SINGLE_MAX_PCT = 0.15
-SEMI_ANNUAL_MONTHS = [2, 8]
+CORE_TARGET_PCT_NAV = 0.80
+TARGET_CORE_PCT = 0.80
+TARGET_SATELLITE_PCT = 0.20
+TARGET_CASH_PCT = 0.00
+CORE_MAX_POSITIONS = 4
+CORE_SINGLE_MAX_PCT = 0.35
+SEMI_ANNUAL_MONTHS = [1, 4, 7, 10]  # Quarterly rebalance schedule
 
 
 def get_next_review_date() -> date:
